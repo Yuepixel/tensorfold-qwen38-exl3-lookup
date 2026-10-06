@@ -251,3 +251,7 @@ Each command writes `receipt_<cmd>_<label>.json` next to itself.
 
 Patch/tool/receipt contents follow the upstream TensorFold license. Receipts are
 data; reuse freely.
+
+---
+
+*This article was completed with the assistance of DeepSeek AI.*
