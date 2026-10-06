@@ -4,7 +4,7 @@ Support material for [TensorFold issue #444](https://github.com/ashhart/TensorFo
 a diff, the benchmark fixtures, and byte-exact `token_sha` receipts for the
 **prompt-lookup (suffix) draft arm** added to the Flash-Next CUDA/EXL3 path.
 
-- **Engine:** TensorFold `0.6.5` (`v0.6.5` tag) + 6 patches below
+- **Engine:** TensorFold `0.6.5` (`v0.6.5` tag) + 7 patches below
 - **Model:** `Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5` (EXL3 3.05 bpw, group-32, `h5_ng5` pack)
 - **Hardware:** NVIDIA DGX Spark (GB10), CPU/GPU unified 128 GB
 - **Policy under test:** forced `l7:2` (baseline, `MAX_DRAFTS=7, MIN_MATCH=2`) vs experimental cost gate (`auto`) — see below
@@ -20,14 +20,16 @@ cancellation leaves the next request unchanged.
 
 | | |
 |---|---|
-| **Prefill** (cold, patched vs `v0.6.5`) | **~670–800 → 1385–1549 t/s (≈2.1×)**, bit-identical |
+| **Prefill** (cold, patched vs `v0.6.5`) | **~670–800 → 1696–1777 t/s (≈2.4×)**, bit-identical |
 | **Decode** (prompt-lookup drafter, verbatim loads) | **+10 % … +44 %** (neutral on free chat/code) |
 | **Determinism** | `token_sha` identical serial / MTP-only / lookup / auto, single & parallel |
 
 The prefill lift is patches `0001–0004` (a rebase of
-[#212](https://github.com/ashhart/TensorFold/pull/212) onto `v0.6.5`); the drafter is
-`0005`/`0006`. It is the most broadly useful part of this stack and is orthogonal to
-the drafter — full numbers in [§5](#5-results).
+[#212](https://github.com/ashhart/TensorFold/pull/212) onto `v0.6.5`) plus `0007`
+(a port of [#283](https://github.com/ashhart/TensorFold/pull/283), the width-gated
+two-chunk ring, another **+13–15 %**); the drafter is `0005`/`0006`. It is the most
+broadly useful part of this stack and is orthogonal to the drafter — full numbers in
+[§5](#5-results).
 
 ### 🤖 Deploy it with one link (for AI agents)
 
@@ -44,7 +46,7 @@ apply, the CUDA build, the weight fetch, the serve command, and the acceptance c
 
 ## 1. Patches
 
-Applied in order on top of `v0.6.5` (tag `p7.1-batch-lookup-v1`):
+Applied in order on top of `v0.6.5` (tag `p7.1-batch-lookup-v1` = `0001`–`0006`; tag `p8-ring-v1` = all seven):
 
 | # | Patch | Area |
 |---|-------|------|
@@ -54,13 +56,14 @@ Applied in order on top of `v0.6.5` (tag `p7.1-batch-lookup-v1`):
 | 0004 | `EXL3 prompt GEMM tiles (128,64,8,3,8)` | EXL3 prompt GEMM |
 | 0005 | `qwen4_exp: add prompt-lookup (suffix) draft arm wired into mtp_decode` | lookup arm |
 | 0006 | `qwen4_exp: wire prompt-lookup into the batched decoder (per-stream backlog)` | lookup batching |
+| 0007 | `perf(cuda): EXL3 prompt experts keep two trellis-word chunks in flight for gate\|up below 4 bits` | EXL3 prompt GEMM |
 
 ```sh
 git checkout v0.6.5
 git am patches/*.patch        # or: git apply patches/*.patch
 ```
 
-Combined diffstat (`v0.6.5..p7.1-batch-lookup-v1`): **34 files, +2002 / −40**.
+Combined diffstat (`v0.6.5..p8-ring`): **34 files, +2028 / −49**.
 A squashed view is in `receipts/all-changes.diff`.
 
 Touched areas:
@@ -233,7 +236,8 @@ to MTP cleanly.
 ### 5.1 Prefill — the big one
 
 The CUDA prompt-GEMM work (`0001`–`0004`, a rebase of
-[#212](https://github.com/ashhart/TensorFold/pull/212) onto `v0.6.5`) is what lifts
+[#212](https://github.com/ashhart/TensorFold/pull/212) onto `v0.6.5`, plus `0007`, a
+port of [#283](https://github.com/ashhart/TensorFold/pull/283)) is what lifts
 EXL3 off the floor. Cold prefill, `tools/prefill_cold.py`, `temperature 0`, random
 nonce prefix so it always cache-misses:
 
@@ -241,10 +245,14 @@ nonce prefix so it always cache-misses:
 |---|---|---|---|---|---|
 | `v0.6.5` without the fix (the #258 level) | ~670–800 across the board | | | | |
 | `v0.6.5` + patches `0001`–`0004` | **1385** | **1528** | **1549** | **1537** | **1498** |
+| + patch `0007` (ring, all seven) | **1696** | **1771** | **1777** | **1758** | **1706** |
 
-≈**2.1×**, output bit-identical, decode untouched; 256k needle TTFT ≈199 s. This is
-orthogonal to the drafter and is the reusable artifact, since #212 is closed/unmerged
-and the Python line is frozen (#286). Reproduce:
+≈**2.4×**, output bit-identical, decode untouched; 256k needle TTFT ≈168 s. The ring
+keeps the next chunk of trellis words in flight while the current one decodes; it is
+**width-gated** to `gate|up` below 4 bits, so it fires on this 3.05 bpw pack (K2 = 6)
+and stays off on 4-bit packs (K2 = 8). This is orthogonal to the drafter and is the
+reusable artifact, since #212 is closed/unmerged and the Python line is frozen (#286).
+Reproduce:
 
 ```sh
 python3 tools/prefill_cold.py build /models/Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5 prompts.json
@@ -304,6 +312,9 @@ Each command writes `receipt_<cmd>_<label>.json` next to itself.
 
 - prompt-lookup design ported from **`jayleaton/glm53-tensorfold-spark`**
   (`patches/0020`, `glm5_next/cuda/lookup.py`).
+- The width-gated two-chunk ring (`0007`) ports **TensorFold PR
+  [#283](https://github.com/ashhart/TensorFold/pull/283)** (`grearjake-star/ring-by-width`,
+  design by Jürgen Schmied) onto `v0.6.5` + `0001`–`0006`.
 - Built on **TensorFold** by ashhart and contributors; EXL3 kernel work follows
   the existing Flash-Next CUDA/EXL3 path.
 - Hardware/quant recipe: Qwen3.8-Flash-Next EXL3 3.05 bpw `h5_ng5` on a single

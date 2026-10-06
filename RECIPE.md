@@ -4,9 +4,9 @@
 > link to this file and asked you to "install it", follow the steps below end to end,
 > report what you ran, and stop and ask if a step cannot be completed.
 
-Goal: build **TensorFold `v0.6.5` + 6 patches** and serve **Qwen3.8-Flash-Next
-(EXL3 3.05 bpw)** on a single **DGX Spark (GB10)**, giving **~2× EXL3 prefill**
-(≈1500 t/s vs ~700) and the **prompt-lookup drafter** on top, with byte-exact
+Goal: build **TensorFold `v0.6.5` + 7 patches** and serve **Qwen3.8-Flash-Next
+(EXL3 3.05 bpw)** on a single **DGX Spark (GB10)**, giving **~2.4× EXL3 prefill**
+(≈1700 t/s vs ~700) and the **prompt-lookup drafter** on top, with byte-exact
 output. Full numbers and receipts: [`README.md`](README.md).
 
 ---
@@ -45,8 +45,9 @@ git -C TensorFold am /path/to/tensorfold-qwen38-exl3-lookup/patches/*.patch
 # fallback if `am` complains: for p in .../patches/*.patch; do git -C TensorFold apply "$p"; done
 ```
 
-Six patches, in order: `0001`–`0004` are the EXL3 prompt-GEMM work (the prefill
-lift), `0005`/`0006` add the prompt-lookup drafter. No conflicts expected.
+Seven patches, in order: `0001`–`0004` are the EXL3 prompt-GEMM work (the prefill
+lift), `0005`/`0006` add the prompt-lookup drafter, `0007` adds the width-gated
+two-chunk ring (another +13–15 % prefill; port of PR #283). No conflicts expected.
 
 ## 3. Build the CUDA extension
 
@@ -120,7 +121,7 @@ python3 receipts/collect.py single mtponly
 
 | check | expected |
 |---|---|
-| Cold prefill (2048/8192/16384/32768/65536) | ≈ 1385 / 1528 / 1549 / 1537 / 1498 t/s (either side of ~2× the ~670–800 baseline) |
+| Cold prefill (2048/8192/16384/32768/65536) | ≈ 1696 / 1771 / 1777 / 1758 / 1706 t/s (~2.4× the ~670–800 baseline) |
 | `token_sha` (7 fixtures) | identical to README §4.1: `f4cf4bac607d`, `2deda2799112`, `aef89122efe1`, `35ac773b2d02`, `98f603d270f7`, `fb7342c804b3`, `d4e923c62b39` |
 | `serial == MTP-only == lookup` | same hash for every fixture |
 
