@@ -1,0 +1,871 @@
+From a925511682993012145e95a0bea2fb1ac8aa8605 Mon Sep 17 00:00:00 2001
+From: grearjake-star <228037169+grearjake-star@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 18:57:11 -0400
+Subject: [PATCH 1/6] perf(cuda): EXL3 prompt experts decode each weight tile
+ once for up to 64 pairs (same bits)
+
+Prompt windows of the routed EXL3 experts ran the grouping kernel, whose grid spans every (expert slot, 16-pair
+tile) of the window - nearly all empty at prompt sizes - and decodes each trellis tile again for every 16 pairs,
+writing fp32 split-K partials for an epilogue to sum. Above 64 rows, routed() now groups pairs on
+tensorfold.cuda.experts' plan (items of <= 64 pairs of one expert) and runs experts_prompt.cuh: a program
+(64-column block, item, matrix) decodes its tiles into shared memory a chunk at a time for its four 16-pair
+member tiles, A arrives by cp.async and leaves by ldmatrix, and each pair runs grouped_kernel's arithmetic
+over the whole K: the same m16n8k16 chains over the same K segments, segments added in warp order, splits
+added from 0. Gate|up leave one final sum; down owns a 128-column Hadamard block and runs down_epilogue's
+arithmetic itself, storing Y as fp32 or once-rounded into y_out. One instance per bit width; a layer launches
+the widths it holds. Decode windows keep the grouping kernel; TF_EXL3_PROMPT=group keeps it everywhere.
+
+Qwen3.8 Flash Next EXL3 4.05 (GB10, real routing of a 2K chunk): a layer's routed experts over 1,024 rows
+25.1 -> 7.7 ms. tests/cuda/test_exl3_prompt_experts.py: every codebook, mixed widths, skewed routing, skipped
+picks, the combine, bf16 Y, a row alone == the row in a window.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/tensorfold/cuda/exl3/experts.cpp        |  51 +++
+ src/tensorfold/cuda/exl3/experts.cu         |  60 +++-
+ src/tensorfold/cuda/exl3/experts.py         |  71 ++++-
+ src/tensorfold/cuda/exl3/experts_cb0.cu     |   4 +-
+ src/tensorfold/cuda/exl3/experts_cb1.cu     |   4 +-
+ src/tensorfold/cuda/exl3/experts_cb2.cu     |   4 +-
+ src/tensorfold/cuda/exl3/experts_prompt.cuh | 335 ++++++++++++++++++++
+ tests/cuda/test_exl3_prompt_experts.py      | 145 +++++++++
+ 8 files changed, 666 insertions(+), 8 deletions(-)
+ create mode 100644 src/tensorfold/cuda/exl3/experts_prompt.cuh
+ create mode 100644 tests/cuda/test_exl3_prompt_experts.py
+
+diff --git a/src/tensorfold/cuda/exl3/experts.cpp b/src/tensorfold/cuda/exl3/experts.cpp
+index 63c38c9..30915da 100644
+--- a/src/tensorfold/cuda/exl3/experts.cpp
++++ b/src/tensorfold/cuda/exl3/experts.cpp
+@@ -5,6 +5,12 @@ void exl3x_grouped_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                         const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
+                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                         int64_t, int64_t);
++void exl3x_prompt_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                       const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t,
++                       int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
++void exl3x_prompt_down_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                            const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t,
++                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+ void exl3x_dequant_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
+ void exl3x_group_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
+ void exl3x_rot_in_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+@@ -44,6 +50,49 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0,
+                        pf, lo, hi);
+ }
+ 
++void prompt(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
++            const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& items, const at::Tensor& counts,
++            const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P, int64_t E,
++            int64_t seg, int64_t wps, int64_t items_max, int64_t cb, int64_t nt, int64_t widths) {
++    check(X0, at::kHalf, "X0");
++    check(X1, at::kHalf, "X1");
++    check(TP0, at::kLong, "TP0");
++    check(TP1, at::kLong, "TP1");
++    check(B0, at::kInt, "B0");
++    check(B1, at::kInt, "B1");
++    check(items, at::kInt, "items");
++    check(counts, at::kInt, "counts");
++    check(members, at::kInt, "members");
++    check(Z, at::kFloat, "Z");
++    TORCH_CHECK(items.numel() >= 3 * items_max, "items too small");
++    TORCH_CHECK(Z.numel() >= mats * P * N, "Z too small");
++    TORCH_CHECK(X0.numel() >= P * K && X1.numel() >= P * K, "X too small");
++    TORCH_CHECK(items_max <= 65535, "too many items for one launch");
++    c10::cuda::CUDAGuard guard(X0.device());
++    exl3x_prompt_cuda(X0, X1, TP0, TP1, B0, B1, items, counts, members, Z, mats, K, N, P, E, seg, wps, items_max, cb,
++                      nt, widths);
++}
++
++void prompt_down(const at::Tensor& X, const at::Tensor& TP, const at::Tensor& B, const at::Tensor& svh,
++                 const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor Y, int64_t K,
++                 int64_t N, int64_t P, int64_t E, int64_t seg, int64_t wps, int64_t items_max, int64_t cb,
++                 int64_t widths) {
++    check(X, at::kHalf, "X");
++    check(TP, at::kLong, "TP");
++    check(B, at::kInt, "B");
++    check(svh, at::kHalf, "svh");
++    check(items, at::kInt, "items");
++    check(counts, at::kInt, "counts");
++    check(members, at::kInt, "members");
++    TORCH_CHECK(Y.is_cuda() && (Y.scalar_type() == at::kFloat || Y.scalar_type() == at::kBFloat16), "Y: fp32 or bf16");
++    TORCH_CHECK(Y.dim() == 2 && Y.size(1) == N && Y.stride(1) == 1 && Y.stride(0) == N && Y.size(0) >= P,
++                "Y: contiguous [>= P, N]");
++    TORCH_CHECK(items.numel() >= 3 * items_max && items_max <= 65535, "items");
++    TORCH_CHECK(X.numel() >= P * K, "X too small");
++    c10::cuda::CUDAGuard guard(X.device());
++    exl3x_prompt_down_cuda(X, TP, B, svh, items, counts, members, Y, K, N, P, E, seg, wps, items_max, cb, widths);
++}
++
+ void dequant(const at::Tensor& T, at::Tensor out, int64_t k2, int64_t cb) {
+     TORCH_CHECK(T.is_cuda() && T.scalar_type() == at::kShort && T.is_contiguous() && T.dim() == 3,
+                 "T: int16 [K/16, N/16, 8 * k2]");
+@@ -131,6 +180,8 @@ void down_combine(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor&
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("grouped", &grouped);
++    m.def("prompt", &prompt);
++    m.def("prompt_down", &prompt_down);
+     m.def("dequant", &dequant);
+     m.def("group", &group);
+     m.def("rot_in", &rot_in);
+diff --git a/src/tensorfold/cuda/exl3/experts.cu b/src/tensorfold/cuda/exl3/experts.cu
+index ff3be8d..81df53e 100644
+--- a/src/tensorfold/cuda/exl3/experts.cu
++++ b/src/tensorfold/cuda/exl3/experts.cu
+@@ -6,7 +6,7 @@
+ #include <ATen/cuda/CUDAContext.h>
+ #include <c10/cuda/CUDAGuard.h>
+ 
+-#include "experts_grouped.cuh"
++#include "experts_prompt.cuh"
+ 
+ namespace {
+ 
+@@ -244,6 +244,12 @@ namespace tf_exl3x {
+ extern template void grouped_launch<0>(const GroupedArgs&, cudaStream_t);
+ extern template void grouped_launch<1>(const GroupedArgs&, cudaStream_t);
+ extern template void grouped_launch<2>(const GroupedArgs&, cudaStream_t);
++extern template void prompt_launch<0>(const PromptArgs&, int, cudaStream_t);
++extern template void prompt_down_launch<0>(const DownArgs&, int, cudaStream_t);
++extern template void prompt_launch<1>(const PromptArgs&, int, cudaStream_t);
++extern template void prompt_down_launch<1>(const DownArgs&, int, cudaStream_t);
++extern template void prompt_launch<2>(const PromptArgs&, int, cudaStream_t);
++extern template void prompt_down_launch<2>(const DownArgs&, int, cudaStream_t);
+ extern template void dequant_launch<0>(const uint32_t*, half*, int, int, int, cudaStream_t);
+ extern template void dequant_launch<1>(const uint32_t*, half*, int, int, int, cudaStream_t);
+ extern template void dequant_launch<2>(const uint32_t*, half*, int, int, int, cudaStream_t);
+@@ -277,6 +283,58 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
++void exl3x_prompt_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
++                       const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& items, const at::Tensor& counts,
++                       const at::Tensor& members, at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P,
++                       int64_t E, int64_t seg, int64_t wps, int64_t items_max, int64_t cb, int64_t nt,
++                       int64_t widths) {
++    TORCH_CHECK(K % 16 == 0 && (K / 16) % (seg * wps) == 0 && N % (16 * nt) == 0,
++                "prompt experts: K and N must split evenly");
++    tf_exl3x::PromptArgs a;
++    a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
++    a.x1 = reinterpret_cast<const half*>(X1.data_ptr());
++    a.tp0 = TP0.data_ptr<int64_t>();
++    a.tp1 = TP1.data_ptr<int64_t>();
++    a.k2_0 = B0.data_ptr<int>();
++    a.k2_1 = B1.data_ptr<int>();
++    a.items = items.data_ptr<int>();
++    a.counts = counts.data_ptr<int>();
++    a.members = members.data_ptr<int>();
++    a.z = Z.data_ptr<float>();
++    a.K = (int)K; a.N = (int)N; a.P = (int)P; a.E = (int)E; a.seg = (int)seg; a.wps = (int)wps;
++    a.items_max = (int)items_max; a.mats = (int)mats; a.nt = (int)nt;
++    auto stream = at::cuda::getCurrentCUDAStream();
++    if (cb == 0) tf_exl3x::prompt_launch<0>(a, (int)widths, stream);
++    else if (cb == 1) tf_exl3x::prompt_launch<1>(a, (int)widths, stream);
++    else if (cb == 2) tf_exl3x::prompt_launch<2>(a, (int)widths, stream);
++    else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++void exl3x_prompt_down_cuda(const at::Tensor& X, const at::Tensor& TP, const at::Tensor& B, const at::Tensor& svh,
++                            const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& Y,
++                            int64_t K, int64_t N, int64_t P, int64_t E, int64_t seg, int64_t wps, int64_t items_max,
++                            int64_t cb, int64_t widths) {
++    TORCH_CHECK(K % 16 == 0 && (K / 16) % (seg * wps) == 0 && N % 128 == 0, "prompt down: K and N must split evenly");
++    tf_exl3x::DownArgs a;
++    a.x = reinterpret_cast<const half*>(X.data_ptr());
++    a.tp = TP.data_ptr<int64_t>();
++    a.k2 = B.data_ptr<int>();
++    a.svh = reinterpret_cast<const half*>(svh.data_ptr());
++    a.items = items.data_ptr<int>();
++    a.counts = counts.data_ptr<int>();
++    a.members = members.data_ptr<int>();
++    a.y = Y.data_ptr();
++    a.K = (int)K; a.N = (int)N; a.P = (int)P; a.E = (int)E; a.seg = (int)seg; a.wps = (int)wps;
++    a.items_max = (int)items_max; a.bf16 = Y.scalar_type() == at::kBFloat16 ? 1 : 0;
++    auto stream = at::cuda::getCurrentCUDAStream();
++    if (cb == 0) tf_exl3x::prompt_down_launch<0>(a, (int)widths, stream);
++    else if (cb == 1) tf_exl3x::prompt_down_launch<1>(a, (int)widths, stream);
++    else if (cb == 2) tf_exl3x::prompt_down_launch<2>(a, (int)widths, stream);
++    else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
+ void exl3x_dequant_cuda(const at::Tensor& T, at::Tensor& out, int64_t K, int64_t N, int64_t k2, int64_t cb) {
+     auto stream = at::cuda::getCurrentCUDAStream();
+     auto t = reinterpret_cast<const uint32_t*>(T.data_ptr());
+diff --git a/src/tensorfold/cuda/exl3/experts.py b/src/tensorfold/cuda/exl3/experts.py
+index f4569ec..085294b 100644
+--- a/src/tensorfold/cuda/exl3/experts.py
++++ b/src/tensorfold/cuda/exl3/experts.py
+@@ -26,7 +26,7 @@ def _ext():
+ 
+     here = Path(__file__).parent
+     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
+-    return load(name="tensorfold_exl3_experts_v1", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
++    return load(name="tensorfold_exl3_experts_v2", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+                 verbose=False)
+ 
+ 
+@@ -75,6 +75,8 @@ class Exl3RoutedExperts:
+     k2_d: tuple[int, int]
+     trellis_bytes: torch.Tensor   # int64 [E], gate + up + down trellis bytes of each expert (for GB/s)
+     keep: list = field(default_factory=list, repr=False)
++    widths_gu: int = 0        # a bit per K2 that gate and up hold (bit k2): the prompt kernel's instances to launch
++    widths_d: int = 0
+ 
+     def nbytes_read(self, ids: Sequence[int]) -> int:
+         return int(self.trellis_bytes[list(ids)].sum())
+@@ -115,9 +117,11 @@ def prepare(gate: Sequence[tuple], up: Sequence[tuple], down: Sequence[tuple], c
+         return out
+ 
+     tb = torch.tensor([(D * I // 256) * (gks[e] + uks[e] + dks[e]) * 16 for e in range(E)], dtype=torch.int64)
++    bits = lambda ks: sum(1 << k for k in set(ks))          # noqa: E731
+     return Exl3RoutedExperts(gp, upp, dp, gk, uk, dk, stack(gate, 1, D), stack(up, 1, D), stack(gate, 2, I),
+                              stack(up, 2, I), stack(down, 1, I), stack(down, 2, D), E, D, I, cb,
+-                             (min(gks + uks), max(gks + uks)), (min(dks), max(dks)), tb, keep)
++                             (min(gks + uks), max(gks + uks)), (min(dks), max(dks)), tb, keep, bits(gks + uks),
++                             bits(dks))
+ 
+ 
+ def prepare_stacked(gt: torch.Tensor, ut: torch.Tensor, dt: torch.Tensor, suh_g, suh_u, svh_g, svh_u, suh_d, svh_d,
+@@ -162,6 +166,18 @@ class Scratch:
+         self.count = torch.zeros((1,), dtype=torch.int32, device=device)
+         self.members_buf = torch.full((maxu * rows,), -1, dtype=torch.int32, device=device)
+         self.rows, self.slots, self.count_experts = rows, slots, ex.count
++        self.device = device
++        self._plan = self._pick = None      # prompt windows: pairs grouped by expert (``plan``), made on first use
++
++    def plan(self):
++        """tensorfold.cuda.experts' grouping of this scratch's rows with one expert more: skipped picks group apart."""
++
++        if self._plan is None:
++            from tensorfold.cuda import experts as grouped
++
++            self._plan = grouped.Plan(self.rows, self.slots, self.count_experts + 1, self.device, prefill=True)
++            self._pick = torch.empty((self.rows * self.slots,), dtype=torch.int32, device=self.device)
++        return self._plan
+ 
+     def window(self, R: int):
+         """(ids, members) sized for R rows: the grids only span what R rows can use."""
+@@ -170,10 +186,22 @@ class Scratch:
+         return self.ids[:maxu], self.members_buf[:maxu * R].view(maxu, R)
+ 
+ 
++# Prompt windows (more than PROMPT_ROWS rows) run on a plan's items: a program a (n block, <= 64 pairs of one expert),
++# each weight tile decoded once for its pairs and the splits added in the kernel (experts_prompt.cuh); the grouping
++# kernel's grid spans every (expert slot, 16-pair tile) of the window and decodes each tile again for every 16 pairs.
++# Every pair keeps its bits. TF_EXL3_PROMPT=group keeps the grouping kernel at every size; decode windows always do.
++PROMPT = __import__("os").environ.get("TF_EXL3_PROMPT", "prompt")
++PROMPT_ROWS = 64
++PROMPT_TILE = 64         # pairs an item holds: 4 warps of 16
++PROMPT_NT = 4            # n tiles a gate/up program (64 columns)
++
++
+ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
+            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
+-           group: bool = True) -> torch.Tensor:
+-    """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync."""
++           group: bool = True, y_out: torch.Tensor | None = None) -> torch.Tensor:
++    """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync.
++
++    ``y_out`` ([R * slots, D], contiguous; no ``wts``): Y lands there (prompt windows round it once, as copy_ does)."""
+ 
+     ext = _ext()
+     D, I, E = ex.dims, ex.width, ex.count
+@@ -181,6 +209,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
+     P = R * slots
+     if R > s.rows:
+         raise ValueError(f"{R} rows but the scratch holds {s.rows}")
++    if group and PROMPT == "prompt" and R > PROMPT_ROWS:
++        return _prompt(ext, x, pick, wts, ex, s, out, R, limit, act_mode, y_out)
+     ids, members = s.window(R)
+     if group:
+         ext.group(pick, ids, s.count, members, R, slots, E)
+@@ -194,6 +224,9 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
+                 D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1])
+     if wts is None:
+         ext.down_epilogue(s.z, pick, ex.svh_d, s.y, R, P, D, sk, slots, E)
++        if y_out is not None:
++            y_out[:P].copy_(s.y[:P])
++            return y_out[:P]
+         return s.y[:P]
+     if out is None:
+         out = torch.empty((R, D), dtype=torch.float32, device=x.device)
+@@ -202,6 +235,36 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
+     return out
+ 
+ 
++def _prompt(ext, x, pick, wts, ex: Exl3RoutedExperts, s: Scratch, out, R: int, limit: float, act_mode: int, y_out):
++    """``routed`` for a prompt window: the plan's items, gate|up summed in the kernel, down with its epilogue."""
++
++    from tensorfold.cuda import experts as grouped
++
++    D, I, E, slots = ex.dims, ex.width, ex.count, s.slots
++    P = R * slots
++    plan = s.plan()
++    picks = torch.clamp(pick[:R].reshape(P), max=E, out=s._pick[:P])     # every skipped pick as E
++    grouped.route(picks.view(R, slots), plan, PROMPT_TILE)
++    bound = grouped.max_items(P, E + 1, PROMPT_TILE)
++    ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
++    _, w, sk, _ = s.cfg_gu
++    ext.prompt(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, plan.items, plan.counts, plan.members, s.z,
++               2, D, I, P, E, (D // 16) // (sk * w), w, bound, ex.cb, PROMPT_NT, ex.widths_gu)
++    ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, 1, slots, E, float(limit), act_mode)
++    _, w, sk, _ = s.cfg_d
++    if sk != 1:
++        raise ValueError(f"the prompt down kernel takes one K split, not {sk}")
++    y = y_out if y_out is not None and wts is None else s.y
++    ext.prompt_down(s.xd, ex.down_ptr, ex.down_k2, ex.svh_d, plan.items, plan.counts, plan.members, y.view(-1, D), I,
++                    D, P, E, (I // 16) // w, w, bound, ex.cb, ex.widths_d)
++    if wts is None:
++        return y[:P]
++    if out is None:
++        out = torch.empty((R, D), dtype=torch.float32, device=x.device)
++    ext.combine(s.y, wts, out, R, D, slots)       # down_combine's combine: the same fma chain
++    return out
++
++
+ def dequant(trellis: torch.Tensor, codebook: int | str) -> torch.Tensor:
+     """W_q [K, N] fp16 of one matrix through the kernels' own lane decode (ExLlamaV3's ``reconstruct``); for tests."""
+ 
+diff --git a/src/tensorfold/cuda/exl3/experts_cb0.cu b/src/tensorfold/cuda/exl3/experts_cb0.cu
+index aec220f..2c15c59 100644
+--- a/src/tensorfold/cuda/exl3/experts_cb0.cu
++++ b/src/tensorfold/cuda/exl3/experts_cb0.cu
+@@ -1,7 +1,9 @@
+ // Grouped EXL3 expert GEMV instances for codebook 0 (3inst).
+-#include "experts_grouped.cuh"
++#include "experts_prompt.cuh"
+ 
+ namespace tf_exl3x {
+ template void grouped_launch<0>(const GroupedArgs&, cudaStream_t);
++template void prompt_launch<0>(const PromptArgs&, int, cudaStream_t);
++template void prompt_down_launch<0>(const DownArgs&, int, cudaStream_t);
+ template void dequant_launch<0>(const uint32_t*, half*, int, int, int, cudaStream_t);
+ }  // namespace tf_exl3x
+diff --git a/src/tensorfold/cuda/exl3/experts_cb1.cu b/src/tensorfold/cuda/exl3/experts_cb1.cu
+index b016240..bcdc615 100644
+--- a/src/tensorfold/cuda/exl3/experts_cb1.cu
++++ b/src/tensorfold/cuda/exl3/experts_cb1.cu
+@@ -1,7 +1,9 @@
+ // Grouped EXL3 expert GEMV instances for codebook 1 (mcg).
+-#include "experts_grouped.cuh"
++#include "experts_prompt.cuh"
+ 
+ namespace tf_exl3x {
+ template void grouped_launch<1>(const GroupedArgs&, cudaStream_t);
++template void prompt_launch<1>(const PromptArgs&, int, cudaStream_t);
++template void prompt_down_launch<1>(const DownArgs&, int, cudaStream_t);
+ template void dequant_launch<1>(const uint32_t*, half*, int, int, int, cudaStream_t);
+ }  // namespace tf_exl3x
+diff --git a/src/tensorfold/cuda/exl3/experts_cb2.cu b/src/tensorfold/cuda/exl3/experts_cb2.cu
+index a6e6493..fd53138 100644
+--- a/src/tensorfold/cuda/exl3/experts_cb2.cu
++++ b/src/tensorfold/cuda/exl3/experts_cb2.cu
+@@ -1,7 +1,9 @@
+ // Grouped EXL3 expert GEMV instances for codebook 2 (mul1).
+-#include "experts_grouped.cuh"
++#include "experts_prompt.cuh"
+ 
+ namespace tf_exl3x {
+ template void grouped_launch<2>(const GroupedArgs&, cudaStream_t);
++template void prompt_launch<2>(const PromptArgs&, int, cudaStream_t);
++template void prompt_down_launch<2>(const DownArgs&, int, cudaStream_t);
+ template void dequant_launch<2>(const uint32_t*, half*, int, int, int, cudaStream_t);
+ }  // namespace tf_exl3x
+diff --git a/src/tensorfold/cuda/exl3/experts_prompt.cuh b/src/tensorfold/cuda/exl3/experts_prompt.cuh
+new file mode 100644
+index 0000000..28c4f22
+--- /dev/null
++++ b/src/tensorfold/cuda/exl3/experts_prompt.cuh
+@@ -0,0 +1,335 @@
++// EXL3 routed experts in prompt windows: each weight tile decoded once for up to 64 pairs, every pair's bits kept.
++// Program (n block, plan item, matrix): its warps decode the block's tiles into shared memory a chunk at a time, each
++// runs 16 pairs over the whole K with grouped_kernel's arithmetic (the same m16n8k16 chains over the same K segments,
++// segments added in warp order, splits added from 0.f), so no split partials reach memory. A arrives by cp.async and
++// leaves by ldmatrix (the same halves, padding rows zero).
++#pragma once
++
++#include "experts_grouped.cuh"
++
++namespace tf_exl3x {
++
++constexpr int PROMPT_WARPS = 4;                        // member tiles an item holds (16 pairs a warp): 64-pair items
++constexpr float HAD_SCALE_P = 0.08838834764831845f;   // 1 / sqrt(128), as experts.cu's HAD_SCALE
++
++struct PromptArgs {
++    const half* x0;
++    const half* x1;
++    const int64_t* tp0;
++    const int64_t* tp1;
++    const int* k2_0;
++    const int* k2_1;
++    const int* items;
++    const int* counts;
++    const int* members;
++    float* z;                // [mats, P, N] final sums
++    int K, N, P, E;
++    int seg, wps;            // k tiles a segment (grouped_kernel's per_warp), segments a split (its warps)
++    int items_max, mats, nt;
++};
++
++__device__ __forceinline__ void cp_async16(uint32_t dst, const void* src, bool ok) {
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "r"(ok ? 16 : 0));
++}
++__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
++template <int N>
++__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
++__device__ __forceinline__ void ldmatrix_x4(uint32_t (&a)[4], uint32_t addr) {
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
++                 : "r"(addr));
++}
++
++// This warp's 16 rows x CH k tiles of A into its stage (rows of CH * 32 bytes, 16-byte chunks XOR-swizzled by row).
++template <int CH>
++__device__ __forceinline__ void stage_a(uint32_t abuf, const half* __restrict__ X, const int* rows16, int K, int kt0,
++                                        int KT, int lane) {
++    constexpr int CPR = CH * 2;                            // 16-byte chunks a row
++#pragma unroll
++    for (int i = 0; i < (16 * CPR) / 32; ++i) {
++        const int idx = lane + 32 * i, r = idx / CPR, c = idx % CPR;
++        const int row = rows16[r];
++        const int kt = kt0 + c / 2;
++        const bool ok = row >= 0 && kt < KT;
++        const half* src = X + (size_t)(ok ? row : 0) * K + (size_t)(ok ? kt0 * 16 + c * 8 : 0);
++        cp_async16(abuf + r * (CPR * 16) + ((c ^ (r & 7)) % CPR) * 16, src, ok);
++    }
++}
++
++// TOT: also keep the splits' running sum (gate/up's SK splits); without it the result is the first split's sum
++// (one split: down), which the caller adds to 0.f as the epilogue does.
++template <int CB, int K2, int NT, int CH, bool TOT>
++__device__ __forceinline__ void prompt_body(const uint32_t* __restrict__ T, const half* __restrict__ X,
++                                            const int* rows16, int K, int N, int nt0, int seg, int wps, bool active,
++                                            int warp, int lane, uint4* sb, uint32_t abase, float (&res)[NT][2][4]) {
++    constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
++    constexpr int DPW = NT / PROMPT_WARPS;              // n tiles this warp decodes a k tile
++    constexpr int ABYTES = 16 * CH * 32;                // a warp's A stage
++    static_assert(NT % PROMPT_WARPS == 0, "NT must be a multiple of the warps");
++    const LaneMap<K2> map(lane);
++    const int KT = K >> 4, NTILES = N >> 4;
++    const size_t kstride = (size_t)NTILES * TW;
++    const uint32_t* tp = T + (size_t)(nt0 + warp * DPW) * TW + lane;
++    const uint32_t abuf0 = abase + warp * 2 * ABYTES;
++
++    float acc[NT][2][4], ts[NT][2][4];
++#pragma unroll
++    for (int i = 0; i < NT; ++i)
++#pragma unroll
++        for (int h = 0; h < 2; ++h)
++#pragma unroll
++            for (int c = 0; c < 4; ++c) acc[i][h][c] = ts[i][h][c] = res[i][h][c] = 0.f;
++
++    uint32_t wn[CH][DPW][LW];
++#pragma unroll
++    for (int kc = 0; kc < CH; ++kc)
++        if (kc < KT)
++#pragma unroll
++            for (int j = 0; j < DPW; ++j) load_words<K2>(wn[kc][j], tp + (size_t)kc * kstride + j * TW, lane);
++    if (active) stage_a<CH>(abuf0, X, rows16, K, 0, KT, lane);
++    cp_async_commit();
++
++    int sleft = seg, g = 0;                              // k tiles left in this segment, the segment
++    const int chunks = (KT + CH - 1) / CH;
++    for (int c = 0; c < chunks; ++c) {
++        uint4* buf = sb + (size_t)(c & 1) * CH * NT * 32;
++        // decode this chunk's tiles of this warp's n tiles into shared memory
++#pragma unroll
++        for (int kc = 0; kc < CH; ++kc)
++            if (c * CH + kc < KT)
++#pragma unroll
++                for (int j = 0; j < DPW; ++j) {
++                    uint32_t b0[2], b1[2];
++                    decode_tile<CB, K2>(wn[kc][j], map, lane, b0, b1);
++                    buf[(kc * NT + warp * DPW + j) * 32 + lane] = make_uint4(b0[0], b0[1], b1[0], b1[1]);
++                }
++        // the next chunk's words and A rows in flight while this one runs
++#pragma unroll
++        for (int kc = 0; kc < CH; ++kc) {
++            const int kt = (c + 1) * CH + kc;
++            if (kt < KT)
++#pragma unroll
++                for (int j = 0; j < DPW; ++j) load_words<K2>(wn[kc][j], tp + (size_t)kt * kstride + j * TW, lane);
++        }
++        __syncwarp();                                    // every lane is done reading the stage it overwrites
++        if (active && c + 1 < chunks)
++            stage_a<CH>(abuf0 + ((c + 1) & 1) * ABYTES, X, rows16, K, (c + 1) * CH, KT, lane);
++        cp_async_commit();
++        cp_async_wait<1>();                              // this chunk's A rows have landed
++        __syncthreads();
++        if (active) {
++            const uint32_t abuf = abuf0 + (c & 1) * ABYTES;
++            const int ar = lane & 15;
++#pragma unroll
++            for (int kc = 0; kc < CH; ++kc) {
++                const int kt = c * CH + kc;
++                if (kt < KT) {
++                    uint32_t a[4];
++                    const int ch = kc * 2 + (lane >> 4);
++                    ldmatrix_x4(a, abuf + ar * (CH * 32) + ((ch ^ (ar & 7)) % (CH * 2)) * 16);
++#pragma unroll
++                    for (int i = 0; i < NT; ++i) {
++                        const uint4 b = buf[(kc * NT + i) * 32 + lane];
++                        const uint32_t b0[2] = {b.x, b.y}, b1[2] = {b.z, b.w};
++                        mma16816(acc[i][0], a, b0);
++                        mma16816(acc[i][1], a, b1);
++                    }
++                    if (--sleft == 0) {                  // a segment ends: grouped_kernel's warp, then split sums
++                        const int wi = g % wps;
++#pragma unroll
++                        for (int i = 0; i < NT; ++i)
++#pragma unroll
++                            for (int h = 0; h < 2; ++h)
++#pragma unroll
++                                for (int q = 0; q < 4; ++q) {
++                                    ts[i][h][q] = wi == 0 ? acc[i][h][q] : ts[i][h][q] + acc[i][h][q];
++                                    acc[i][h][q] = 0.f;
++                                    if constexpr (TOT) {
++                                        if (wi == wps - 1) res[i][h][q] += ts[i][h][q];
++                                    }
++                                }
++                        sleft = seg;
++                        ++g;
++                    }
++                }
++            }
++        }
++    }
++    cp_async_wait<0>();
++    if constexpr (!TOT) {
++#pragma unroll
++        for (int i = 0; i < NT; ++i)
++#pragma unroll
++            for (int h = 0; h < 2; ++h)
++#pragma unroll
++                for (int q = 0; q < 4; ++q) res[i][h][q] = ts[i][h][q];
++    }
++}
++
++// k tiles a stage: B (2 * CH * NT tiles of 512 bytes) and A (4 warps x 2 x 16 rows x CH * 32 bytes)
++template <int NT> __host__ __device__ constexpr int prompt_ch() { return NT == 8 ? 2 : 4; }
++
++// Program (n block, plan item, matrix): the item's (expert, first member, count <= 64) pairs, warp w member tile w.
++// One instance a width (K2): a layer's launch runs one per width it holds, each program skipping other widths' experts,
++// so no instance carries the registers of the widest decode.
++template <int CB, int K2, int NT>
++__global__ void __launch_bounds__(PROMPT_WARPS * 32) prompt_kernel(PromptArgs a) {
++    constexpr int CH = prompt_ch<NT>();
++    const int item = blockIdx.y;
++    if (item >= a.counts[0]) return;
++    const int e = a.items[3 * item], first = a.items[3 * item + 1], cnt = a.items[3 * item + 2];
++    if (e < 0 || e >= a.E) return;                        // a skipped pick's item
++    const int mat = blockIdx.z;
++    if ((mat ? a.k2_1[e] : a.k2_0[e]) != K2) return;
++    const half* X = mat ? a.x1 : a.x0;
++    const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? a.tp1[e] : a.tp0[e]);
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int g = lane >> 2, t = lane & 3;
++    const int nt0 = blockIdx.x * NT;
++
++    __shared__ uint4 sb[2 * CH * NT * 32];
++    __shared__ __align__(128) uint4 sa[PROMPT_WARPS * 2 * 16 * CH * 2];
++    __shared__ int rows_sh[PROMPT_WARPS * 16];
++    for (int i = threadIdx.x; i < PROMPT_WARPS * 16; i += PROMPT_WARPS * 32)
++        rows_sh[i] = i < cnt ? a.members[first + i] : -1;
++    __syncthreads();
++    const bool active = warp * 16 < cnt;
++    const int r0 = rows_sh[warp * 16 + g], r1 = rows_sh[warp * 16 + g + 8];
++
++    float tot[NT][2][4];
++    prompt_body<CB, K2, NT, CH, true>(T, X, rows_sh + warp * 16, a.K, a.N, nt0, a.seg, a.wps, active, warp,
++                                            lane, sb, (uint32_t)__cvta_generic_to_shared(sa), tot);
++    if (!active) return;
++    float* zm = a.z + (size_t)mat * a.P * a.N;
++#pragma unroll
++    for (int i = 0; i < NT; ++i)
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++            const int col = (nt0 + i) * 16 + h * 8 + 2 * t;
++            if (r0 >= 0)
++                *reinterpret_cast<float2*>(zm + (size_t)r0 * a.N + col) = make_float2(tot[i][h][0], tot[i][h][1]);
++            if (r1 >= 0)
++                *reinterpret_cast<float2*>(zm + (size_t)r1 * a.N + col) = make_float2(tot[i][h][2], tot[i][h][3]);
++        }
++}
++
++#define TF_EXL3P_WIDTHS(X_) \
++    X_(2) X_(3) X_(4) X_(5) X_(6) X_(7) X_(8) X_(9) X_(10) X_(11) X_(12) X_(13) X_(14) X_(15) X_(16)
++
++// widths: a bit per K2 the layer's experts hold (bit k2)
++template <int CB>
++void prompt_launch(const PromptArgs& a, int widths, cudaStream_t stream) {
++    if (a.items_max < 1) return;
++    TORCH_CHECK(a.nt == 4, "prompt experts: n tiles a program must be 4, not ", a.nt);   // 8 would spill
++    dim3 grid((unsigned)(a.N / (16 * a.nt)), (unsigned)a.items_max, (unsigned)a.mats);
++#define TF_PW(K2_) if (widths & (1 << K2_)) prompt_kernel<CB, K2_, 4><<<grid, PROMPT_WARPS * 32, 0, stream>>>(a);
++    TF_EXL3P_WIDTHS(TF_PW)
++#undef TF_PW
++}
++
++// ---------------------------------------------------------------------------------------------------------------
++// Down projection with its epilogue: a program owns one 128-column Hadamard block (8 n tiles), so after the K loop each
++// pair's 128 sums go through down_epilogue_kernel's arithmetic (s = 0; s += sum; fwht128; * HAD_SCALE * svh_d) and
++// are stored as fp32 or rounded once to bf16 (as a copy_ of the fp32 y would): no Z, no fp32 y. One split only.
++
++__device__ __forceinline__ void fwht128_p(float (&v)[4], int lane) {      // experts.cu's fwht128, the same order
++    float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
++    v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
++#pragma unroll
++    for (int m = 1; m < 32; m <<= 1) {
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            float o = __shfl_xor_sync(0xffffffffu, v[j], m);
++            v[j] = (lane & m) ? o - v[j] : v[j] + o;
++        }
++    }
++}
++
++struct DownArgs {
++    const half* x;
++    const int64_t* tp;
++    const int* k2;
++    const half* svh;         // [E, N]
++    const int* items;
++    const int* counts;
++    const int* members;
++    void* y;                 // [P, N] fp32 or bf16
++    int K, N, P, E, seg, wps, items_max, bf16;
++};
++
++template <int CB, int K2>
++__global__ void __launch_bounds__(PROMPT_WARPS * 32) prompt_down_kernel(DownArgs a) {
++    constexpr int NT = 8, CH = prompt_ch<8>();
++    const int item = blockIdx.y;
++    if (item >= a.counts[0]) return;
++    const int e = a.items[3 * item], first = a.items[3 * item + 1], cnt = a.items[3 * item + 2];
++    if (e < 0 || e >= a.E) return;
++    if (a.k2[e] != K2) return;
++    const uint32_t* T = reinterpret_cast<const uint32_t*>(a.tp[e]);
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int g = lane >> 2, t = lane & 3;
++    const int nt0 = blockIdx.x * NT;
++
++    // B stages (16 KB) and A stages (8 KB), then 4 warps x 16 rows x 128 fp32 (32 KB) for the epilogue
++    __shared__ __align__(128) uint4 sm[2048];
++    uint4* sb = sm;
++    const uint32_t sa = (uint32_t)__cvta_generic_to_shared(sm + 2 * CH * NT * 32);
++    __shared__ int rows_sh[PROMPT_WARPS * 16];
++    for (int i = threadIdx.x; i < PROMPT_WARPS * 16; i += PROMPT_WARPS * 32)
++        rows_sh[i] = i < cnt ? a.members[first + i] : -1;
++    __syncthreads();
++    const bool active = warp * 16 < cnt;
++
++    float ts[NT][2][4];
++    prompt_body<CB, K2, NT, CH, false>(T, a.x, rows_sh + warp * 16, a.K, a.N, nt0, a.seg, a.wps, active, warp,
++                                          lane, sb, sa, ts);
++    __syncthreads();                                       // every warp is done with the stages
++    if (!active) return;
++    float* st = reinterpret_cast<float*>(sm) + warp * 16 * 128;
++#pragma unroll
++    for (int i = 0; i < NT; ++i)
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++            const int col = i * 16 + h * 8 + 2 * t;
++            *reinterpret_cast<float2*>(st + g * 128 + col) = make_float2(ts[i][h][0], ts[i][h][1]);
++            *reinterpret_cast<float2*>(st + (g + 8) * 128 + col) = make_float2(ts[i][h][2], ts[i][h][3]);
++        }
++    __syncwarp();
++    const int n = blockIdx.x * 128 + 4 * lane;
++    const half* sv = a.svh + (size_t)e * a.N + n;
++    const float s0 = __half2float(sv[0]), s1 = __half2float(sv[1]), s2 = __half2float(sv[2]), s3 = __half2float(sv[3]);
++    for (int r = 0; r < 16; ++r) {
++        const int p = rows_sh[warp * 16 + r];
++        if (p < 0) break;                                  // members come first
++        const float4 u = *reinterpret_cast<const float4*>(st + r * 128 + 4 * lane);
++        float v[4];
++        v[0] = 0.f; v[0] += u.x;                           // the epilogue's s = 0; s += Z (one split)
++        v[1] = 0.f; v[1] += u.y;
++        v[2] = 0.f; v[2] += u.z;
++        v[3] = 0.f; v[3] += u.w;
++        fwht128_p(v, lane);
++        const float o0 = v[0] * HAD_SCALE_P * s0, o1 = v[1] * HAD_SCALE_P * s1;
++        const float o2 = v[2] * HAD_SCALE_P * s2, o3 = v[3] * HAD_SCALE_P * s3;
++        if (a.bf16) {
++            __nv_bfloat162 lo2 = __floats2bfloat162_rn(o0, o1), hi2 = __floats2bfloat162_rn(o2, o3);
++            uint2 w;
++            w.x = *reinterpret_cast<uint32_t*>(&lo2);
++            w.y = *reinterpret_cast<uint32_t*>(&hi2);
++            *reinterpret_cast<uint2*>(reinterpret_cast<__nv_bfloat16*>(a.y) + (size_t)p * a.N + n) = w;
++        } else {
++            float* yp = reinterpret_cast<float*>(a.y) + (size_t)p * a.N + n;
++            *reinterpret_cast<float4*>(yp) = make_float4(o0, o1, o2, o3);
++        }
++    }
++}
++
++template <int CB>
++void prompt_down_launch(const DownArgs& a, int widths, cudaStream_t stream) {
++    if (a.items_max < 1) return;
++    dim3 grid((unsigned)(a.N / 128), (unsigned)a.items_max, 1);
++#define TF_PD(K2_) if (widths & (1 << K2_)) prompt_down_kernel<CB, K2_><<<grid, PROMPT_WARPS * 32, 0, stream>>>(a);
++    TF_EXL3P_WIDTHS(TF_PD)
++#undef TF_PD
++}
++
++}  // namespace tf_exl3x
+diff --git a/tests/cuda/test_exl3_prompt_experts.py b/tests/cuda/test_exl3_prompt_experts.py
+new file mode 100644
+index 0000000..b526069
+--- /dev/null
++++ b/tests/cuda/test_exl3_prompt_experts.py
+@@ -0,0 +1,145 @@
++"""EXL3 routed experts in prompt windows (experts_prompt.cuh) give every pair the grouping kernel's bits.
++
++Every codebook, mixed and 4-bit-only widths, skewed routing (experts spanning several items), skipped picks, with and
++without the weighted combine, windows on both sides of the switch row count; decode windows keep the grouping kernel."""
++
++from __future__ import annotations
++
++import math
++
++import pytest
++import torch
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
++
++
++def _trellis(k, n, k2, gen):
++    v = torch.randint(-32768, 32768, (k // 16, n // 16, 8 * k2), dtype=torch.int32, generator=gen)
++    return v.to(torch.int16).cuda().contiguous()
++
++
++def _scale(n, mag, gen):
++    sign = torch.randint(0, 2, (n,), generator=gen).float() * 2 - 1
++    return (sign * (torch.rand((n,), generator=gen) + 0.5) * mag).half().cuda()
++
++
++def _layer(E, D, I, kfun, cb, seed):
++    from tensorfold.cuda.exl3 import experts
++
++    g = torch.Generator().manual_seed(seed)
++    gate, up, down = [], [], []
++    for e in range(E):
++        kg, ku, kd = kfun(e)
++        gate.append((_trellis(D, I, kg, g), _scale(D, 1 / math.sqrt(D), g), _scale(I, 1.0, g)))
++        up.append((_trellis(D, I, ku, g), _scale(D, 1 / math.sqrt(D), g), _scale(I, 1.0, g)))
++        down.append((_trellis(I, D, kd, g), _scale(I, 1 / math.sqrt(I), g), _scale(D, 0.25, g)))
++    return experts.prepare(gate, up, down, cb)
++
++
++def _skewed_picks(E, R, k, gen):
++    """Top-k of a strongly biased router (a few experts take most rows: many member tiles), the last slot the shared
++    expert (id E - 1 here), and every 7th row's slot 0 a skipped pick (id E)."""
++
++    bias = torch.linspace(4.0, -4.0, E - 1)
++    logits = torch.randn((R, E - 1), generator=gen) + bias
++    sel = logits.topk(k, dim=1).indices.to(torch.int32)
++    sel = torch.cat([sel, torch.full((R, 1), E - 1, dtype=torch.int32)], 1)
++    sel[::7, 0] = E
++    w = torch.rand((R, k + 1), generator=gen) * 0.2 + 0.05
++    return sel.cuda().contiguous(), w.float().cuda().contiguous()
++
++
++CASES = [
++    ("mul1-4bit", 2, lambda e: (8, 8, 8)),                                                  # EXL3 4.05's experts
++    ("mul1-mixed", 2, lambda e: ((6, 6, 6) if e % 4 else (12, 12, 12))),                     # 3.05-like + 6-bit shared
++    ("mcg", 1, lambda e: ((2, 4, 6, 8, 10, 12, 14, 16)[e % 8],) * 2 + ((4, 6, 8)[e % 3],)),
++    ("3inst", 0, lambda e: ((4, 8, 16)[e % 3],) * 3),
++]
++
++
++@pytest.mark.parametrize("name,cb,kfun", CASES, ids=[c[0] for c in CASES])
++def test_prompt_kernel_gives_the_grouping_kernels_bits(name, cb, kfun, monkeypatch):
++    from tensorfold.cuda.exl3 import experts
++
++    E, D, I, TOPK, ROWS = 33, 512, 256, 6, 300
++    ex = _layer(E, D, I, kfun, cb, seed=5 + cb)
++    g = torch.Generator().manual_seed(23 + cb)
++    x = (torch.randn((ROWS, D), generator=g) * 0.5).to(torch.bfloat16).cuda()
++    sel, w = _skewed_picks(E, ROWS, TOPK, g)
++    scratch = experts.Scratch(ex, ROWS, TOPK + 1)
++
++    def run(R, mode, wts):
++        monkeypatch.setattr(experts, "PROMPT", mode)
++        scratch.y.fill_(float("nan"))                  # no row may pass on what another run left
++        scratch.z.fill_(float("nan"))
++        got = experts.routed(x[:R], sel[:R].contiguous(), w[:R].contiguous() if wts else None, ex, scratch, None, R)
++        return got.clone()
++
++    for R in (65, 129, 300):
++        for wts in (False, True):
++            ref = run(R, "group", wts)                 # the grouping kernel, one program a (expert, member tile)
++            got = run(R, "prompt", wts)
++            if not wts:                                # skipped slots stay NaN in both; every routed slot is set
++                assert torch.isfinite(ref.view(R, TOPK + 1, D)[sel[:R] < E]).all()
++            assert torch.equal(got.view(torch.int32), ref.view(torch.int32)), (name, R, wts)
++
++
++def test_prompt_rows_do_not_depend_on_the_window(monkeypatch):
++    """A row's output in a prompt window equals its output alone (one row, the grouping kernel), for 4.05's widths."""
++
++    from tensorfold.cuda.exl3 import experts
++
++    E, D, I, TOPK, ROWS = 33, 512, 256, 6, 200
++    ex = _layer(E, D, I, lambda e: (12, 12, 12) if e == E - 1 else (8, 8, 8), 2, seed=3)
++    g = torch.Generator().manual_seed(4)
++    x = (torch.randn((ROWS, D), generator=g) * 0.5).to(torch.bfloat16).cuda()
++    sel, _ = _skewed_picks(E, ROWS, TOPK, g)
++    scratch = experts.Scratch(ex, ROWS, TOPK + 1)
++    monkeypatch.setattr(experts, "PROMPT", "prompt")
++    full = experts.routed(x, sel, None, ex, scratch, None, ROWS).clone().view(ROWS, TOPK + 1, D)
++    for r in (0, 1, 77, 199):
++        one = experts.routed(x[r:r + 1], sel[r:r + 1].contiguous(), None, ex, scratch, None, 1).view(TOPK + 1, D)
++        keep = sel[r] < E
++        assert torch.equal(full[r][keep].view(torch.int32), one[keep].view(torch.int32)), r
++
++
++def test_decode_windows_keep_the_grouping_kernel(monkeypatch):
++    """At or below PROMPT_ROWS rows (decode, graphs) routed() takes the grouping path: no plan is made."""
++
++    from tensorfold.cuda.exl3 import experts
++
++    monkeypatch.setattr(experts, "PROMPT", "prompt")
++    ex = _layer(9, 512, 256, lambda e: (8, 8, 8), 2, seed=1)
++    scratch = experts.Scratch(ex, 64, 3)
++    x = torch.randn((8, 512)).to(torch.bfloat16).cuda()
++    sel = torch.randint(0, 9, (8, 3), dtype=torch.int32).cuda()
++    experts.routed(x, sel, None, ex, scratch, None, 8)
++    assert scratch._plan is None
++
++
++def test_prompt_bf16_y_is_the_rounded_fp32_y(monkeypatch):
++    """y_out (bf16, the prompt path's per-slot Y) equals the grouping kernel's fp32 Y copied into bf16."""
++
++    from tensorfold.cuda.exl3 import experts
++
++    E, D, I, TOPK, ROWS = 33, 512, 256, 6, 160
++    ex = _layer(E, D, I, lambda e: (12, 12, 12) if e == E - 1 else (8, 8, 8), 2, seed=8)
++    g = torch.Generator().manual_seed(9)
++    x = (torch.randn((ROWS, D), generator=g) * 0.5).to(torch.bfloat16).cuda()
++    logits = torch.randn((ROWS, E - 1), generator=g) + torch.linspace(4.0, -4.0, E - 1)
++    sel = logits.topk(TOPK, dim=1).indices.to(torch.int32)        # every slot routed, no expert twice in a row
++    sel = torch.cat([sel, torch.full((ROWS, 1), E - 1, dtype=torch.int32)], 1).cuda().contiguous()
++    scratch = experts.Scratch(ex, ROWS, TOPK + 1)
++    monkeypatch.setattr(experts, "PROMPT", "group")
++    ref32 = experts.routed(x, sel, None, ex, scratch, None, ROWS).clone()
++    ref = ref32.to(torch.bfloat16)
++    monkeypatch.setattr(experts, "PROMPT", "prompt")
++    scratch.y.fill_(float("nan"))
++    got32 = experts.routed(x, sel, None, ex, scratch, None, ROWS).clone()
++    bad32 = (got32.view(torch.int32) != ref32.view(torch.int32)).sum().item()
++    out = torch.full((ROWS * (TOPK + 1), D), float("nan"), dtype=torch.bfloat16, device="cuda")
++    got = experts.routed(x, sel, None, ex, scratch, None, ROWS, y_out=out)
++    assert got.data_ptr() == out.data_ptr()
++    bad = (out.view(torch.int16) != ref.view(torch.int16))
++    rows = bad.any(dim=1).nonzero().flatten().tolist()
++    assert bad32 == 0 and not rows, (bad32, int(bad.sum()), rows[:20], len(rows))
+-- 
+2.43.0
+

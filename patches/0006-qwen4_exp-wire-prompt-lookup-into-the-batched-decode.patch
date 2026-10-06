@@ -1,0 +1,752 @@
+From 20c9a7d609fd9866a61489af55050c249e74bd38 Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 16:56:54 +0800
+Subject: [PATCH 6/6] qwen4_exp: wire prompt-lookup into the batched decoder
+ (per-stream backlog) + calibrate gate costs
+
+P7.1.1/P7.1.2: multi.py _draft_all stages each stream's accepted rows in a per-stream backlog; streams.py exposes lookup_drafted/accepted metrics; lookup.py costs_for carries measured verify/MTP timings plus an env-gated TF_EXL3_LOOKUP_DEBUG hook. Default stays forced l7:2; the auto gate remains experimental (its cost model is biased, see handover).
+---
+ src/tensorfold/cuda/streams.py                |   8 +-
+ .../families/qwen4_exp/cuda/decode.py         |  21 +++
+ .../families/qwen4_exp/cuda/lookup.py         |  38 ++++-
+ .../families/qwen4_exp/cuda/multi.py          |  99 +++++++++---
+ tools/p7_conc_bench.py                        |  82 ++++++++++
+ tools/p7_conc_edit.py                         |  74 +++++++++
+ tools/p7_cost_fit.py                          |  42 +++++
+ tools/p7_probe.py                             |  21 +++
+ tools/p7_profile.py                           | 143 ++++++++++++++++++
+ 9 files changed, 502 insertions(+), 26 deletions(-)
+ create mode 100644 tools/p7_conc_bench.py
+ create mode 100644 tools/p7_conc_edit.py
+ create mode 100644 tools/p7_cost_fit.py
+ create mode 100644 tools/p7_probe.py
+ create mode 100644 tools/p7_profile.py
+
+diff --git a/src/tensorfold/cuda/streams.py b/src/tensorfold/cuda/streams.py
+index 07492c8..b3dc1e0 100644
+--- a/src/tensorfold/cuda/streams.py
++++ b/src/tensorfold/cuda/streams.py
+@@ -39,6 +39,8 @@ class Stream:
+     min_rows: int = 0
+     drafted: int = 0                                      # drafted rows its rounds verified, and the ones kept
+     accepted: int = 0
++    lookup_drafted: int = 0                               # lookup-arm drafts its rounds verified, and the ones kept
++    lookup_accepted: int = 0
+     cached: int = 0
+     prefill_s: float = 0.0
+     started: float = 0.0
+@@ -69,11 +71,13 @@ class Stream:
+     def stats(self) -> dict:
+         own = {"prefill_s": round(self.prefill_s, 4), "decode_s": round(max(self.finished - self.started, 0.0), 4),
+                "rounds": self.rounds, "drafts": self.draft, "cached": self.cached, "min_rows": self.min_rows,
+-               "drafted": self.drafted, "accepted": self.accepted}
++               "drafted": self.drafted, "accepted": self.accepted,
++               "lookup_drafted": self.lookup_drafted, "lookup_accepted": self.lookup_accepted}
+         if self.carry is None:
+             return own
+         both = {k: round(self.carry[k] + own[k], 4) for k in ("prefill_s", "decode_s")}
+-        both.update({k: self.carry[k] + own[k] for k in ("rounds", "drafted", "accepted")})
++        both.update({k: self.carry.get(k, 0) + own[k]
++                     for k in ("rounds", "drafted", "accepted", "lookup_drafted", "lookup_accepted")})
+         rows = [r for r in (self.carry["min_rows"], own["min_rows"]) if r]
+         return {**own, **both, "cached": self.carry["cached"], "min_rows": min(rows, default=0)}
+ 
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/decode.py b/src/tensorfold/families/qwen4_exp/cuda/decode.py
+index 12779b6..5530e15 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/decode.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/decode.py
+@@ -2,6 +2,8 @@
+ 
+ from __future__ import annotations
+ 
++import json
++import os
+ import time
+ from dataclasses import dataclass, field
+ from typing import Sequence
+@@ -21,6 +23,8 @@ from .state import CAND, Buffers, State
+ from .mtp import mtp_forward
+ from .weights import Weights
+ 
++_COST_LOG = os.environ.get("TF_EXL3_COST_LOG", "")   # P7.1.2 cost calibration: append per-round timings here
++
+ 
+ def sample_mapped(logits: torch.Tensor, positions: Sequence[int], sampling: Sampling | None,
+                   id_map: torch.Tensor) -> list[int]:
+@@ -531,6 +535,7 @@ def _mtp_lookup_decode(e: Engine, pending: int, count: int, sampling: Sampling |
+     start = time.perf_counter()
+     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+         room = count - len(out)
++        t_mtp = 0.0
+         look = lookup.plan(out, room)
+         if look:
+             drafts, arm, steps_m, backlog_m = look, "l", 0, 0
+@@ -539,7 +544,13 @@ def _mtp_lookup_decode(e: Engine, pending: int, count: int, sampling: Sampling |
+             backlog_m = len(m_next)
+             n = min(depth, room)
+             if n > 0 and m_next:
++                if _COST_LOG:
++                    torch.cuda.synchronize()
++                    _m = time.perf_counter()
+                 drafts = draft(e, m_rows[:len(m_next)], m_next, st.pos + 1, n, sampling, confidence)
++                if _COST_LOG:
++                    torch.cuda.synchronize()
++                    t_mtp = (time.perf_counter() - _m) * 1000.0
+                 steps_m = 1 + st.mtp_drafted
+                 m_next = []
+             else:
+@@ -549,7 +560,13 @@ def _mtp_lookup_decode(e: Engine, pending: int, count: int, sampling: Sampling |
+         if window is not None:                           # the drafts no accepted path can hold are cut first
+             tokens, drafts = window.tokens, window.tokens[1:]
+         R = len(tokens)
++        if _COST_LOG:
++            torch.cuda.synchronize()
++            _f = time.perf_counter()
+         logits = e.forward(tokens)
++        if _COST_LOG:
++            torch.cuda.synchronize()
++            t_fwd = (time.perf_counter() - _f) * 1000.0
+         if window is not None:
+             constraint.mask(logits[:R], window, w.meta.get("vocab_offset", 0))
+         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling, gathered=window is None)
+@@ -568,6 +585,10 @@ def _mtp_lookup_decode(e: Engine, pending: int, count: int, sampling: Sampling |
+         keeps.append(keep)
+         widths.append(R)
+         lookup.record(arm, R, steps_m, backlog_m, keep)
++        if _COST_LOG:
++            with open(_COST_LOG, "a") as fh:
++                fh.write(json.dumps({"arm": arm, "rows": R, "steps": steps_m, "backlog": backlog_m,
++                                     "keep": keep, "fwd_ms": t_fwd, "mtp_ms": t_mtp}) + "\n")
+         m_rows[len(m_next):len(m_next) + keep].copy_(b.streams[:keep])
+         m_next.extend(sampled[:keep])
+         if len(m_next) > rows:                          # the MTP cache takes a leading chunk; the rest waits
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/lookup.py b/src/tensorfold/families/qwen4_exp/cuda/lookup.py
+index 753049e..1b221d0 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/lookup.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/lookup.py
+@@ -41,15 +41,30 @@ DECAY = 0.85                      # a band's evidence fades by this a round that
+ ALT_WINDOW = 8                    # the other drafters' rate: their last 8 rounds
+ PROBE_EVERY = 8                   # a band of matches of 16+ tokens the gate skipped this many times is tried once
+ PROBE_MATCH = 16
++_DEBUG = bool(os.environ.get("TF_EXL3_LOOKUP_DEBUG"))     # TF_EXL3_LOOKUP_DEBUG=1 prints each gate decision
++
++
++# verify window wall time (ms) by row count, measured single-stream on tf-exl3 (P7.1.2 microbench, tools/p7_cost_fit.py).
++# A window is dominated by a ~27 ms per-round fixed cost, so extra rows are cheap and the gate should draft deep.
++_VERIFY_MS = (27.0, 30.4, 33.7, 35.9, 40.6, 41.7, 42.8, 46.9)
++_MTP_MS = 1.8                      # MTP arm's fixed per-round overhead, from the same fit (mtp_ms ~ a + b*(steps-1))
++_MTP_STEP_MS = 1.3                 # and per chained step (the backlog term fit to ~0, absorbed by the fixed part)
+ 
+ 
+ def costs_for(rows: int) -> dict:
+-    """The per-round model costs the gate prices rounds with, in arbitrary but self-consistent units (relative
+-    timings only: ``verify[k]`` is a k+1-row window, ``mtp``/``mtp_step``/``mtp_row`` the MTP head's). ``rows`` is
+-    the engine's widest verify window. Calibrate in P7.4; correctness does not depend on it."""
++    """The per-round model costs the gate prices rounds with, in milliseconds (relative timings only:
++    ``verify[k]`` is a k+1-row window, ``mtp``/``mtp_step``/``mtp_row`` the MTP head's). ``rows`` is the engine's
++    widest verify window. Calibrated P7.1.2 (tf-exl3); correctness does not depend on it."""
+ 
+     rows = max(2, int(rows))
+-    return {"verify": [float(k + 1) for k in range(rows)], "mtp": 1.0, "mtp_step": 0.5, "mtp_row": 0.1,
++    if rows <= len(_VERIFY_MS):
++        verify = list(_VERIFY_MS[:rows])
++    else:
++        verify = list(_VERIFY_MS)
++        step = _VERIFY_MS[-1] - _VERIFY_MS[-2]
++        while len(verify) < rows:
++            verify.append(verify[-1] + step)
++    return {"verify": [float(v) for v in verify], "mtp": _MTP_MS, "mtp_step": _MTP_STEP_MS, "mtp_row": 0.0,
+             "block": 0.0, "taps_row": 0.0}
+ 
+ 
+@@ -312,9 +327,15 @@ class Lookup:
+         if not drafts:
+             return []
+         self.band = self._band(length)
++        if _DEBUG:
++            print("LOOKUP band=%d len=%d p=%.3f ndraft=%d alt=%.4f" % (self.band, length, self.p(self.band),
++                  len(drafts), self.alt_rate()), flush=True)
+         if self.gated:
+             b = self.band
+             k, rate = best_depth(self.p(b), self.costs, len(drafts), self.row_ms)
++            if _DEBUG:
++                print("LOOKUP gate k=%d rate=%.4f alt=%.4f skip=%s" % (k, rate, self.alt_rate(),
++                      k == 0 or rate <= self.alt_rate()), flush=True)
+             if k == 0 or rate <= self.alt_rate():
+                 # a long match's acceptance is learned only by trying it: once in a while, it is
+                 self.skipped[b] += 1
+@@ -337,6 +358,13 @@ class Lookup:
+             self.rounds += 1
+             self.drafted += drafts
+             self.accepted += kept
++            if _DEBUG:
++                print("REC l band=%d p=%.3f acc=%.2f tri=%.2f kept=%d/%d alt=%.4f" % (
++                    b, self.p(b), self.acc[b], self.tri[b], kept, drafts, self.alt_rate()), flush=True)
+             return
+-        self.alt.append((keep, round_ms(self.costs, arm, rows, steps, backlog)))
++        _ms = round_ms(self.costs, arm, rows, steps, backlog)
++        if _DEBUG:
++            print("REC m arm=%s rows=%d steps=%d backlog=%d keep=%d ms=%.2f alt=%.4f" % (
++                arm, rows, steps, backlog, keep, _ms, self.alt_rate()), flush=True)
++        self.alt.append((keep, _ms))
+         del self.alt[:-ALT_WINDOW]
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/multi.py b/src/tensorfold/families/qwen4_exp/cuda/multi.py
+index e4326b4..b37e60b 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/multi.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/multi.py
+@@ -21,6 +21,7 @@ from .decode import (PREFILL_ROWS, WARM_TAIL, Engine, _gathered_fits, choose_gat
+                      entry_end, prefill_begin, tp_sample_rows)
+ from . import attn_multi, gdn_multi, image_rows, prefixes
+ from .forward import commit, compute, compute_mixed, converges, stage
++from .lookup import build_lookup, env_spec
+ from .mtp import mtp_compute, mtp_stage
+ from .state import Buffers, State
+ from .multi_solo import Alone, solo
+@@ -67,6 +68,9 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+         self.pbuf = Buffers(w, prefill_rows + (rows if self.converged else 0), capacity, prefill=True)
+         self.gdn = gdn_multi.Scratch(w, rows)            # every stream's DeltaNet rows, one launch a step
+         self.held: dict[int, list[int]] = {}             # stream id -> last round's kept rows, folded in next round
++        self.lookups: dict[int, object] = {}             # stream id -> its prompt-lookup arm (TF_EXL3_LOOKUP), or none
++        self.back: dict[int, list] = {}                  # stream id -> rows a lookup round deferred, absorbed with the next MTP round
++        self.arm: dict[int, tuple] = {}                  # stream id -> (arm, rows, steps, backlog) of the drafts now pending
+         # slots start small and grow with their stream's context, up to the window, while the gate has room
+         self.free = [State(w, min(capacity, FIRST), depth + 1, kv_dtype, limit=capacity) for _ in range(slots)]
+         self.slots = list(self.free)
+@@ -399,7 +403,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+                     s.error = exc
+             last = s.error is not None or len(s.out) + len(new) >= s.count or end in self._ends(s)
+             kept.append((s, a0, rows[:len(path)], new, last))
+-        self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last])
++        self._draft_all([(s, a0, keep, new) for s, a0, keep, new, last in kept if s.draft and not last])
+         for s, _, _, new, _ in kept:
+             if s.error is not None:
+                 s.done = True
+@@ -415,44 +419,95 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+         return failed + done + ended
+ 
+     def _draft_all(self, streams: list) -> None:
+-        """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth."""
+-
+-        for s, _, _ in streams:
++        """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth.
++
++        A stream whose prompt suffix matches drafts from the prompt (``TF_EXL3_LOOKUP``) and defers its rows; they
++        are absorbed, with the rows just kept, in the next MTP round, so the MTP cache never skips a position.
++        """
++
++        for s, _, keep, _ in streams:                    # price the drafts this round verified by the arm that made them
++            info = self.arm.pop(s.sid, None)
++            if info is not None:
++                lk = self.lookups.get(s.sid)
++                if lk is not None:
++                    lk.record(info[0], info[1], info[2], info[3], len(keep))
++                    s.lookup_drafted, s.lookup_accepted = lk.drafted, lk.accepted
+             s.drafts = []
+-        room = {s.sid: min(self.depth, s.count - len(s.out) - len(keep)) for s, _, keep in streams}
+-        todo = [(s, a0, keep) for s, a0, keep in streams if room[s.sid] > 0 and self.mbuf is not None]
++        room = {s.sid: min(self.depth, s.count - len(s.out) - len(keep)) for s, _, keep, _ in streams}
++        todo = [(s, a0, keep, new) for s, a0, keep, new in streams if room[s.sid] > 0 and self.mbuf is not None]
+         if not todo:
+             return
+-        for s, _, _ in todo:
++        for s, _, _, _ in todo:
+             st = s.st
+             if st.mtp_drafted:
+                 st.set_mtp_len(st.mtp_len - st.mtp_drafted)
+                 st.mtp_drafted = 0
+-        windows = [(s.st, keep, self.buf.streams[a0:a0 + len(keep)]) for s, a0, keep in todo]
+-        segs = mtp_stage(self.w, self.mbuf, windows)
+-        logits = self._mtp(segs)
+-        for (s, _, keep), (st, a0, a1) in zip(todo, segs):
+-            st.set_mtp_len(st.mtp_len + len(keep))
+-        active = [(s, a1 - 1) for s, (_, _, a1) in zip([t[0] for t in todo], segs)]
++        spec = env_spec() if self.w.comm is None else None
++        mtp = []
++        for s, a0, keep, new in todo:
++            look = self.lookups.get(s.sid)
++            if look is None and spec is not None:
++                look = build_lookup(s.prompt, self.depth + 1, spec, eos=self.eos, stop_eos=s.stop_eos)
++                if look is not None:
++                    self.lookups[s.sid] = look
++            drafts = list(look.plan([*s.out, *new], room[s.sid])) if look is not None else []
++            back = self.back.get(s.sid, [])
++            full = sum(len(t) for _, t in back) >= self.depth + 1
++            if drafts and not full:                      # lookup arm: draft from the prompt, defer this round's rows
++                s.drafts = drafts
++                back.append((self.buf.streams[a0:a0 + len(keep)].clone(), list(keep)))
++                self.back[s.sid] = back
++                self.arm[s.sid] = ("l", 1 + len(drafts), 0, 0)
++            else:                                        # MTP arm: absorb the deferred rows and the rows just kept
++                mtp.append((s, a0, keep, look))
++        if not mtp:
++            return
++        rows, toks = {}, {}
++        for s, a0, keep, _ in mtp:
++            entries = [*self.back.pop(s.sid, []), (self.buf.streams[a0:a0 + len(keep)], list(keep))]
++            rows[s.sid] = entries[0][0] if len(entries) == 1 else torch.cat([t for t, _ in entries])
++            toks[s.sid] = [x for _, t in entries for x in t]
++        budget, seeds = self.mbuf.rows, {}
++        off = {s.sid: 0 for s, _, _, _ in mtp}
++        while any(off[s.sid] < len(toks[s.sid]) for s, _, _, _ in mtp):
++            chunk, used = [], 0
++            for s, _, _, _ in mtp:
++                left = len(toks[s.sid]) - off[s.sid]
++                if left <= 0 or used >= budget:
++                    continue
++                take = min(left, budget - used)
++                at = off[s.sid]
++                chunk.append((s, toks[s.sid][at:at + take], rows[s.sid][at:at + take]))
++                off[s.sid] = at + take
++                used += take
++            segs = mtp_stage(self.w, self.mbuf, [(s.st, tk, ten) for s, tk, ten in chunk])
++            logits = self._mtp(segs)
++            for i, ((s, tk, _), (st, a0, a1)) in enumerate(zip(chunk, segs)):
++                st.set_mtp_len(st.mtp_len + len(tk))
++                if off[s.sid] >= len(toks[s.sid]):       # the chain starts from the last row this stream absorbed
++                    seeds[s.sid] = (logits[i].clone(), self.mbuf.streams[a1 - 1:a1].clone())
++        active = [(s, seeds[s.sid][1]) for s, _, _, _ in mtp]
++        logits = torch.stack([seeds[s.sid][0] for s, _, _, _ in mtp])
+         for j in range(self.depth):
+             picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active])
+             nxt = []
+-            for (s, row), (d, p) in zip(active, picks):
++            for (s, sr), (d, p) in zip(active, picks):
+                 low = self.confidence > 0 and p < self.confidence
+                 if low and j > 0:
+                     continue
+                 s.drafts.append(d)
+                 if not low and j + 1 < room[s.sid]:
+-                    nxt.append((s, row, d))
++                    nxt.append((s, sr, d))
+             if not nxt:
+-                return
+-            windows = [(s.st, [d], self.mbuf.streams[row:row + 1]) for s, row, d in nxt]
+-            segs = mtp_stage(self.w, self.mbuf, windows)
++                break
++            segs = mtp_stage(self.w, self.mbuf, [(s.st, [d], sr) for s, sr, d in nxt])
+             logits = self._mtp(segs)
+             for s, _, _ in nxt:
+                 s.st.set_mtp_len(s.st.mtp_len + 1)
+                 s.st.mtp_drafted += 1
+-            active = [(s, a0) for (s, _, _), (_, a0, _) in zip(nxt, segs)]
++            active = [(s, self.mbuf.streams[a0:a0 + 1]) for (s, _, _), (_, a0, _) in zip(nxt, segs)]
++        for s, _, _, _ in mtp:                           # price these drafts for the next round's record
++            self.arm[s.sid] = ("m", 1 + len(s.drafts), 1 + len(s.drafts), len(toks[s.sid]))
+ 
+     def _mtp(self, segs: list) -> torch.Tensor:
+         """An MTP step over every drafting stream, its attention one launch a kernel for all of them."""
+@@ -513,6 +568,9 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+             self.link.send(["finish", [s.sid for s in done]])
+         for s in done:
+             self.held.pop(s.sid, None)
++            self.arm.pop(s.sid, None)
++            self.lookups.pop(s.sid, None)
++            self.back.pop(s.sid, None)
+             self.streams.pop(s.sid, None)
+             if not any(k[1] is s.st for k in self.kept) and all(f is not s.st for f in self.free):
+                 self._shrink(s.st)
+@@ -526,6 +584,9 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+         for s in live:
+             self.streams.pop(s.sid, None)
+             self.held.pop(s.sid, None)
++            self.arm.pop(s.sid, None)
++            self.lookups.pop(s.sid, None)
++            self.back.pop(s.sid, None)
+             self._drop_kept(s.st)
+             self._shrink(s.st)
+             self.free.append(s.st)
+diff --git a/tools/p7_conc_bench.py b/tools/p7_conc_bench.py
+new file mode 100644
+index 0000000..0c54864
+--- /dev/null
++++ b/tools/p7_conc_bench.py
+@@ -0,0 +1,82 @@
++"""Concurrent P7.1 class bench: K simultaneous prompts of one class share each round's forward
++(the batched MultiDecoder path the P7.1.1 lookup wiring targets). Reports per-stream and mean decode
++tok/s from the server's own tensorfold.decode_s. Compare TF_EXL3_LOOKUP=l7:2 vs "" (MTP-only).
++
++  python3 tools/p7_conc_bench.py http://127.0.0.1:8080 MODEL --class code --streams 2 --rounds 6 --label l7:2
++"""
++
++import argparse
++import json
++import statistics
++import threading
++import urllib.request
++
++FILE = "\n".join([
++    "def add(a, b):", "    return a + b", "", "def sub(a, b):", "    return a - b", "",
++    "def mul(a, b):", "    return a * b", "", "def div(a, b):", "    return a / b", "",
++    "def mod(a, b):", "    return a % b", "", "def power(a, b):", "    return a ** b", "",
++    "def floor_div(a, b):", "    return a // b", "", "def max_of(a, b):", "    return a if a > b else b", "",
++    "def min_of(a, b):", "    return a if a < b else b", "", "def abs_of(a):",
++    "    return a if a >= 0 else -a", "", "def neg(a):", "    return -a",
++])
++CLASSES = {
++    "chat": "用中文简要解释什么是 GPU 并行计算，用一段话说明，不超过 120 字。",
++    "code": "用 Python 写一个函数 fib(n)，返回第 n 个斐波那契数，要求用迭代实现。只输出代码，不要解释。",
++    "prose": "法国首都是哪座城市？只答城市名。",
++    "repeat": "严格按下面的模式续写，逐字复现，只输出序列，不要解释：\n\napple, banana, cherry, apple, banana, cherry, apple, banana, cherry, apple,",
++    "edit": "你是一个代码编辑助手。下面是文件 utils.py 的全部内容：\n\n```python\n" + FILE +
++            "\n```\n\n请给每个函数加上类型注解，并完整输出整个文件（不要省略任何行，不要解释）。",
++    "continue": "严格续写下面的文件内容，逐字复现已有函数，然后追加一个新函数 double(a) 返回 a * 2。"
++                "只输出代码，不要解释：\n\n```python\n" + FILE,
++}
++
++
++def one(base, model, prompt, tokens, out, idx, barrier):
++    body = {"model": model, "max_tokens": tokens, "temperature": 0, "ignore_eos": True,
++            "messages": [{"role": "user", "content": prompt}], "draft": True,
++            "chat_template_kwargs": {"enable_thinking": False}}
++    req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
++                                 headers={"Content-Type": "application/json"})
++    barrier.wait()
++    with urllib.request.urlopen(req, timeout=900) as resp:
++        data = json.loads(resp.read())
++    tf = data["tensorfold"]
++    n = data["usage"]["completion_tokens"]
++    out[idx] = {"tps": (n - 1) / tf["decode_s"] if tf["decode_s"] > 0 else 0.0, "n": n,
++                "decode_s": tf["decode_s"], "rounds": tf["rounds"],
++                "ld": tf.get("lookup_drafted"), "la": tf.get("lookup_accepted")}
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("base")
++    p.add_argument("model")
++    p.add_argument("--class", dest="klass", default="code", choices=sorted(CLASSES))
++    p.add_argument("--tokens", type=int, default=128)
++    p.add_argument("--streams", type=int, default=2)
++    p.add_argument("--rounds", type=int, default=6)
++    p.add_argument("--label", default="")
++    a = p.parse_args()
++    prompt = CLASSES[a.klass]
++    means = []
++    for r in range(a.rounds):
++        out = {}
++        barrier = threading.Barrier(a.streams)
++        threads = [threading.Thread(target=one, args=(a.base, a.model, prompt, a.tokens, out, i, barrier))
++                   for i in range(a.streams)]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++        vals = [out[i] for i in sorted(out)]
++        mean = statistics.mean(v["tps"] for v in vals)
++        means.append(mean)
++        print("round", r, a.label, "perstream=", [round(v["tps"], 1) for v in vals],
++              "mean=%.1f" % mean, "ld=", [v["ld"] for v in vals], "la=", [v["la"] for v in vals],
++              "rounds=", [v["rounds"] for v in vals])
++    steady = means[1:] if len(means) > 1 else means
++    print("LABEL", a.label, "CLASS", a.klass, "OVERALL_MEAN=%.1f" % statistics.mean(means),
++          "STEADY_MEAN=%.1f" % statistics.mean(steady))
++
++
++main()
+diff --git a/tools/p7_conc_edit.py b/tools/p7_conc_edit.py
+new file mode 100644
+index 0000000..ddd0953
+--- /dev/null
++++ b/tools/p7_conc_edit.py
+@@ -0,0 +1,74 @@
++"""Concurrent P7.1 edit-class decode bench: K simultaneous edit prompts share each round's forward
++(the batched MultiDecoder path the P7.1.1 lookup wiring targets). Reports per-stream and mean decode
++tok/s from the server's own tensorfold.decode_s. Compare TF_EXL3_LOOKUP=l7:2 vs "" (MTP-only).
++
++  python3 tools/p7_conc_edit.py http://127.0.0.1:8080 MODEL --streams 2 --rounds 3 --label l7:2
++"""
++
++import argparse
++import json
++import statistics
++import threading
++import urllib.request
++
++FILE = "\n".join([
++    "def add(a, b):", "    return a + b", "", "def sub(a, b):", "    return a - b", "",
++    "def mul(a, b):", "    return a * b", "", "def div(a, b):", "    return a / b", "",
++    "def mod(a, b):", "    return a % b", "", "def power(a, b):", "    return a ** b", "",
++    "def floor_div(a, b):", "    return a // b", "", "def max_of(a, b):", "    return a if a > b else b", "",
++    "def min_of(a, b):", "    return a if a < b else b", "", "def abs_of(a):",
++    "    return a if a >= 0 else -a", "", "def neg(a):", "    return -a",
++])
++PROMPTS = [
++    "你是一个代码编辑助手。下面是文件 utils.py 的全部内容：\n\n```python\n" + FILE +
++    "\n```\n\n请给每个函数加上类型注解，并完整输出整个文件（不要省略任何行，不要解释）。",
++    "严格续写下面的文件内容，逐字复现已有函数，然后追加一个新函数 double(a) 返回 a * 2。"
++    "只输出代码，不要解释：\n\n```python\n" + FILE,
++]
++
++
++def one(base, model, prompt, tokens, out, idx, barrier):
++    body = {"model": model, "max_tokens": tokens, "temperature": 0, "ignore_eos": True,
++            "messages": [{"role": "user", "content": prompt}], "draft": True,
++            "chat_template_kwargs": {"enable_thinking": False}}
++    req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
++                                 headers={"Content-Type": "application/json"})
++    barrier.wait()
++    with urllib.request.urlopen(req, timeout=900) as resp:
++        data = json.loads(resp.read())
++    tf = data["tensorfold"]
++    n = data["usage"]["completion_tokens"]
++    out[idx] = {"tps": (n - 1) / tf["decode_s"] if tf["decode_s"] > 0 else 0.0, "n": n,
++                "decode_s": tf["decode_s"], "rounds": tf["rounds"],
++                "ld": tf.get("lookup_drafted"), "la": tf.get("lookup_accepted")}
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("base")
++    p.add_argument("model")
++    p.add_argument("--tokens", type=int, default=128)
++    p.add_argument("--streams", type=int, default=2)
++    p.add_argument("--rounds", type=int, default=3)
++    p.add_argument("--label", default="")
++    a = p.parse_args()
++    means = []
++    for r in range(a.rounds):
++        out = {}
++        barrier = threading.Barrier(a.streams)
++        threads = [threading.Thread(target=one, args=(a.base, a.model, PROMPTS[i % len(PROMPTS)],
++                   a.tokens, out, i, barrier)) for i in range(a.streams)]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++        vals = [out[i] for i in sorted(out)]
++        mean = statistics.mean(v["tps"] for v in vals)
++        means.append(mean)
++        print("round", r, a.label, "perstream=", [round(v["tps"], 1) for v in vals],
++              "mean=%.1f" % mean, "ld=", [v["ld"] for v in vals], "la=", [v["la"] for v in vals],
++              "rounds=", [v["rounds"] for v in vals])
++    print("LABEL", a.label, "OVERALL_MEAN=%.1f" % statistics.mean(means))
++
++
++main()
+diff --git a/tools/p7_cost_fit.py b/tools/p7_cost_fit.py
+new file mode 100644
+index 0000000..8a64109
+--- /dev/null
++++ b/tools/p7_cost_fit.py
+@@ -0,0 +1,42 @@
++"""P7.1.2 cost fitter: read TF_EXL3_COST_LOG JSONL, print verify[] (fwd ms per window width)
++and a least-squares fit of the MTP arm's mtp_ms ~ a + b*(steps-1) + c*(backlog-1)."""
++
++import json
++import statistics
++from collections import defaultdict
++
++import numpy as np
++
++rows_data = defaultdict(list)
++m_data = []
++n = 0
++with open("/tmp/cost.jsonl") as fh:
++    for line in fh:
++        line = line.strip()
++        if not line:
++            continue
++        r = json.loads(line)
++        n += 1
++        rows_data[r["rows"]].append(r["fwd_ms"])
++        if r["arm"] == "m":
++            m_data.append((r["steps"], r["backlog"], r["mtp_ms"]))
++
++print("total rounds:", n, "  m-arm:", len(m_data))
++print("%4s %6s %12s %10s %10s" % ("rows", "count", "fwd_ms_mean", "fwd_min", "fwd_max"))
++for rows in sorted(rows_data):
++    v = rows_data[rows]
++    print("%4d %6d %12.4f %10.4f %10.4f" % (rows, len(v), statistics.mean(v), min(v), max(v)))
++
++if m_data:
++    A = np.array([[1.0, s - 1, b - 1] for s, b, _ in m_data])
++    y = np.array([m for _, _, m in m_data])
++    coef, *_ = np.linalg.lstsq(A, y, rcond=None)
++    pred = A @ coef
++    print("\nmtp fit: mtp_ms = %.4f + %.4f*(steps-1) + %.4f*(backlog-1)" % tuple(coef))
++    print("residual std: %.4f" % float(np.std(y - pred)))
++    g = defaultdict(list)
++    for s, b, m in m_data:
++        g[(s, b)].append(m)
++    print("%6s %8s %5s %14s" % ("steps", "backlog", "n", "mtp_ms_mean"))
++    for k in sorted(g):
++        print("%6d %8d %5d %14.3f" % (k[0], k[1], len(g[k]), statistics.mean(g[k])))
+diff --git a/tools/p7_probe.py b/tools/p7_probe.py
+new file mode 100644
+index 0000000..60386fc
+--- /dev/null
++++ b/tools/p7_probe.py
+@@ -0,0 +1,21 @@
++#!/usr/bin/env python3
++"""P7.1.2 field probe: one drafted request, dump the response blocks' keys and values."""
++import json
++import urllib.request
++
++BASE = "http://127.0.0.1:8080"
++MODEL = "Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5"
++body = {
++    "model": MODEL, "max_tokens": 48, "temperature": 0, "ignore_eos": True, "draft": True,
++    "messages": [{"role": "user", "content": "用中文简要解释什么是 GPU 并行计算，一段话，不超过 80 字。"}],
++    "chat_template_kwargs": {"enable_thinking": False},
++}
++req = urllib.request.Request(BASE + "/v1/chat/completions",
++                             data=json.dumps(body).encode(),
++                             headers={"Content-Type": "application/json"})
++d = json.loads(urllib.request.urlopen(req, timeout=180).read())
++for k, v in d.items():
++    if k == "choices":
++        v = [{"finish_reason": c.get("finish_reason"),
++              "message_keys": sorted((c.get("message") or {}).keys())} for c in v]
++    print(k, "=", json.dumps(v, ensure_ascii=False)[:1200])
+diff --git a/tools/p7_profile.py b/tools/p7_profile.py
+new file mode 100644
+index 0000000..6ef63a1
+--- /dev/null
++++ b/tools/p7_profile.py
+@@ -0,0 +1,143 @@
++#!/usr/bin/env python3
++"""P7.1.2 comprehensive profile: per class, per stream count.
++
++  decode mode (non-streaming): prefill_s, decode_tps, rounds, acceptance, prompt/cached tokens
++  ttft mode (SSE): client-measured time to first content token, and total wall
++
++  python3 tools/p7_profile.py http://127.0.0.1:8080 MODEL --label l7:2 --streams 1,2 --rounds 4
++"""
++
++import argparse
++import json
++import statistics
++import threading
++import time
++import urllib.request
++import uuid
++
++FILE = "\n".join([
++    "def add(a, b):", "    return a + b", "", "def sub(a, b):", "    return a - b", "",
++    "def mul(a, b):", "    return a * b", "", "def div(a, b):", "    return a / b", "",
++    "def mod(a, b):", "    return a % b", "", "def power(a, b):", "    return a ** b", "",
++    "def floor_div(a, b):", "    return a // b", "", "def max_of(a, b):", "    return a if a > b else b", "",
++    "def min_of(a, b):", "    return a if a < b else b", "", "def abs_of(a):",
++    "    return a if a >= 0 else -a", "", "def neg(a):", "    return -a",
++])
++CLASSES = {
++    "chat": "用中文简要解释什么是 GPU 并行计算，用一段话说明，不超过 120 字。",
++    "code": "用 Python 写一个函数 fib(n)，返回第 n 个斐波那契数，要求用迭代实现。只输出代码，不要解释。",
++    "prose": "法国首都是哪座城市？只答城市名。",
++    "repeat": "严格按下面的模式续写，逐字复现，只输出序列，不要解释：\n\napple, banana, cherry, apple, banana, cherry, apple, banana, cherry, apple,",
++    "edit": "你是一个代码编辑助手。下面是文件 utils.py 的全部内容：\n\n```python\n" + FILE +
++            "\n```\n\n请给每个函数加上类型注解，并完整输出整个文件（不要省略任何行，不要解释）。",
++    "continue": "严格续写下面的文件内容，逐字复现已有函数，然后追加一个新函数 double(a) 返回 a * 2。"
++                "只输出代码，不要解释：\n\n```python\n" + FILE,
++}
++
++
++def mean(xs):
++    xs = [x for x in xs if x is not None]
++    return statistics.mean(xs) if xs else float("nan")
++
++
++def body(model, prompt, tokens, stream):
++    return {"model": model, "max_tokens": tokens, "temperature": 0, "ignore_eos": True, "draft": True,
++            "messages": [{"role": "user", "content": prompt}], "stream": stream,
++            "chat_template_kwargs": {"enable_thinking": False}}
++
++
++def call_decode(base, model, prompt, tokens, out, idx, barrier):
++    req = urllib.request.Request(base + "/v1/chat/completions",
++                                 data=json.dumps(body(model, prompt, tokens, False)).encode(),
++                                 headers={"Content-Type": "application/json"})
++    barrier.wait()
++    d = json.loads(urllib.request.urlopen(req, timeout=900).read())
++    tf = d.get("tensorfold", {}) or {}
++    u = d.get("usage", {}) or {}
++    out[idx] = {"prompt": u.get("prompt_tokens"),
++                "cached": (u.get("prompt_tokens_details") or {}).get("cached_tokens"),
++                "prefill_s": tf.get("prefill_s"), "decode_s": tf.get("decode_s"),
++                "tps": tf.get("decode_tps"), "rounds": tf.get("rounds"),
++                "drafted": tf.get("drafted"), "accepted": tf.get("accepted"),
++                "ld": tf.get("lookup_drafted"), "la": tf.get("lookup_accepted")}
++
++
++def call_ttft(base, model, prompt, tokens, out, idx, barrier):
++    req = urllib.request.Request(base + "/v1/chat/completions",
++                                 data=json.dumps(body(model, prompt, tokens, True)).encode(),
++                                 headers={"Content-Type": "application/json"})
++    barrier.wait()
++    t0 = time.perf_counter()
++    ttft = None
++    tlast = t0
++    with urllib.request.urlopen(req, timeout=900) as resp:
++        for raw in resp:
++            tlast = time.perf_counter()
++            line = raw.decode("utf-8", "ignore").strip()
++            if not line.startswith("data:"):
++                continue
++            payload = line[5:].strip()
++            if payload == "[DONE]":
++                break
++            if ttft is None:
++                try:
++                    obj = json.loads(payload)
++                except Exception:
++                    continue
++                for ch in obj.get("choices", []):
++                    if (ch.get("delta") or {}).get("content"):
++                        ttft = time.perf_counter() - t0
++                        break
++    out[idx] = {"ttft": ttft, "total": tlast - t0}
++
++
++def run_cell(base, model, klass, streams, rounds, mode, tokens, unique=False):
++    base_prompt = CLASSES[klass]
++    fn = call_decode if mode == "decode" else call_ttft
++    rows = []
++    for _ in range(rounds):
++        prompts = [("[%s] " % uuid.uuid4().hex) + base_prompt for _ in range(streams)] if unique else [base_prompt] * streams
++        out = {}
++        barrier = threading.Barrier(streams)
++        threads = [threading.Thread(target=fn, args=(base, model, prompts[i], tokens, out, i, barrier))
++                   for i in range(streams)]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++        rows.append([out[i] for i in sorted(out)])
++    steady = rows[1:] if len(rows) > 1 else rows
++    flat = [v for row in steady for v in row]
++    return flat
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("base")
++    p.add_argument("model")
++    p.add_argument("--classes", default="chat,code,edit,continue")
++    p.add_argument("--streams", default="1,2")
++    p.add_argument("--rounds", type=int, default=4)
++    p.add_argument("--tokens", type=int, default=128)
++    p.add_argument("--ttft-tokens", type=int, default=64)
++    p.add_argument("--label", default="")
++    p.add_argument("--unique", action="store_true", help="prepend a per-request nonce so every prompt is a cache miss (cold prefill)")
++    a = p.parse_args()
++    classes = [c for c in a.classes.split(",") if c]
++    streams = [int(s) for s in a.streams.split(",") if s]
++    for s in streams:
++        for klass in classes:
++            d = run_cell(a.base, a.model, klass, s, a.rounds, "decode", a.tokens, a.unique)
++            acc = [c["accepted"] / c["drafted"] for c in d if c.get("drafted")]
++            print("DEC %s class=%s streams=%d cold=%d prompt=%.0f cached=%.0f prefill=%.3f decode_tps=%.1f rounds=%.1f acc=%.3f"
++                  % (a.label, klass, s, int(a.unique), mean([c["prompt"] for c in d]), mean([c["cached"] for c in d]),
++                     mean([c["prefill_s"] for c in d]), mean([c["tps"] for c in d]),
++                     mean([c["rounds"] for c in d]), mean(acc)), flush=True)
++        for klass in classes:
++            t = run_cell(a.base, a.model, klass, s, a.rounds, "ttft", a.ttft_tokens, a.unique)
++            print("TTFT %s class=%s streams=%d cold=%d ttft=%.3f total=%.3f"
++                  % (a.label, klass, s, int(a.unique), mean([c["ttft"] for c in t]), mean([c["total"] for c in t])), flush=True)
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.43.0
+

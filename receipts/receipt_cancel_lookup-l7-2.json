@@ -1,0 +1,40 @@
+{
+  "aborted_after_lines": 5,
+  "ref_serial": {
+    "token_sha": "aef89122efe1",
+    "completion_tokens": 2,
+    "rounds": 1,
+    "decode_s": 0.0279,
+    "prefill_s": 0.0806,
+    "lookup_drafted": 0,
+    "lookup_accepted": 0
+  },
+  "post_cancel_serial": {
+    "token_sha": "aef89122efe1",
+    "completion_tokens": 2,
+    "rounds": 1,
+    "decode_s": 0.0289,
+    "prefill_s": 0.0786,
+    "lookup_drafted": 0,
+    "lookup_accepted": 0
+  },
+  "post_cancel_drafted": {
+    "token_sha": "aef89122efe1",
+    "completion_tokens": 2,
+    "rounds": 1,
+    "decode_s": 0.1567,
+    "prefill_s": 0.0424,
+    "lookup_drafted": 0,
+    "lookup_accepted": 0
+  },
+  "ref_match": true,
+  "health_after": {
+    "busy": false,
+    "requests_running": 0,
+    "streams": {
+      "decoding": 0,
+      "prefilling": 0,
+      "max": 2
+    }
+  }
+}

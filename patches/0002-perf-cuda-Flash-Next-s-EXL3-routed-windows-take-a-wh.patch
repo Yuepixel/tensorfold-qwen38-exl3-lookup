@@ -1,0 +1,70 @@
+From 08558d2e3649959dca5d091779227972b10ab6a7 Mon Sep 17 00:00:00 2001
+From: grearjake-star <228037169+grearjake-star@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 18:57:30 -0400
+Subject: [PATCH 2/6] perf(cuda): Flash Next's EXL3 routed windows take a whole
+ 2048-row prompt chunk (same bits)
+
+The 1024-row routed window came from the grouping kernel keeping a window's picks in 48 KB of shared memory;
+the prompt kernel groups on the plan, so a prompt chunk is one window and each routed expert is read once a
+chunk instead of twice. Its Y lands in the MoE buffer as bf16 straight from the down kernel (y_out), the bits
+of the fp32 copy it replaces. TF_EXL3_MOE_WINDOW overrides (1024 when TF_EXL3_PROMPT=group); the admission
+counts the window's scratch as before.
+
+Flash Next EXL3 4.05 on GB10, in-process prompt seconds with the prompt kernel: 6K 6.07 -> 5.03 at window
+1024 -> 2048.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../families/qwen4_exp/cuda/exl3_pack.py        | 17 ++++++++++++++++-
+ .../families/qwen4_exp/cuda/forward.py          |  7 +++++--
+ 2 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/exl3_pack.py b/src/tensorfold/families/qwen4_exp/cuda/exl3_pack.py
+index 13780fe..3e1f1b0 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/exl3_pack.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/exl3_pack.py
+@@ -13,7 +13,22 @@ import torch
+ from tensorfold.cuda.exl3.format import is_exl3  # noqa: F401  (exl3.py and engine.py import it from here)
+ 
+ EXTRA_FILES = ("ngram_embedding.safetensors", "mtp_hyper_connection_mixer_patch.safetensors")
+-MOE_WINDOW = 1024        # most rows a routed-expert call takes (its grouping keeps every pick in 48 KB of shared memory)
++
++
++def _moe_window() -> int:
++    """Most rows a routed-expert call takes: a 2048-row prompt chunk on the prompt kernel, 1024 on the grouping kernel."""
++
++    from tensorfold.cuda.exl3 import experts as x3experts
++
++    raw = os.environ.get("TF_EXL3_MOE_WINDOW", "")
++    rows = int(raw) if raw else (2048 if x3experts.PROMPT == "prompt" else 1024)
++    if not 16 <= rows <= 4096:
++        raise ValueError(f"TF_EXL3_MOE_WINDOW: 16 to 4096 rows, not {rows}")
++    return rows
++
++
++MOE_WINDOW = _moe_window()   # rows never change a pair's bits; each window reads every routed expert once
++
+ _DT = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32, "I64": torch.int64, "I32": torch.int32,
+        "I16": torch.int16, "U8": torch.uint8, "I8": torch.int8, "U16": torch.int16, "U32": torch.int32}
+ 
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/forward.py b/src/tensorfold/families/qwen4_exp/cuda/forward.py
+index c5fa44d..d72dd78 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/forward.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/forward.py
+@@ -349,8 +349,11 @@ def _exl3_moe(m, w: Weights, b: Buffers, R: int) -> tuple:
+         return 2, y.view(R, buf.slots, -1), buf.wts[:R]
+     for r0 in range(0, R, MOE_WINDOW):
+         n = min(MOE_WINDOW, R - r0)
+-        y = routed(b.mixed[r0:r0 + n], buf.pick[r0:r0 + n], None, m.experts, w.x3.moe, None, n)
+-        buf.y[r0:r0 + n].copy_(y.view(n, buf.slots, -1))
++        dst = buf.y[r0:r0 + n]
++        y = routed(b.mixed[r0:r0 + n], buf.pick[r0:r0 + n], None, m.experts, w.x3.moe, None, n,
++                   y_out=dst.view(n * buf.slots, -1))
++        if y.data_ptr() != dst.data_ptr():
++            dst.copy_(y.view(n, buf.slots, -1))
+     return 2, buf.y[:R], buf.wts[:R]
+ 
+ 
+-- 
+2.43.0
+

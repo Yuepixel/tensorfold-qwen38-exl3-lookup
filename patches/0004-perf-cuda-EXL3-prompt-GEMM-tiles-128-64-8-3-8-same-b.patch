@@ -1,0 +1,62 @@
+From 147598af7a036e9130f485428e1c724f719d0d00 Mon Sep 17 00:00:00 2001
+From: grearjake-star <228037169+grearjake-star@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 18:57:53 -0400
+Subject: [PATCH 4/6] perf(cuda): EXL3 prompt GEMM tiles (128, 64, 8, 3, 8)
+ (same bits)
+
+A 64-wide K step and 3 stages run Flash Next's dense prompt GEMMs 2-5% faster on GB10 (2560 -> 10240:
+1.79 -> 1.75 ms, 6144 -> 2560: 1.33 -> 1.26 ms at 2048 rows); every row's bits are the old tiles' (test).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/tensorfold/cuda/exl3/prefill.py    |  2 +-
+ tests/cuda/test_exl3_prompt_experts.py | 23 +++++++++++++++++++++++
+ 2 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/src/tensorfold/cuda/exl3/prefill.py b/src/tensorfold/cuda/exl3/prefill.py
+index 823e3d6..fe81f2e 100644
+--- a/src/tensorfold/cuda/exl3/prefill.py
++++ b/src/tensorfold/cuda/exl3/prefill.py
+@@ -47,7 +47,7 @@ def _gemm(X, W, H, SVH, BIAS, OUT, M, o_stride, K: tl.constexpr, N: tl.constexpr
+ def tiles(k: int, n: int) -> tuple[int, int, int, int, int]:
+     """(rows a program, K step, warps, stages, row blocks a raster group): the shape's alone, so a row never depends on its chunk."""
+ 
+-    return 128, 32, 8, 4, 8
++    return 128, 64, 8, 3, 8      # 2-5% over (128, 32, 8, 4, 8) on GB10, the same bits (the K step only regroups MMAs)
+ 
+ 
+ class Workspace:
+diff --git a/tests/cuda/test_exl3_prompt_experts.py b/tests/cuda/test_exl3_prompt_experts.py
+index 92f092b..5581bbf 100644
+--- a/tests/cuda/test_exl3_prompt_experts.py
++++ b/tests/cuda/test_exl3_prompt_experts.py
+@@ -165,3 +165,26 @@ def test_f16_prompt_tiles_give_the_sliced_bits(n, k, monkeypatch):
+             monkeypatch.setattr(exl3_mm, "FUSED_MIN", 64)
+             got = lin(x, torch.full((m, n), float("nan"), dtype=dt, device="cuda"))
+             assert torch.equal(got.view(torch.int16), ref.view(torch.int16)), (n, k, m, dt)
++
++
++@pytest.mark.parametrize("k,n", [(2560, 1024), (1024, 2560)])
++def test_exl3_prompt_gemm_tiles_keep_the_bits(k, n, monkeypatch):
++    """The EXL3 prompt GEMM's tiles (rows a program, K step, warps, stages) never change a row's bits: today's tiles
++    against the previous (128, 32, 8, 4, 8), 6-bit mul1 weights, ragged row counts."""
++
++    from tensorfold.cuda.exl3 import prefill as XP
++    from tensorfold.cuda.exl3.linear import Exl3Linear
++
++    g = torch.Generator().manual_seed(k + n)
++    tr = torch.randint(-32768, 32768, (k // 16, n // 16, 96), generator=g, dtype=torch.int32).to(torch.int16)
++    suh = ((torch.rand(k, generator=g) + 0.5) * (torch.randint(0, 2, (k,), generator=g) * 2 - 1) / k ** 0.5).half()
++    svh = ((torch.rand(n, generator=g) + 0.5) * (torch.randint(0, 2, (n,), generator=g) * 2 - 1)).half()
++    lin = Exl3Linear.from_tensors(tr, suh, svh, "mul1")
++    ws = XP.Workspace()
++    for m in (1, 77, 300):
++        x = torch.randn((m, k), generator=g).to(torch.bfloat16).cuda()
++        got = XP.matmul(lin, x, torch.empty((m, n), dtype=torch.bfloat16, device="cuda"), ws).clone()
++        monkeypatch.setattr(XP, "tiles", lambda kk, nn: (128, 32, 8, 4, 8))
++        ref = XP.matmul(lin, x, torch.full((m, n), float("nan"), dtype=torch.bfloat16, device="cuda"), ws)
++        monkeypatch.undo()
++        assert torch.equal(got.view(torch.int16), ref.view(torch.int16)), (k, n, m)
+-- 
+2.43.0
+

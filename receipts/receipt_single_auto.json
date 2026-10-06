@@ -1,0 +1,149 @@
+{
+  "prose": {
+    "serial": {
+      "token_sha": "f4cf4bac607d",
+      "completion_tokens": 2,
+      "rounds": 1,
+      "decode_s": 0.0308,
+      "prefill_s": 0.1306,
+      "lookup_drafted": null,
+      "lookup_accepted": null
+    },
+    "drafted": {
+      "token_sha": "f4cf4bac607d",
+      "completion_tokens": 2,
+      "rounds": 1,
+      "decode_s": 0.1221,
+      "prefill_s": 0.1379,
+      "lookup_drafted": 0,
+      "lookup_accepted": 0
+    },
+    "match": true
+  },
+  "code": {
+    "serial": {
+      "token_sha": "2deda2799112",
+      "completion_tokens": 74,
+      "rounds": 73,
+      "decode_s": 2.0313,
+      "prefill_s": 0.1699,
+      "lookup_drafted": null,
+      "lookup_accepted": null
+    },
+    "drafted": {
+      "token_sha": "2deda2799112",
+      "completion_tokens": 74,
+      "rounds": 13,
+      "decode_s": 0.6589,
+      "prefill_s": 0.1556,
+      "lookup_drafted": 0,
+      "lookup_accepted": 0
+    },
+    "match": true
+  },
+  "repeat": {
+    "serial": {
+      "token_sha": "aef89122efe1",
+      "completion_tokens": 2,
+      "rounds": 1,
+      "decode_s": 0.0285,
+      "prefill_s": 0.1665,
+      "lookup_drafted": null,
+      "lookup_accepted": null
+    },
+    "drafted": {
+      "token_sha": "aef89122efe1",
+      "completion_tokens": 2,
+      "rounds": 1,
+      "decode_s": 0.0482,
+      "prefill_s": 0.1609,
+      "lookup_drafted": 0,
+      "lookup_accepted": 0
+    },
+    "match": true
+  },
+  "chat": {
+    "serial": {
+      "token_sha": "35ac773b2d02",
+      "completion_tokens": 55,
+      "rounds": 54,
+      "decode_s": 1.5005,
+      "prefill_s": 0.1487,
+      "lookup_drafted": null,
+      "lookup_accepted": null
+    },
+    "drafted": {
+      "token_sha": "35ac773b2d02",
+      "completion_tokens": 55,
+      "rounds": 46,
+      "decode_s": 1.577,
+      "prefill_s": 0.1596,
+      "lookup_drafted": 0,
+      "lookup_accepted": 0
+    },
+    "match": true
+  },
+  "edit_full": {
+    "serial": {
+      "token_sha": "98f603d270f7",
+      "completion_tokens": 96,
+      "rounds": 95,
+      "decode_s": 2.6511,
+      "prefill_s": 0.3655,
+      "lookup_drafted": null,
+      "lookup_accepted": null
+    },
+    "drafted": {
+      "token_sha": "98f603d270f7",
+      "completion_tokens": 96,
+      "rounds": 16,
+      "decode_s": 0.8282,
+      "prefill_s": 0.375,
+      "lookup_drafted": 0,
+      "lookup_accepted": 0
+    },
+    "match": true
+  },
+  "edit_continue": {
+    "serial": {
+      "token_sha": "fb7342c804b3",
+      "completion_tokens": 96,
+      "rounds": 95,
+      "decode_s": 2.6405,
+      "prefill_s": 0.3669,
+      "lookup_drafted": null,
+      "lookup_accepted": null
+    },
+    "drafted": {
+      "token_sha": "fb7342c804b3",
+      "completion_tokens": 96,
+      "rounds": 15,
+      "decode_s": 0.9642,
+      "prefill_s": 0.3613,
+      "lookup_drafted": 13,
+      "lookup_accepted": 13
+    },
+    "match": true
+  },
+  "pattern_novel": {
+    "serial": {
+      "token_sha": "d4e923c62b39",
+      "completion_tokens": 40,
+      "rounds": 39,
+      "decode_s": 1.0859,
+      "prefill_s": 0.272,
+      "lookup_drafted": null,
+      "lookup_accepted": null
+    },
+    "drafted": {
+      "token_sha": "d4e923c62b39",
+      "completion_tokens": 40,
+      "rounds": 8,
+      "decode_s": 0.3786,
+      "prefill_s": 0.2772,
+      "lookup_drafted": 0,
+      "lookup_accepted": 0
+    },
+    "match": true
+  }
+}

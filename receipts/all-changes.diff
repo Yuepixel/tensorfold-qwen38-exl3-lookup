@@ -1,0 +1,2558 @@
+diff --git a/p7_bench.sh b/p7_bench.sh
+new file mode 100644
+index 0000000..fb8ecb1
+--- /dev/null
++++ b/p7_bench.sh
+@@ -0,0 +1,7 @@
++#!/usr/bin/env bash
++# P7 bench wrapper: decode t/s for the 2 built-in prompts (code/chat) at greedy (temp 0).
++# $1 = label (e.g. mtp-only / lookup-l7:2 / lookup-auto)
++set -u
++LABEL="${1:-bench}"
++M=Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5
++docker exec tf-exl3 python /src/TensorFold/tools/bench_openai.py http://127.0.0.1:8080 "$M" --tokens 128 --reps 3 --temperatures 0 --label "$LABEL"
+diff --git a/p7_edit.sh b/p7_edit.sh
+new file mode 100644
+index 0000000..4aa335a
+--- /dev/null
++++ b/p7_edit.sh
+@@ -0,0 +1,6 @@
++#!/usr/bin/env bash
++# P7 edit/agent-class bench wrapper. $1 = label
++set -u
++LABEL="${1:-edit}"
++M=Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5
++docker exec tf-exl3 python /src/TensorFold/tools/p7_edit_bench.py http://127.0.0.1:8080 "$M" --tokens 128 --reps 3 --label "$LABEL"
+diff --git a/p7_exact.sh b/p7_exact.sh
+new file mode 100644
+index 0000000..eaea653
+--- /dev/null
++++ b/p7_exact.sh
+@@ -0,0 +1,25 @@
++#!/usr/bin/env bash
++# P7 A1 byte-exact probe: same 3 prompt classes, serial (draft:false) vs drafted (draft:true).
++# Prints "<label> draft=<flag> <token_sha>". Run once against the lookup server; the
++# draft:false shas are the byte-exact reference and must match the drafted ones.
++set -u
++U=http://127.0.0.1:8080/v1/chat/completions
++H='Content-Type: application/json'
++M=Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5
++run() {
++  local label="$1" content="$2" draft="$3"
++  local body="{\"model\":\"$M\",\"messages\":[{\"role\":\"user\",\"content\":$content}],\"temperature\":0,\"max_tokens\":96,\"draft\":$draft}"
++  local out sha
++  out=$(curl -s --max-time 240 "$U" -H "$H" -d "$body")
++  sha=$(printf '%s' "$out" | grep -o '"token_sha": *"[0-9a-f]*"' | head -1)
++  echo "$label draft=$draft ${sha:-NO_SHA}"
++}
++# prose / chat
++run prose '"法国首都是哪座城市？只答城市名。"' false
++run prose '"法国首都是哪座城市？只答城市名。"' true
++# code
++run code '"用 Python 写一个函数 fib(n) 返回前 n 个斐波那契数，只输出代码。"' false
++run code '"用 Python 写一个函数 fib(n) 返回前 n 个斐波那契数，只输出代码。"' true
++# edit / repetition (drives the lookup arm)
++run repeat '"严格按模式续写，每行只写一个词：\n1. apple\n2. apple\n3. apple\n4. apple\n5."' false
++run repeat '"严格按模式续写，每行只写一个词：\n1. apple\n2. apple\n3. apple\n4. apple\n5."' true
+diff --git a/p7_metrics.sh b/p7_metrics.sh
+new file mode 100644
+index 0000000..e84657f
+--- /dev/null
++++ b/p7_metrics.sh
+@@ -0,0 +1,4 @@
++#!/usr/bin/env bash
++# print the lookup / MTP counters from /metrics (after some requests have finished)
++set -u
++curl -s --max-time 20 http://127.0.0.1:8080/metrics | grep -E 'lookup_(drafted|accepted)_total|mtp_(drafted|accepted)_total'
+diff --git a/p7_one.sh b/p7_one.sh
+new file mode 100644
+index 0000000..8ec9426
+--- /dev/null
++++ b/p7_one.sh
+@@ -0,0 +1,7 @@
++#!/usr/bin/env bash
++# print the raw drafted response for the prose prompt (debug the missing token_sha)
++set -u
++curl -s --max-time 240 http://127.0.0.1:8080/v1/chat/completions \
++  -H 'Content-Type: application/json' \
++  -d '{"model":"Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5","messages":[{"role":"user","content":"法国首都是哪座城市？只答城市名。"}],"temperature":0,"max_tokens":96,"draft":true}'
++echo
+diff --git a/p7_restart.sh b/p7_restart.sh
+new file mode 100644
+index 0000000..f421dd4
+--- /dev/null
++++ b/p7_restart.sh
+@@ -0,0 +1,23 @@
++#!/usr/bin/env bash
++# P7 server restart helper: kill the running serve, start it with the given lookup env, wait ready.
++# $1 = TF_EXL3_LOOKUP ("default" = omit env, let run_serve.sh's shipped default apply; "" = MTP-only),
++# $2 = TF_EXL3_LOOKUP_MIN (default 4)
++set -u
++SPEC="${1-l7:2}"
++MIN="${2:-4}"
++docker exec tf-exl3 pkill -f 'tensorfold serve' >/dev/null 2>&1
++sleep 3
++if [ "$SPEC" = "default" ]; then
++  docker exec -d tf-exl3 bash /src/TensorFold/run_serve.sh
++else
++  docker exec -e TF_EXL3_LOOKUP="$SPEC" -e TF_EXL3_LOOKUP_MIN="$MIN" -d tf-exl3 bash /src/TensorFold/run_serve.sh
++fi
++for i in $(seq 1 150); do
++  if curl -s --max-time 4 http://127.0.0.1:8080/v1/models >/dev/null 2>&1; then
++    echo READY
++    exit 0
++  fi
++  sleep 4
++done
++echo TIMEOUT
++exit 1
+diff --git a/p7_v123.sh b/p7_v123.sh
+new file mode 100644
+index 0000000..d1e9e27
+--- /dev/null
++++ b/p7_v123.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++# P7 A5 quick regression helpers: V1 inspect, V2 health/models, V3 chat.
++set -u
++M=/models/Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5
++echo "== V1 inspect =="
++docker exec tf-exl3 python -m tensorfold.cuda.exl3.inspect "$M" > /tmp/p7_inspect.txt 2>&1
++echo "inspect_rc=$?"
++grep -iE 'quant_method|mtp|error|traceback' /tmp/p7_inspect.txt | head -20
++echo "== V2 health/models =="
++curl -s --max-time 10 -o /dev/null -w 'health=%{http_code}\n' http://127.0.0.1:8080/health
++curl -s --max-time 10 http://127.0.0.1:8080/v1/models
++echo
++echo "== V3 chat =="
++curl -s --max-time 120 http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5","messages":[{"role":"user","content":"只用一个词回答：法国首都是？"}],"max_tokens":16,"temperature":0}'
++echo
+diff --git a/run_serve.sh b/run_serve.sh
+new file mode 100644
+index 0000000..d73d3c6
+--- /dev/null
++++ b/run_serve.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++set -e
++# P7 prompt-lookup draft arm (qwen4_exp). Default on with the P7.4-calibrated forced policy l7:2
++# (up to 7 drafts, matches of >=2 tokens): +14~37% on edit/agent decode, +2% chat, roughly neutral
++# elsewhere, byte-exact vs serial either way. Set TF_EXL3_LOOKUP="" to revert to MTP-only (A6), or to
++# another lN[:M] / "auto" (auto is experimental; its gate cost model is not yet calibrated).
++export TF_EXL3_LOOKUP="${TF_EXL3_LOOKUP-l7:2}"
++exec /usr/local/bin/tensorfold serve /models/Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5 --host 0.0.0.0 --port 8080 > /tmp/serve.log 2>&1
+diff --git a/src/tensorfold/cuda/exl3/experts.cpp b/src/tensorfold/cuda/exl3/experts.cpp
+index 63c38c9..30915da 100644
+--- a/src/tensorfold/cuda/exl3/experts.cpp
++++ b/src/tensorfold/cuda/exl3/experts.cpp
+@@ -5,6 +5,12 @@ void exl3x_grouped_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                         const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
+                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                         int64_t, int64_t);
++void exl3x_prompt_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                       const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t,
++                       int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
++void exl3x_prompt_down_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                            const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t,
++                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+ void exl3x_dequant_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
+ void exl3x_group_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
+ void exl3x_rot_in_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+@@ -44,6 +50,49 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0,
+                        pf, lo, hi);
+ }
+ 
++void prompt(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
++            const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& items, const at::Tensor& counts,
++            const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P, int64_t E,
++            int64_t seg, int64_t wps, int64_t items_max, int64_t cb, int64_t nt, int64_t widths) {
++    check(X0, at::kHalf, "X0");
++    check(X1, at::kHalf, "X1");
++    check(TP0, at::kLong, "TP0");
++    check(TP1, at::kLong, "TP1");
++    check(B0, at::kInt, "B0");
++    check(B1, at::kInt, "B1");
++    check(items, at::kInt, "items");
++    check(counts, at::kInt, "counts");
++    check(members, at::kInt, "members");
++    check(Z, at::kFloat, "Z");
++    TORCH_CHECK(items.numel() >= 3 * items_max, "items too small");
++    TORCH_CHECK(Z.numel() >= mats * P * N, "Z too small");
++    TORCH_CHECK(X0.numel() >= P * K && X1.numel() >= P * K, "X too small");
++    TORCH_CHECK(items_max <= 65535, "too many items for one launch");
++    c10::cuda::CUDAGuard guard(X0.device());
++    exl3x_prompt_cuda(X0, X1, TP0, TP1, B0, B1, items, counts, members, Z, mats, K, N, P, E, seg, wps, items_max, cb,
++                      nt, widths);
++}
++
++void prompt_down(const at::Tensor& X, const at::Tensor& TP, const at::Tensor& B, const at::Tensor& svh,
++                 const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor Y, int64_t K,
++                 int64_t N, int64_t P, int64_t E, int64_t seg, int64_t wps, int64_t items_max, int64_t cb,
++                 int64_t widths) {
++    check(X, at::kHalf, "X");
++    check(TP, at::kLong, "TP");
++    check(B, at::kInt, "B");
++    check(svh, at::kHalf, "svh");
++    check(items, at::kInt, "items");
++    check(counts, at::kInt, "counts");
++    check(members, at::kInt, "members");
++    TORCH_CHECK(Y.is_cuda() && (Y.scalar_type() == at::kFloat || Y.scalar_type() == at::kBFloat16), "Y: fp32 or bf16");
++    TORCH_CHECK(Y.dim() == 2 && Y.size(1) == N && Y.stride(1) == 1 && Y.stride(0) == N && Y.size(0) >= P,
++                "Y: contiguous [>= P, N]");
++    TORCH_CHECK(items.numel() >= 3 * items_max && items_max <= 65535, "items");
++    TORCH_CHECK(X.numel() >= P * K, "X too small");
++    c10::cuda::CUDAGuard guard(X.device());
++    exl3x_prompt_down_cuda(X, TP, B, svh, items, counts, members, Y, K, N, P, E, seg, wps, items_max, cb, widths);
++}
++
+ void dequant(const at::Tensor& T, at::Tensor out, int64_t k2, int64_t cb) {
+     TORCH_CHECK(T.is_cuda() && T.scalar_type() == at::kShort && T.is_contiguous() && T.dim() == 3,
+                 "T: int16 [K/16, N/16, 8 * k2]");
+@@ -131,6 +180,8 @@ void down_combine(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor&
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("grouped", &grouped);
++    m.def("prompt", &prompt);
++    m.def("prompt_down", &prompt_down);
+     m.def("dequant", &dequant);
+     m.def("group", &group);
+     m.def("rot_in", &rot_in);
+diff --git a/src/tensorfold/cuda/exl3/experts.cu b/src/tensorfold/cuda/exl3/experts.cu
+index ff3be8d..81df53e 100644
+--- a/src/tensorfold/cuda/exl3/experts.cu
++++ b/src/tensorfold/cuda/exl3/experts.cu
+@@ -6,7 +6,7 @@
+ #include <ATen/cuda/CUDAContext.h>
+ #include <c10/cuda/CUDAGuard.h>
+ 
+-#include "experts_grouped.cuh"
++#include "experts_prompt.cuh"
+ 
+ namespace {
+ 
+@@ -244,6 +244,12 @@ namespace tf_exl3x {
+ extern template void grouped_launch<0>(const GroupedArgs&, cudaStream_t);
+ extern template void grouped_launch<1>(const GroupedArgs&, cudaStream_t);
+ extern template void grouped_launch<2>(const GroupedArgs&, cudaStream_t);
++extern template void prompt_launch<0>(const PromptArgs&, int, cudaStream_t);
++extern template void prompt_down_launch<0>(const DownArgs&, int, cudaStream_t);
++extern template void prompt_launch<1>(const PromptArgs&, int, cudaStream_t);
++extern template void prompt_down_launch<1>(const DownArgs&, int, cudaStream_t);
++extern template void prompt_launch<2>(const PromptArgs&, int, cudaStream_t);
++extern template void prompt_down_launch<2>(const DownArgs&, int, cudaStream_t);
+ extern template void dequant_launch<0>(const uint32_t*, half*, int, int, int, cudaStream_t);
+ extern template void dequant_launch<1>(const uint32_t*, half*, int, int, int, cudaStream_t);
+ extern template void dequant_launch<2>(const uint32_t*, half*, int, int, int, cudaStream_t);
+@@ -277,6 +283,58 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
++void exl3x_prompt_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
++                       const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& items, const at::Tensor& counts,
++                       const at::Tensor& members, at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P,
++                       int64_t E, int64_t seg, int64_t wps, int64_t items_max, int64_t cb, int64_t nt,
++                       int64_t widths) {
++    TORCH_CHECK(K % 16 == 0 && (K / 16) % (seg * wps) == 0 && N % (16 * nt) == 0,
++                "prompt experts: K and N must split evenly");
++    tf_exl3x::PromptArgs a;
++    a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
++    a.x1 = reinterpret_cast<const half*>(X1.data_ptr());
++    a.tp0 = TP0.data_ptr<int64_t>();
++    a.tp1 = TP1.data_ptr<int64_t>();
++    a.k2_0 = B0.data_ptr<int>();
++    a.k2_1 = B1.data_ptr<int>();
++    a.items = items.data_ptr<int>();
++    a.counts = counts.data_ptr<int>();
++    a.members = members.data_ptr<int>();
++    a.z = Z.data_ptr<float>();
++    a.K = (int)K; a.N = (int)N; a.P = (int)P; a.E = (int)E; a.seg = (int)seg; a.wps = (int)wps;
++    a.items_max = (int)items_max; a.mats = (int)mats; a.nt = (int)nt;
++    auto stream = at::cuda::getCurrentCUDAStream();
++    if (cb == 0) tf_exl3x::prompt_launch<0>(a, (int)widths, stream);
++    else if (cb == 1) tf_exl3x::prompt_launch<1>(a, (int)widths, stream);
++    else if (cb == 2) tf_exl3x::prompt_launch<2>(a, (int)widths, stream);
++    else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++void exl3x_prompt_down_cuda(const at::Tensor& X, const at::Tensor& TP, const at::Tensor& B, const at::Tensor& svh,
++                            const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& Y,
++                            int64_t K, int64_t N, int64_t P, int64_t E, int64_t seg, int64_t wps, int64_t items_max,
++                            int64_t cb, int64_t widths) {
++    TORCH_CHECK(K % 16 == 0 && (K / 16) % (seg * wps) == 0 && N % 128 == 0, "prompt down: K and N must split evenly");
++    tf_exl3x::DownArgs a;
++    a.x = reinterpret_cast<const half*>(X.data_ptr());
++    a.tp = TP.data_ptr<int64_t>();
++    a.k2 = B.data_ptr<int>();
++    a.svh = reinterpret_cast<const half*>(svh.data_ptr());
++    a.items = items.data_ptr<int>();
++    a.counts = counts.data_ptr<int>();
++    a.members = members.data_ptr<int>();
++    a.y = Y.data_ptr();
++    a.K = (int)K; a.N = (int)N; a.P = (int)P; a.E = (int)E; a.seg = (int)seg; a.wps = (int)wps;
++    a.items_max = (int)items_max; a.bf16 = Y.scalar_type() == at::kBFloat16 ? 1 : 0;
++    auto stream = at::cuda::getCurrentCUDAStream();
++    if (cb == 0) tf_exl3x::prompt_down_launch<0>(a, (int)widths, stream);
++    else if (cb == 1) tf_exl3x::prompt_down_launch<1>(a, (int)widths, stream);
++    else if (cb == 2) tf_exl3x::prompt_down_launch<2>(a, (int)widths, stream);
++    else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
+ void exl3x_dequant_cuda(const at::Tensor& T, at::Tensor& out, int64_t K, int64_t N, int64_t k2, int64_t cb) {
+     auto stream = at::cuda::getCurrentCUDAStream();
+     auto t = reinterpret_cast<const uint32_t*>(T.data_ptr());
+diff --git a/src/tensorfold/cuda/exl3/experts.py b/src/tensorfold/cuda/exl3/experts.py
+index f4569ec..085294b 100644
+--- a/src/tensorfold/cuda/exl3/experts.py
++++ b/src/tensorfold/cuda/exl3/experts.py
+@@ -26,7 +26,7 @@ def _ext():
+ 
+     here = Path(__file__).parent
+     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
+-    return load(name="tensorfold_exl3_experts_v1", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
++    return load(name="tensorfold_exl3_experts_v2", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+                 verbose=False)
+ 
+ 
+@@ -75,6 +75,8 @@ class Exl3RoutedExperts:
+     k2_d: tuple[int, int]
+     trellis_bytes: torch.Tensor   # int64 [E], gate + up + down trellis bytes of each expert (for GB/s)
+     keep: list = field(default_factory=list, repr=False)
++    widths_gu: int = 0        # a bit per K2 that gate and up hold (bit k2): the prompt kernel's instances to launch
++    widths_d: int = 0
+ 
+     def nbytes_read(self, ids: Sequence[int]) -> int:
+         return int(self.trellis_bytes[list(ids)].sum())
+@@ -115,9 +117,11 @@ def prepare(gate: Sequence[tuple], up: Sequence[tuple], down: Sequence[tuple], c
+         return out
+ 
+     tb = torch.tensor([(D * I // 256) * (gks[e] + uks[e] + dks[e]) * 16 for e in range(E)], dtype=torch.int64)
++    bits = lambda ks: sum(1 << k for k in set(ks))          # noqa: E731
+     return Exl3RoutedExperts(gp, upp, dp, gk, uk, dk, stack(gate, 1, D), stack(up, 1, D), stack(gate, 2, I),
+                              stack(up, 2, I), stack(down, 1, I), stack(down, 2, D), E, D, I, cb,
+-                             (min(gks + uks), max(gks + uks)), (min(dks), max(dks)), tb, keep)
++                             (min(gks + uks), max(gks + uks)), (min(dks), max(dks)), tb, keep, bits(gks + uks),
++                             bits(dks))
+ 
+ 
+ def prepare_stacked(gt: torch.Tensor, ut: torch.Tensor, dt: torch.Tensor, suh_g, suh_u, svh_g, svh_u, suh_d, svh_d,
+@@ -162,6 +166,18 @@ class Scratch:
+         self.count = torch.zeros((1,), dtype=torch.int32, device=device)
+         self.members_buf = torch.full((maxu * rows,), -1, dtype=torch.int32, device=device)
+         self.rows, self.slots, self.count_experts = rows, slots, ex.count
++        self.device = device
++        self._plan = self._pick = None      # prompt windows: pairs grouped by expert (``plan``), made on first use
++
++    def plan(self):
++        """tensorfold.cuda.experts' grouping of this scratch's rows with one expert more: skipped picks group apart."""
++
++        if self._plan is None:
++            from tensorfold.cuda import experts as grouped
++
++            self._plan = grouped.Plan(self.rows, self.slots, self.count_experts + 1, self.device, prefill=True)
++            self._pick = torch.empty((self.rows * self.slots,), dtype=torch.int32, device=self.device)
++        return self._plan
+ 
+     def window(self, R: int):
+         """(ids, members) sized for R rows: the grids only span what R rows can use."""
+@@ -170,10 +186,22 @@ class Scratch:
+         return self.ids[:maxu], self.members_buf[:maxu * R].view(maxu, R)
+ 
+ 
++# Prompt windows (more than PROMPT_ROWS rows) run on a plan's items: a program a (n block, <= 64 pairs of one expert),
++# each weight tile decoded once for its pairs and the splits added in the kernel (experts_prompt.cuh); the grouping
++# kernel's grid spans every (expert slot, 16-pair tile) of the window and decodes each tile again for every 16 pairs.
++# Every pair keeps its bits. TF_EXL3_PROMPT=group keeps the grouping kernel at every size; decode windows always do.
++PROMPT = __import__("os").environ.get("TF_EXL3_PROMPT", "prompt")
++PROMPT_ROWS = 64
++PROMPT_TILE = 64         # pairs an item holds: 4 warps of 16
++PROMPT_NT = 4            # n tiles a gate/up program (64 columns)
++
++
+ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
+            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
+-           group: bool = True) -> torch.Tensor:
+-    """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync."""
++           group: bool = True, y_out: torch.Tensor | None = None) -> torch.Tensor:
++    """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync.
++
++    ``y_out`` ([R * slots, D], contiguous; no ``wts``): Y lands there (prompt windows round it once, as copy_ does)."""
+ 
+     ext = _ext()
+     D, I, E = ex.dims, ex.width, ex.count
+@@ -181,6 +209,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
+     P = R * slots
+     if R > s.rows:
+         raise ValueError(f"{R} rows but the scratch holds {s.rows}")
++    if group and PROMPT == "prompt" and R > PROMPT_ROWS:
++        return _prompt(ext, x, pick, wts, ex, s, out, R, limit, act_mode, y_out)
+     ids, members = s.window(R)
+     if group:
+         ext.group(pick, ids, s.count, members, R, slots, E)
+@@ -194,6 +224,9 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
+                 D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1])
+     if wts is None:
+         ext.down_epilogue(s.z, pick, ex.svh_d, s.y, R, P, D, sk, slots, E)
++        if y_out is not None:
++            y_out[:P].copy_(s.y[:P])
++            return y_out[:P]
+         return s.y[:P]
+     if out is None:
+         out = torch.empty((R, D), dtype=torch.float32, device=x.device)
+@@ -202,6 +235,36 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
+     return out
+ 
+ 
++def _prompt(ext, x, pick, wts, ex: Exl3RoutedExperts, s: Scratch, out, R: int, limit: float, act_mode: int, y_out):
++    """``routed`` for a prompt window: the plan's items, gate|up summed in the kernel, down with its epilogue."""
++
++    from tensorfold.cuda import experts as grouped
++
++    D, I, E, slots = ex.dims, ex.width, ex.count, s.slots
++    P = R * slots
++    plan = s.plan()
++    picks = torch.clamp(pick[:R].reshape(P), max=E, out=s._pick[:P])     # every skipped pick as E
++    grouped.route(picks.view(R, slots), plan, PROMPT_TILE)
++    bound = grouped.max_items(P, E + 1, PROMPT_TILE)
++    ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
++    _, w, sk, _ = s.cfg_gu
++    ext.prompt(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, plan.items, plan.counts, plan.members, s.z,
++               2, D, I, P, E, (D // 16) // (sk * w), w, bound, ex.cb, PROMPT_NT, ex.widths_gu)
++    ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, 1, slots, E, float(limit), act_mode)
++    _, w, sk, _ = s.cfg_d
++    if sk != 1:
++        raise ValueError(f"the prompt down kernel takes one K split, not {sk}")
++    y = y_out if y_out is not None and wts is None else s.y
++    ext.prompt_down(s.xd, ex.down_ptr, ex.down_k2, ex.svh_d, plan.items, plan.counts, plan.members, y.view(-1, D), I,
++                    D, P, E, (I // 16) // w, w, bound, ex.cb, ex.widths_d)
++    if wts is None:
++        return y[:P]
++    if out is None:
++        out = torch.empty((R, D), dtype=torch.float32, device=x.device)
++    ext.combine(s.y, wts, out, R, D, slots)       # down_combine's combine: the same fma chain
++    return out
++
++
+ def dequant(trellis: torch.Tensor, codebook: int | str) -> torch.Tensor:
+     """W_q [K, N] fp16 of one matrix through the kernels' own lane decode (ExLlamaV3's ``reconstruct``); for tests."""
+ 
+diff --git a/src/tensorfold/cuda/exl3/experts_cb0.cu b/src/tensorfold/cuda/exl3/experts_cb0.cu
+index aec220f..2c15c59 100644
+--- a/src/tensorfold/cuda/exl3/experts_cb0.cu
++++ b/src/tensorfold/cuda/exl3/experts_cb0.cu
+@@ -1,7 +1,9 @@
+ // Grouped EXL3 expert GEMV instances for codebook 0 (3inst).
+-#include "experts_grouped.cuh"
++#include "experts_prompt.cuh"
+ 
+ namespace tf_exl3x {
+ template void grouped_launch<0>(const GroupedArgs&, cudaStream_t);
++template void prompt_launch<0>(const PromptArgs&, int, cudaStream_t);
++template void prompt_down_launch<0>(const DownArgs&, int, cudaStream_t);
+ template void dequant_launch<0>(const uint32_t*, half*, int, int, int, cudaStream_t);
+ }  // namespace tf_exl3x
+diff --git a/src/tensorfold/cuda/exl3/experts_cb1.cu b/src/tensorfold/cuda/exl3/experts_cb1.cu
+index b016240..bcdc615 100644
+--- a/src/tensorfold/cuda/exl3/experts_cb1.cu
++++ b/src/tensorfold/cuda/exl3/experts_cb1.cu
+@@ -1,7 +1,9 @@
+ // Grouped EXL3 expert GEMV instances for codebook 1 (mcg).
+-#include "experts_grouped.cuh"
++#include "experts_prompt.cuh"
+ 
+ namespace tf_exl3x {
+ template void grouped_launch<1>(const GroupedArgs&, cudaStream_t);
++template void prompt_launch<1>(const PromptArgs&, int, cudaStream_t);
++template void prompt_down_launch<1>(const DownArgs&, int, cudaStream_t);
+ template void dequant_launch<1>(const uint32_t*, half*, int, int, int, cudaStream_t);
+ }  // namespace tf_exl3x
+diff --git a/src/tensorfold/cuda/exl3/experts_cb2.cu b/src/tensorfold/cuda/exl3/experts_cb2.cu
+index a6e6493..fd53138 100644
+--- a/src/tensorfold/cuda/exl3/experts_cb2.cu
++++ b/src/tensorfold/cuda/exl3/experts_cb2.cu
+@@ -1,7 +1,9 @@
+ // Grouped EXL3 expert GEMV instances for codebook 2 (mul1).
+-#include "experts_grouped.cuh"
++#include "experts_prompt.cuh"
+ 
+ namespace tf_exl3x {
+ template void grouped_launch<2>(const GroupedArgs&, cudaStream_t);
++template void prompt_launch<2>(const PromptArgs&, int, cudaStream_t);
++template void prompt_down_launch<2>(const DownArgs&, int, cudaStream_t);
+ template void dequant_launch<2>(const uint32_t*, half*, int, int, int, cudaStream_t);
+ }  // namespace tf_exl3x
+diff --git a/src/tensorfold/cuda/exl3/experts_prompt.cuh b/src/tensorfold/cuda/exl3/experts_prompt.cuh
+new file mode 100644
+index 0000000..28c4f22
+--- /dev/null
++++ b/src/tensorfold/cuda/exl3/experts_prompt.cuh
+@@ -0,0 +1,335 @@
++// EXL3 routed experts in prompt windows: each weight tile decoded once for up to 64 pairs, every pair's bits kept.
++// Program (n block, plan item, matrix): its warps decode the block's tiles into shared memory a chunk at a time, each
++// runs 16 pairs over the whole K with grouped_kernel's arithmetic (the same m16n8k16 chains over the same K segments,
++// segments added in warp order, splits added from 0.f), so no split partials reach memory. A arrives by cp.async and
++// leaves by ldmatrix (the same halves, padding rows zero).
++#pragma once
++
++#include "experts_grouped.cuh"
++
++namespace tf_exl3x {
++
++constexpr int PROMPT_WARPS = 4;                        // member tiles an item holds (16 pairs a warp): 64-pair items
++constexpr float HAD_SCALE_P = 0.08838834764831845f;   // 1 / sqrt(128), as experts.cu's HAD_SCALE
++
++struct PromptArgs {
++    const half* x0;
++    const half* x1;
++    const int64_t* tp0;
++    const int64_t* tp1;
++    const int* k2_0;
++    const int* k2_1;
++    const int* items;
++    const int* counts;
++    const int* members;
++    float* z;                // [mats, P, N] final sums
++    int K, N, P, E;
++    int seg, wps;            // k tiles a segment (grouped_kernel's per_warp), segments a split (its warps)
++    int items_max, mats, nt;
++};
++
++__device__ __forceinline__ void cp_async16(uint32_t dst, const void* src, bool ok) {
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "r"(ok ? 16 : 0));
++}
++__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
++template <int N>
++__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
++__device__ __forceinline__ void ldmatrix_x4(uint32_t (&a)[4], uint32_t addr) {
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
++                 : "r"(addr));
++}
++
++// This warp's 16 rows x CH k tiles of A into its stage (rows of CH * 32 bytes, 16-byte chunks XOR-swizzled by row).
++template <int CH>
++__device__ __forceinline__ void stage_a(uint32_t abuf, const half* __restrict__ X, const int* rows16, int K, int kt0,
++                                        int KT, int lane) {
++    constexpr int CPR = CH * 2;                            // 16-byte chunks a row
++#pragma unroll
++    for (int i = 0; i < (16 * CPR) / 32; ++i) {
++        const int idx = lane + 32 * i, r = idx / CPR, c = idx % CPR;
++        const int row = rows16[r];
++        const int kt = kt0 + c / 2;
++        const bool ok = row >= 0 && kt < KT;
++        const half* src = X + (size_t)(ok ? row : 0) * K + (size_t)(ok ? kt0 * 16 + c * 8 : 0);
++        cp_async16(abuf + r * (CPR * 16) + ((c ^ (r & 7)) % CPR) * 16, src, ok);
++    }
++}
++
++// TOT: also keep the splits' running sum (gate/up's SK splits); without it the result is the first split's sum
++// (one split: down), which the caller adds to 0.f as the epilogue does.
++template <int CB, int K2, int NT, int CH, bool TOT>
++__device__ __forceinline__ void prompt_body(const uint32_t* __restrict__ T, const half* __restrict__ X,
++                                            const int* rows16, int K, int N, int nt0, int seg, int wps, bool active,
++                                            int warp, int lane, uint4* sb, uint32_t abase, float (&res)[NT][2][4]) {
++    constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
++    constexpr int DPW = NT / PROMPT_WARPS;              // n tiles this warp decodes a k tile
++    constexpr int ABYTES = 16 * CH * 32;                // a warp's A stage
++    static_assert(NT % PROMPT_WARPS == 0, "NT must be a multiple of the warps");
++    const LaneMap<K2> map(lane);
++    const int KT = K >> 4, NTILES = N >> 4;
++    const size_t kstride = (size_t)NTILES * TW;
++    const uint32_t* tp = T + (size_t)(nt0 + warp * DPW) * TW + lane;
++    const uint32_t abuf0 = abase + warp * 2 * ABYTES;
++
++    float acc[NT][2][4], ts[NT][2][4];
++#pragma unroll
++    for (int i = 0; i < NT; ++i)
++#pragma unroll
++        for (int h = 0; h < 2; ++h)
++#pragma unroll
++            for (int c = 0; c < 4; ++c) acc[i][h][c] = ts[i][h][c] = res[i][h][c] = 0.f;
++
++    uint32_t wn[CH][DPW][LW];
++#pragma unroll
++    for (int kc = 0; kc < CH; ++kc)
++        if (kc < KT)
++#pragma unroll
++            for (int j = 0; j < DPW; ++j) load_words<K2>(wn[kc][j], tp + (size_t)kc * kstride + j * TW, lane);
++    if (active) stage_a<CH>(abuf0, X, rows16, K, 0, KT, lane);
++    cp_async_commit();
++
++    int sleft = seg, g = 0;                              // k tiles left in this segment, the segment
++    const int chunks = (KT + CH - 1) / CH;
++    for (int c = 0; c < chunks; ++c) {
++        uint4* buf = sb + (size_t)(c & 1) * CH * NT * 32;
++        // decode this chunk's tiles of this warp's n tiles into shared memory
++#pragma unroll
++        for (int kc = 0; kc < CH; ++kc)
++            if (c * CH + kc < KT)
++#pragma unroll
++                for (int j = 0; j < DPW; ++j) {
++                    uint32_t b0[2], b1[2];
++                    decode_tile<CB, K2>(wn[kc][j], map, lane, b0, b1);
++                    buf[(kc * NT + warp * DPW + j) * 32 + lane] = make_uint4(b0[0], b0[1], b1[0], b1[1]);
++                }
++        // the next chunk's words and A rows in flight while this one runs
++#pragma unroll
++        for (int kc = 0; kc < CH; ++kc) {
++            const int kt = (c + 1) * CH + kc;
++            if (kt < KT)
++#pragma unroll
++                for (int j = 0; j < DPW; ++j) load_words<K2>(wn[kc][j], tp + (size_t)kt * kstride + j * TW, lane);
++        }
++        __syncwarp();                                    // every lane is done reading the stage it overwrites
++        if (active && c + 1 < chunks)
++            stage_a<CH>(abuf0 + ((c + 1) & 1) * ABYTES, X, rows16, K, (c + 1) * CH, KT, lane);
++        cp_async_commit();
++        cp_async_wait<1>();                              // this chunk's A rows have landed
++        __syncthreads();
++        if (active) {
++            const uint32_t abuf = abuf0 + (c & 1) * ABYTES;
++            const int ar = lane & 15;
++#pragma unroll
++            for (int kc = 0; kc < CH; ++kc) {
++                const int kt = c * CH + kc;
++                if (kt < KT) {
++                    uint32_t a[4];
++                    const int ch = kc * 2 + (lane >> 4);
++                    ldmatrix_x4(a, abuf + ar * (CH * 32) + ((ch ^ (ar & 7)) % (CH * 2)) * 16);
++#pragma unroll
++                    for (int i = 0; i < NT; ++i) {
++                        const uint4 b = buf[(kc * NT + i) * 32 + lane];
++                        const uint32_t b0[2] = {b.x, b.y}, b1[2] = {b.z, b.w};
++                        mma16816(acc[i][0], a, b0);
++                        mma16816(acc[i][1], a, b1);
++                    }
++                    if (--sleft == 0) {                  // a segment ends: grouped_kernel's warp, then split sums
++                        const int wi = g % wps;
++#pragma unroll
++                        for (int i = 0; i < NT; ++i)
++#pragma unroll
++                            for (int h = 0; h < 2; ++h)
++#pragma unroll
++                                for (int q = 0; q < 4; ++q) {
++                                    ts[i][h][q] = wi == 0 ? acc[i][h][q] : ts[i][h][q] + acc[i][h][q];
++                                    acc[i][h][q] = 0.f;
++                                    if constexpr (TOT) {
++                                        if (wi == wps - 1) res[i][h][q] += ts[i][h][q];
++                                    }
++                                }
++                        sleft = seg;
++                        ++g;
++                    }
++                }
++            }
++        }
++    }
++    cp_async_wait<0>();
++    if constexpr (!TOT) {
++#pragma unroll
++        for (int i = 0; i < NT; ++i)
++#pragma unroll
++            for (int h = 0; h < 2; ++h)
++#pragma unroll
++                for (int q = 0; q < 4; ++q) res[i][h][q] = ts[i][h][q];
++    }
++}
++
++// k tiles a stage: B (2 * CH * NT tiles of 512 bytes) and A (4 warps x 2 x 16 rows x CH * 32 bytes)
++template <int NT> __host__ __device__ constexpr int prompt_ch() { return NT == 8 ? 2 : 4; }
++
++// Program (n block, plan item, matrix): the item's (expert, first member, count <= 64) pairs, warp w member tile w.
++// One instance a width (K2): a layer's launch runs one per width it holds, each program skipping other widths' experts,
++// so no instance carries the registers of the widest decode.
++template <int CB, int K2, int NT>
++__global__ void __launch_bounds__(PROMPT_WARPS * 32) prompt_kernel(PromptArgs a) {
++    constexpr int CH = prompt_ch<NT>();
++    const int item = blockIdx.y;
++    if (item >= a.counts[0]) return;
++    const int e = a.items[3 * item], first = a.items[3 * item + 1], cnt = a.items[3 * item + 2];
++    if (e < 0 || e >= a.E) return;                        // a skipped pick's item
++    const int mat = blockIdx.z;
++    if ((mat ? a.k2_1[e] : a.k2_0[e]) != K2) return;
++    const half* X = mat ? a.x1 : a.x0;
++    const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? a.tp1[e] : a.tp0[e]);
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int g = lane >> 2, t = lane & 3;
++    const int nt0 = blockIdx.x * NT;
++
++    __shared__ uint4 sb[2 * CH * NT * 32];
++    __shared__ __align__(128) uint4 sa[PROMPT_WARPS * 2 * 16 * CH * 2];
++    __shared__ int rows_sh[PROMPT_WARPS * 16];
++    for (int i = threadIdx.x; i < PROMPT_WARPS * 16; i += PROMPT_WARPS * 32)
++        rows_sh[i] = i < cnt ? a.members[first + i] : -1;
++    __syncthreads();
++    const bool active = warp * 16 < cnt;
++    const int r0 = rows_sh[warp * 16 + g], r1 = rows_sh[warp * 16 + g + 8];
++
++    float tot[NT][2][4];
++    prompt_body<CB, K2, NT, CH, true>(T, X, rows_sh + warp * 16, a.K, a.N, nt0, a.seg, a.wps, active, warp,
++                                            lane, sb, (uint32_t)__cvta_generic_to_shared(sa), tot);
++    if (!active) return;
++    float* zm = a.z + (size_t)mat * a.P * a.N;
++#pragma unroll
++    for (int i = 0; i < NT; ++i)
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++            const int col = (nt0 + i) * 16 + h * 8 + 2 * t;
++            if (r0 >= 0)
++                *reinterpret_cast<float2*>(zm + (size_t)r0 * a.N + col) = make_float2(tot[i][h][0], tot[i][h][1]);
++            if (r1 >= 0)
++                *reinterpret_cast<float2*>(zm + (size_t)r1 * a.N + col) = make_float2(tot[i][h][2], tot[i][h][3]);
++        }
++}
++
++#define TF_EXL3P_WIDTHS(X_) \
++    X_(2) X_(3) X_(4) X_(5) X_(6) X_(7) X_(8) X_(9) X_(10) X_(11) X_(12) X_(13) X_(14) X_(15) X_(16)
++
++// widths: a bit per K2 the layer's experts hold (bit k2)
++template <int CB>
++void prompt_launch(const PromptArgs& a, int widths, cudaStream_t stream) {
++    if (a.items_max < 1) return;
++    TORCH_CHECK(a.nt == 4, "prompt experts: n tiles a program must be 4, not ", a.nt);   // 8 would spill
++    dim3 grid((unsigned)(a.N / (16 * a.nt)), (unsigned)a.items_max, (unsigned)a.mats);
++#define TF_PW(K2_) if (widths & (1 << K2_)) prompt_kernel<CB, K2_, 4><<<grid, PROMPT_WARPS * 32, 0, stream>>>(a);
++    TF_EXL3P_WIDTHS(TF_PW)
++#undef TF_PW
++}
++
++// ---------------------------------------------------------------------------------------------------------------
++// Down projection with its epilogue: a program owns one 128-column Hadamard block (8 n tiles), so after the K loop each
++// pair's 128 sums go through down_epilogue_kernel's arithmetic (s = 0; s += sum; fwht128; * HAD_SCALE * svh_d) and
++// are stored as fp32 or rounded once to bf16 (as a copy_ of the fp32 y would): no Z, no fp32 y. One split only.
++
++__device__ __forceinline__ void fwht128_p(float (&v)[4], int lane) {      // experts.cu's fwht128, the same order
++    float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
++    v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
++#pragma unroll
++    for (int m = 1; m < 32; m <<= 1) {
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            float o = __shfl_xor_sync(0xffffffffu, v[j], m);
++            v[j] = (lane & m) ? o - v[j] : v[j] + o;
++        }
++    }
++}
++
++struct DownArgs {
++    const half* x;
++    const int64_t* tp;
++    const int* k2;
++    const half* svh;         // [E, N]
++    const int* items;
++    const int* counts;
++    const int* members;
++    void* y;                 // [P, N] fp32 or bf16
++    int K, N, P, E, seg, wps, items_max, bf16;
++};
++
++template <int CB, int K2>
++__global__ void __launch_bounds__(PROMPT_WARPS * 32) prompt_down_kernel(DownArgs a) {
++    constexpr int NT = 8, CH = prompt_ch<8>();
++    const int item = blockIdx.y;
++    if (item >= a.counts[0]) return;
++    const int e = a.items[3 * item], first = a.items[3 * item + 1], cnt = a.items[3 * item + 2];
++    if (e < 0 || e >= a.E) return;
++    if (a.k2[e] != K2) return;
++    const uint32_t* T = reinterpret_cast<const uint32_t*>(a.tp[e]);
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int g = lane >> 2, t = lane & 3;
++    const int nt0 = blockIdx.x * NT;
++
++    // B stages (16 KB) and A stages (8 KB), then 4 warps x 16 rows x 128 fp32 (32 KB) for the epilogue
++    __shared__ __align__(128) uint4 sm[2048];
++    uint4* sb = sm;
++    const uint32_t sa = (uint32_t)__cvta_generic_to_shared(sm + 2 * CH * NT * 32);
++    __shared__ int rows_sh[PROMPT_WARPS * 16];
++    for (int i = threadIdx.x; i < PROMPT_WARPS * 16; i += PROMPT_WARPS * 32)
++        rows_sh[i] = i < cnt ? a.members[first + i] : -1;
++    __syncthreads();
++    const bool active = warp * 16 < cnt;
++
++    float ts[NT][2][4];
++    prompt_body<CB, K2, NT, CH, false>(T, a.x, rows_sh + warp * 16, a.K, a.N, nt0, a.seg, a.wps, active, warp,
++                                          lane, sb, sa, ts);
++    __syncthreads();                                       // every warp is done with the stages
++    if (!active) return;
++    float* st = reinterpret_cast<float*>(sm) + warp * 16 * 128;
++#pragma unroll
++    for (int i = 0; i < NT; ++i)
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++            const int col = i * 16 + h * 8 + 2 * t;
++            *reinterpret_cast<float2*>(st + g * 128 + col) = make_float2(ts[i][h][0], ts[i][h][1]);
++            *reinterpret_cast<float2*>(st + (g + 8) * 128 + col) = make_float2(ts[i][h][2], ts[i][h][3]);
++        }
++    __syncwarp();
++    const int n = blockIdx.x * 128 + 4 * lane;
++    const half* sv = a.svh + (size_t)e * a.N + n;
++    const float s0 = __half2float(sv[0]), s1 = __half2float(sv[1]), s2 = __half2float(sv[2]), s3 = __half2float(sv[3]);
++    for (int r = 0; r < 16; ++r) {
++        const int p = rows_sh[warp * 16 + r];
++        if (p < 0) break;                                  // members come first
++        const float4 u = *reinterpret_cast<const float4*>(st + r * 128 + 4 * lane);
++        float v[4];
++        v[0] = 0.f; v[0] += u.x;                           // the epilogue's s = 0; s += Z (one split)
++        v[1] = 0.f; v[1] += u.y;
++        v[2] = 0.f; v[2] += u.z;
++        v[3] = 0.f; v[3] += u.w;
++        fwht128_p(v, lane);
++        const float o0 = v[0] * HAD_SCALE_P * s0, o1 = v[1] * HAD_SCALE_P * s1;
++        const float o2 = v[2] * HAD_SCALE_P * s2, o3 = v[3] * HAD_SCALE_P * s3;
++        if (a.bf16) {
++            __nv_bfloat162 lo2 = __floats2bfloat162_rn(o0, o1), hi2 = __floats2bfloat162_rn(o2, o3);
++            uint2 w;
++            w.x = *reinterpret_cast<uint32_t*>(&lo2);
++            w.y = *reinterpret_cast<uint32_t*>(&hi2);
++            *reinterpret_cast<uint2*>(reinterpret_cast<__nv_bfloat16*>(a.y) + (size_t)p * a.N + n) = w;
++        } else {
++            float* yp = reinterpret_cast<float*>(a.y) + (size_t)p * a.N + n;
++            *reinterpret_cast<float4*>(yp) = make_float4(o0, o1, o2, o3);
++        }
++    }
++}
++
++template <int CB>
++void prompt_down_launch(const DownArgs& a, int widths, cudaStream_t stream) {
++    if (a.items_max < 1) return;
++    dim3 grid((unsigned)(a.N / 128), (unsigned)a.items_max, 1);
++#define TF_PD(K2_) if (widths & (1 << K2_)) prompt_down_kernel<CB, K2_><<<grid, PROMPT_WARPS * 32, 0, stream>>>(a);
++    TF_EXL3P_WIDTHS(TF_PD)
++#undef TF_PD
++}
++
++}  // namespace tf_exl3x
+diff --git a/src/tensorfold/cuda/exl3/prefill.py b/src/tensorfold/cuda/exl3/prefill.py
+index 823e3d6..fe81f2e 100644
+--- a/src/tensorfold/cuda/exl3/prefill.py
++++ b/src/tensorfold/cuda/exl3/prefill.py
+@@ -47,7 +47,7 @@ def _gemm(X, W, H, SVH, BIAS, OUT, M, o_stride, K: tl.constexpr, N: tl.constexpr
+ def tiles(k: int, n: int) -> tuple[int, int, int, int, int]:
+     """(rows a program, K step, warps, stages, row blocks a raster group): the shape's alone, so a row never depends on its chunk."""
+ 
+-    return 128, 32, 8, 4, 8
++    return 128, 64, 8, 3, 8      # 2-5% over (128, 32, 8, 4, 8) on GB10, the same bits (the K step only regroups MMAs)
+ 
+ 
+ class Workspace:
+diff --git a/src/tensorfold/cuda/health.py b/src/tensorfold/cuda/health.py
+index b4e417e..d04227a 100644
+--- a/src/tensorfold/cuda/health.py
++++ b/src/tensorfold/cuda/health.py
+@@ -10,7 +10,8 @@ from typing import Any
+ from tensorfold.server import metrics
+ 
+ STATS = {"prefill_s": "prefill_seconds_total", "decode_s": "decode_seconds_total", "cached": "cached_tokens_total",
+-         "rounds": "rounds_total", "drafted": "drafted_total", "accepted": "accepted_total"}
++         "rounds": "rounds_total", "drafted": "drafted_total", "accepted": "accepted_total",
++         "lookup_drafted": "lookup_drafted_total", "lookup_accepted": "lookup_accepted_total"}
+ _MADE = threading.Lock()
+ 
+ 
+@@ -72,6 +73,7 @@ class Health:
+             decode = (ended - request.first) if request.first is not None else None
+         metrics.note(getattr(self, "app", None), prompt=request.prompt, generation=len(request.out),
+                      drafted=_stat(stats, "drafted"), accepted=_stat(stats, "accepted"),
++                     lookup_drafted=_stat(stats, "lookup_drafted"), lookup_accepted=_stat(stats, "lookup_accepted"),
+                      latency=max(0.0, ended - request.started),
+                      ttft=(request.first - request.started) if request.first is not None else None,
+                      decode=None if decode is None else max(0.0, float(decode)))
+diff --git a/src/tensorfold/cuda/streams.py b/src/tensorfold/cuda/streams.py
+index 07492c8..b3dc1e0 100644
+--- a/src/tensorfold/cuda/streams.py
++++ b/src/tensorfold/cuda/streams.py
+@@ -39,6 +39,8 @@ class Stream:
+     min_rows: int = 0
+     drafted: int = 0                                      # drafted rows its rounds verified, and the ones kept
+     accepted: int = 0
++    lookup_drafted: int = 0                               # lookup-arm drafts its rounds verified, and the ones kept
++    lookup_accepted: int = 0
+     cached: int = 0
+     prefill_s: float = 0.0
+     started: float = 0.0
+@@ -69,11 +71,13 @@ class Stream:
+     def stats(self) -> dict:
+         own = {"prefill_s": round(self.prefill_s, 4), "decode_s": round(max(self.finished - self.started, 0.0), 4),
+                "rounds": self.rounds, "drafts": self.draft, "cached": self.cached, "min_rows": self.min_rows,
+-               "drafted": self.drafted, "accepted": self.accepted}
++               "drafted": self.drafted, "accepted": self.accepted,
++               "lookup_drafted": self.lookup_drafted, "lookup_accepted": self.lookup_accepted}
+         if self.carry is None:
+             return own
+         both = {k: round(self.carry[k] + own[k], 4) for k in ("prefill_s", "decode_s")}
+-        both.update({k: self.carry[k] + own[k] for k in ("rounds", "drafted", "accepted")})
++        both.update({k: self.carry.get(k, 0) + own[k]
++                     for k in ("rounds", "drafted", "accepted", "lookup_drafted", "lookup_accepted")})
+         rows = [r for r in (self.carry["min_rows"], own["min_rows"]) if r]
+         return {**own, **both, "cached": self.carry["cached"], "min_rows": min(rows, default=0)}
+ 
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/decode.py b/src/tensorfold/families/qwen4_exp/cuda/decode.py
+index ea765aa..5530e15 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/decode.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/decode.py
+@@ -2,6 +2,8 @@
+ 
+ from __future__ import annotations
+ 
++import json
++import os
+ import time
+ from dataclasses import dataclass, field
+ from typing import Sequence
+@@ -21,6 +23,8 @@ from .state import CAND, Buffers, State
+ from .mtp import mtp_forward
+ from .weights import Weights
+ 
++_COST_LOG = os.environ.get("TF_EXL3_COST_LOG", "")   # P7.1.2 cost calibration: append per-round timings here
++
+ 
+ def sample_mapped(logits: torch.Tensor, positions: Sequence[int], sampling: Sampling | None,
+                   id_map: torch.Tensor) -> list[int]:
+@@ -408,6 +412,8 @@ class DecodeResult:
+     keeps: list[int] = field(default_factory=list)      # tokens each round kept
+     committed: list[int] = field(default_factory=list)  # the tokens now in the caches (all but the pending one)
+     widths: list[int] = field(default_factory=list)     # rows each round verified
++    lookup_drafted: int = 0                             # lookup-draft arm: tokens drafted / accepted (P7)
++    lookup_accepted: int = 0
+ 
+     @property
+     def tokens_per_second(self) -> float:
+@@ -443,9 +449,13 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
+ @torch.no_grad()
+ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *, depth: int = DEPTH,
+                confidence: float = CONFIDENCE, stop_eos: bool = False, on_tokens=None, constraint=None,
+-               probabilities=None) -> DecodeResult:
+-    """Verify pending and drafted tokens from the prefill state, commit rows before the first mismatched draft, and call ``on_tokens(new)`` with kept tokens after pending, stopping on True."""
++               probabilities=None, lookup: "Lookup | None" = None) -> DecodeResult:
++    """Verify pending and drafted tokens from the prefill state, commit rows before the first mismatched draft, and call ``on_tokens(new)`` with kept tokens after pending, stopping on True. ``lookup`` (P7, ``lookup.py``): a prompt-lookup drafter whose rounds replace the MTP head's, byte-exactly; None keeps the MTP-only path unchanged."""
+ 
++    if lookup is not None:
++        return _mtp_lookup_decode(e, pending, count, sampling, depth=depth, confidence=confidence,
++                                  stop_eos=stop_eos, on_tokens=on_tokens, constraint=constraint,
++                                  probabilities=probabilities, lookup=lookup)
+     w, st, b = e.w, e.st, e.buf
+     out = [pending]
+     rounds = drafted = accepted = 0
+@@ -500,3 +510,102 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
+         absorb(e, b.streams[:unabsorbed[0]], unabsorbed[1])
+     committed = out[:st.pos - pos0]
+     return DecodeResult(out[:count], seconds, rounds, drafted, accepted, keeps, committed, widths)
++
++
++@torch.no_grad()
++def _mtp_lookup_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *, depth: int,
++                       confidence: float, stop_eos: bool, on_tokens, constraint, probabilities,
++                       lookup) -> DecodeResult:
++    """``mtp_decode`` with a prompt-lookup draft arm (P7). A round whose history repeats a span drafts its
++    continuation (``lookup.plan``); the other rounds draft with the MTP head. Kept rows are held in a backlog and
++    absorbed into the MTP cache together, so a lookup round leaves the cache as a run of the MTP head would. The
++    verify window, keyed sampler and commit are the MTP path's, so the reply is byte-identical to serial decoding."""
++
++    w, st, b = e.w, e.st, e.buf
++    out = [pending]
++    rounds = drafted = accepted = 0
++    keeps: list[int] = []
++    widths: list[int] = []
++    pos0 = st.pos
++    rows = e.rows                                       # the MTP buffer holds at most this many rows per absorb
++    m_rows = torch.empty((2 * rows, e.last_streams.shape[-1]), dtype=e.last_streams.dtype, device=e.last_streams.device)
++    m_rows[:1].copy_(e.last_streams)
++    m_next: list[int] = [pending]
++    torch.cuda.synchronize()
++    start = time.perf_counter()
++    while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
++        room = count - len(out)
++        t_mtp = 0.0
++        look = lookup.plan(out, room)
++        if look:
++            drafts, arm, steps_m, backlog_m = look, "l", 0, 0
++        else:
++            arm = "m"
++            backlog_m = len(m_next)
++            n = min(depth, room)
++            if n > 0 and m_next:
++                if _COST_LOG:
++                    torch.cuda.synchronize()
++                    _m = time.perf_counter()
++                drafts = draft(e, m_rows[:len(m_next)], m_next, st.pos + 1, n, sampling, confidence)
++                if _COST_LOG:
++                    torch.cuda.synchronize()
++                    t_mtp = (time.perf_counter() - _m) * 1000.0
++                steps_m = 1 + st.mtp_drafted
++                m_next = []
++            else:
++                drafts, steps_m = [], 1
++        tokens = [out[-1]] + drafts
++        window = constraint.window(tokens, list(range(-1, len(tokens) - 1))) if constraint is not None else None
++        if window is not None:                           # the drafts no accepted path can hold are cut first
++            tokens, drafts = window.tokens, window.tokens[1:]
++        R = len(tokens)
++        if _COST_LOG:
++            torch.cuda.synchronize()
++            _f = time.perf_counter()
++        logits = e.forward(tokens)
++        if _COST_LOG:
++            torch.cuda.synchronize()
++            t_fwd = (time.perf_counter() - _f) * 1000.0
++        if window is not None:
++            constraint.mask(logits[:R], window, w.meta.get("vocab_offset", 0))
++        sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling, gathered=window is None)
++        keep = 1
++        for i, d in enumerate(drafts):
++            if sampled[i] != d or (stop_eos and sampled[i] in w.cfg.eos):
++                break
++            keep += 1
++        if probabilities is not None:
++            n = min(keep, count - len(out))
++            capture(logits[:n], sampled[:n], list(range(st.pos + 1, st.pos + 1 + n)), probabilities)
++        commit(w, st, b, R, keep)
++        rounds += 1
++        drafted += len(drafts)
++        accepted += keep - 1
++        keeps.append(keep)
++        widths.append(R)
++        lookup.record(arm, R, steps_m, backlog_m, keep)
++        if _COST_LOG:
++            with open(_COST_LOG, "a") as fh:
++                fh.write(json.dumps({"arm": arm, "rows": R, "steps": steps_m, "backlog": backlog_m,
++                                     "keep": keep, "fwd_ms": t_fwd, "mtp_ms": t_mtp}) + "\n")
++        m_rows[len(m_next):len(m_next) + keep].copy_(b.streams[:keep])
++        m_next.extend(sampled[:keep])
++        if len(m_next) > rows:                          # the MTP cache takes a leading chunk; the rest waits
++            drop = len(m_next) - rows
++            absorb(e, m_rows[:drop], m_next[:drop])
++            m_rows[:rows].copy_(m_rows[drop:drop + rows].clone())
++            m_next = m_next[drop:]
++        new = sampled[:keep][:max(0, count - len(out))]
++        if constraint is not None:
++            constraint.advance(sampled[:keep])
++        out.extend(sampled[:keep])
++        if on_tokens is not None and new and on_tokens(new):
++            break
++    torch.cuda.synchronize()
++    seconds = time.perf_counter() - start
++    if m_next:                              # the MTP cache takes the kept rows: it then covers the sequence
++        absorb(e, m_rows[:len(m_next)], m_next)
++    committed = out[:st.pos - pos0]
++    return DecodeResult(out[:count], seconds, rounds, drafted, accepted, keeps, committed, widths,
++                        lookup.drafted, lookup.accepted)
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/engine.py b/src/tensorfold/families/qwen4_exp/cuda/engine.py
+index 002ff1f..db8a1cb 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/engine.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/engine.py
+@@ -403,6 +403,7 @@ class FlashNextEngine:
+         import torch
+ 
+         from .decode import entry_end, mtp_decode, prefill, serial_decode
++        from .lookup import build_lookup, env_spec
+ 
+         t0 = time.perf_counter()
+         self._start_from(hit)
+@@ -425,9 +426,13 @@ class FlashNextEngine:
+         if (on_tokens is not None and on_tokens([first])) or (stop_eos and first in self.eos) or max_tokens <= 1:
+             return stats
+         if self.depth > 0:
++            lookup = build_lookup(prompt, self.e.rows, env_spec(), eos=self.eos, stop_eos=stop_eos)
+             res = mtp_decode(self.e, first, max_tokens, sampling, depth=self.depth, confidence=self.confidence,
+-                             stop_eos=stop_eos, on_tokens=on_tokens, constraint=constraint, probabilities=probabilities)
++                             stop_eos=stop_eos, on_tokens=on_tokens, constraint=constraint, probabilities=probabilities,
++                             lookup=lookup)
+             stats.update(drafted=res.drafted, accepted=res.accepted, min_rows=min(res.widths, default=0))
++            if lookup is not None:
++                stats.update(lookup_drafted=res.lookup_drafted, lookup_accepted=res.lookup_accepted)
+         else:
+             res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens,
+                                 constraint=constraint, probabilities=probabilities)
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/exl3_mm.py b/src/tensorfold/families/qwen4_exp/cuda/exl3_mm.py
+index 6b0bf41..a8f0df3 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/exl3_mm.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/exl3_mm.py
+@@ -88,6 +88,38 @@ def _f16_mm(X, W, OUT, M, N, x_stride, o_stride, K: tl.constexpr, KS: tl.constex
+                  mask=m_ok[:, None] & n_ok[None, :])
+ 
+ 
++@triton.jit(do_not_specialize=["M"])
++def _f16_fused(X, W, OUT, M, N, x_stride, o_stride, K: tl.constexpr, KS: tl.constexpr, SK: tl.constexpr,
++               BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
++    """_f16_mm's SK slices and _reduce's in-order sum in one program: slice s from zero over its K in BK steps, then
++    0 + slice 0 + slice 1 ... (the bits of the two kernels, without the fp32 slices in memory)."""
++
++    pm = tl.program_id(0)
++    pn = tl.program_id(1)
++    rm = pm * BM + tl.arange(0, BM)
++    rn = pn * BN + tl.arange(0, BN)
++    rk = tl.arange(0, BK)
++    m_ok = rm < M
++    n_ok = rn < N
++    total = tl.zeros((BM, BN), dtype=tl.float32)
++    for ps in range(SK):
++        acc = tl.zeros((BM, BN), dtype=tl.float32)
++        k0 = ps * KS
++        for kk in range(0, KS, BK):
++            x = tl.load(X + rm[:, None] * x_stride + (k0 + kk + rk)[None, :], mask=m_ok[:, None], other=0.0)
++            w = tl.load(W + rn[:, None] * K + (k0 + kk + rk)[None, :], mask=n_ok[:, None], other=0.0)
++            acc = tl.dot(x.to(tl.float16), tl.trans(w), acc)
++        total += acc
++    tl.store(OUT + rm[:, None] * o_stride + rn[None, :], total.to(OUT.dtype.element_ty),
++             mask=m_ok[:, None] & n_ok[None, :])
++
++
++# Prompt row counts (more than FUSED_MIN rows) take larger row tiles and, with K slices, _f16_fused: the same bits
++# per row (tests/cuda/test_flashnext_P.py); decode windows keep the 16-row tiles and the slices.
++FUSED_MIN = 64
++PROMPT_TILE = (64, 128, 64, 4)           # BM, BN, BK, warps
++
++
+ @triton.jit(do_not_specialize=["M"])
+ def _reduce(P, OUT, M, N, o_stride, SK: tl.constexpr, BLOCK: tl.constexpr):
+     r = tl.program_id(0)
+@@ -143,6 +175,20 @@ class F16:
+     def __call__(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+         if out.stride(-1) != 1:
+             raise ValueError("F16: output rows must be contiguous")
++        m = x.shape[0]
++        if m > FUSED_MIN and FUSED_MIN > 0:
++            if x.stride(1) != 1 or x.shape[1] != self.k:
++                raise ValueError(f"F16: x {tuple(x.shape)} does not match K={self.k}")
++            bm, bn, bk, warps = PROMPT_TILE
++            if self.sk == 1:
++                _f16_mm[(triton.cdiv(m, bm), triton.cdiv(self.n, bn), 1)](
++                    x, self.w, out, m, self.n, x.stride(0), out.stride(0), K=self.k, KS=self.k, BM=bm, BN=bn, BK=64,
++                    F32=False, num_warps=warps, num_stages=3)
++            else:
++                _f16_fused[(triton.cdiv(m, bm), triton.cdiv(self.n, bn))](
++                    x, self.w, out, m, self.n, x.stride(0), out.stride(0), K=self.k, KS=self.k // self.sk, SK=self.sk,
++                    BM=bm, BN=bn, BK=64, num_warps=warps, num_stages=3)
++            return out
+         if self.sk == 1:
+             self._launch(x, out, False)
+             return out
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/exl3_pack.py b/src/tensorfold/families/qwen4_exp/cuda/exl3_pack.py
+index 13780fe..3e1f1b0 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/exl3_pack.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/exl3_pack.py
+@@ -13,7 +13,22 @@ import torch
+ from tensorfold.cuda.exl3.format import is_exl3  # noqa: F401  (exl3.py and engine.py import it from here)
+ 
+ EXTRA_FILES = ("ngram_embedding.safetensors", "mtp_hyper_connection_mixer_patch.safetensors")
+-MOE_WINDOW = 1024        # most rows a routed-expert call takes (its grouping keeps every pick in 48 KB of shared memory)
++
++
++def _moe_window() -> int:
++    """Most rows a routed-expert call takes: a 2048-row prompt chunk on the prompt kernel, 1024 on the grouping kernel."""
++
++    from tensorfold.cuda.exl3 import experts as x3experts
++
++    raw = os.environ.get("TF_EXL3_MOE_WINDOW", "")
++    rows = int(raw) if raw else (2048 if x3experts.PROMPT == "prompt" else 1024)
++    if not 16 <= rows <= 4096:
++        raise ValueError(f"TF_EXL3_MOE_WINDOW: 16 to 4096 rows, not {rows}")
++    return rows
++
++
++MOE_WINDOW = _moe_window()   # rows never change a pair's bits; each window reads every routed expert once
++
+ _DT = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32, "I64": torch.int64, "I32": torch.int32,
+        "I16": torch.int16, "U8": torch.uint8, "I8": torch.int8, "U16": torch.int16, "U32": torch.int32}
+ 
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/forward.py b/src/tensorfold/families/qwen4_exp/cuda/forward.py
+index c5fa44d..d72dd78 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/forward.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/forward.py
+@@ -349,8 +349,11 @@ def _exl3_moe(m, w: Weights, b: Buffers, R: int) -> tuple:
+         return 2, y.view(R, buf.slots, -1), buf.wts[:R]
+     for r0 in range(0, R, MOE_WINDOW):
+         n = min(MOE_WINDOW, R - r0)
+-        y = routed(b.mixed[r0:r0 + n], buf.pick[r0:r0 + n], None, m.experts, w.x3.moe, None, n)
+-        buf.y[r0:r0 + n].copy_(y.view(n, buf.slots, -1))
++        dst = buf.y[r0:r0 + n]
++        y = routed(b.mixed[r0:r0 + n], buf.pick[r0:r0 + n], None, m.experts, w.x3.moe, None, n,
++                   y_out=dst.view(n * buf.slots, -1))
++        if y.data_ptr() != dst.data_ptr():
++            dst.copy_(y.view(n, buf.slots, -1))
+     return 2, buf.y[:R], buf.wts[:R]
+ 
+ 
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/lookup.py b/src/tensorfold/families/qwen4_exp/cuda/lookup.py
+new file mode 100644
+index 0000000..1b221d0
+--- /dev/null
++++ b/src/tensorfold/families/qwen4_exp/cuda/lookup.py
+@@ -0,0 +1,370 @@
++"""Prompt-lookup drafts for Flash Next (qwen4_exp): continue the longest earlier occurrence of the text's suffix,
++with no model forward. Ported from glm53-tensorfold-spark patches/0020 (``families/glm5_next/cuda/lookup.py``).
++
++Agent traffic (file edits, tool calls, JSON, code quoting the context) repeats long spans of what is already in
++the prompt or the reply. ``SuffixIndex`` keeps every ``n``-gram of the request's history (prompt, then every
++committed token) and, each round, finds the earlier occurrence whose backward match with the history's end is
++longest (ties to the most recent); the tokens that followed it are the drafts (``copy``: a match that overlaps the
++end continues periodically, as an LZ77 copy does). Qwen's ``CopyIndex`` draws from the context the same way.
++
++``Lookup`` decides each round whether to spend a verify window on those tokens and how many: the drafts are
++verified by the same window, keyed sampler and commit as every other draft, so a draft is kept exactly when it
++equals the token serial decoding produces there (greedy or sampled), and the reply is byte-identical to serial
++decoding whatever is proposed. The decision only changes the speed:
++
++- forced (env ``TF_EXL3_LOOKUP=lN[:M]``): every round with a match of at least M tokens verifies up to N of its
++  tokens; the other rounds draft with the MTP head as usual.
++- gated (env ``TF_EXL3_LOOKUP=1``/``auto``, default OFF): a round with a match of at least ``TF_EXL3_LOOKUP_MIN``
++  tokens (default 4) verifies the k tokens (0 to 7) with the most expected committed tokens per millisecond, and
++  only when that beats the tokens a millisecond this request's MTP rounds have committed (their recent rounds,
++  priced as ``round_ms`` prices them). ``p``, the chance a lookup draft is kept given the one before it was, is a
++  running estimate per match-length band, starting from a cautious prior.
++
++Everything here is a function of the committed tokens, the model costs and the env, so the decision is
++deterministic. Pure Python (no torch): the unit tests run anywhere.
++"""
++
++from __future__ import annotations
++
++import os
++from typing import Sequence
++
++DEFAULT_MIN = 3                   # ``lN``'s match threshold when M is not given
++MAX_DRAFTS = 7                    # a verify window holds the pending token and up to 7 drafts
++CANDIDATES = 64                   # earlier occurrences of the suffix's n-gram examined a round (most recent first)
++EXTEND = 64                       # a backward match is not measured past this many tokens
++# (shortest match of the band, prior p): the chance a lookup draft is kept after a kept one, before this request
++# has evidence. Cautious for short matches, which prose makes by chance.
++BANDS = ((0, 0.45), (8, 0.7), (16, 0.8), (32, 0.9))
++PRIOR_WEIGHT = 2.0                # trials the prior counts for
++DECAY = 0.85                      # a band's evidence fades by this a round that updates it
++ALT_WINDOW = 8                    # the other drafters' rate: their last 8 rounds
++PROBE_EVERY = 8                   # a band of matches of 16+ tokens the gate skipped this many times is tried once
++PROBE_MATCH = 16
++_DEBUG = bool(os.environ.get("TF_EXL3_LOOKUP_DEBUG"))     # TF_EXL3_LOOKUP_DEBUG=1 prints each gate decision
++
++
++# verify window wall time (ms) by row count, measured single-stream on tf-exl3 (P7.1.2 microbench, tools/p7_cost_fit.py).
++# A window is dominated by a ~27 ms per-round fixed cost, so extra rows are cheap and the gate should draft deep.
++_VERIFY_MS = (27.0, 30.4, 33.7, 35.9, 40.6, 41.7, 42.8, 46.9)
++_MTP_MS = 1.8                      # MTP arm's fixed per-round overhead, from the same fit (mtp_ms ~ a + b*(steps-1))
++_MTP_STEP_MS = 1.3                 # and per chained step (the backlog term fit to ~0, absorbed by the fixed part)
++
++
++def costs_for(rows: int) -> dict:
++    """The per-round model costs the gate prices rounds with, in milliseconds (relative timings only:
++    ``verify[k]`` is a k+1-row window, ``mtp``/``mtp_step``/``mtp_row`` the MTP head's). ``rows`` is the engine's
++    widest verify window. Calibrated P7.1.2 (tf-exl3); correctness does not depend on it."""
++
++    rows = max(2, int(rows))
++    if rows <= len(_VERIFY_MS):
++        verify = list(_VERIFY_MS[:rows])
++    else:
++        verify = list(_VERIFY_MS)
++        step = _VERIFY_MS[-1] - _VERIFY_MS[-2]
++        while len(verify) < rows:
++            verify.append(verify[-1] + step)
++    return {"verify": [float(v) for v in verify], "mtp": _MTP_MS, "mtp_step": _MTP_STEP_MS, "mtp_row": 0.0,
++            "block": 0.0, "taps_row": 0.0}
++
++
++def parse_policy(spec: str) -> list[int] | None:
++    """``lN`` or ``lN:M`` -> [N, M]; None when ``spec`` is not a lookup spec. N from 1 to 7, M from 1 to 64."""
++
++    spec = str(spec).strip()
++    if not spec.startswith("l"):
++        return None
++    parts = spec[1:].split(":")
++    bad = ValueError(f"lookup policy {spec!r}: expected lN or lN:M (N from 1 to {MAX_DRAFTS}, M from 1 to 64)")
++    if len(parts) not in (1, 2):
++        raise bad
++    try:
++        most = int(parts[0])
++        least = int(parts[1]) if len(parts) == 2 else DEFAULT_MIN
++    except ValueError:
++        raise bad from None
++    if not 1 <= most <= MAX_DRAFTS or not 1 <= least <= 64:
++        raise bad
++    return [most, least]
++
++
++def env_spec() -> str | None:
++    """``TF_EXL3_LOOKUP``: None (MTP only, the default) when unset/0/off; ``auto`` for the gated mode; else a
++    forced ``lN[:M]`` spec."""
++
++    raw = os.environ.get("TF_EXL3_LOOKUP", "").strip().lower()
++    if raw in ("", "0", "false", "off", "no"):
++        return None
++    if raw in ("1", "true", "on", "yes", "auto"):
++        return "auto"
++    return raw
++
++
++def env_min() -> int:
++    """``TF_EXL3_LOOKUP_MIN`` (default 4): the gated mode's shortest match that drafts. 1 to 64."""
++
++    least = int(os.environ.get("TF_EXL3_LOOKUP_MIN", "4"))
++    if not 1 <= least <= 64:
++        raise ValueError(f"TF_EXL3_LOOKUP_MIN={least}: expected 1 to 64")
++    return least
++
++
++def build_lookup(prompt: Sequence[int], rows: int, spec: str | None, *, eos: Sequence[int] = (),
++                 stop_eos: bool = True) -> "Lookup | None":
++    """The request's ``Lookup`` for env ``spec`` (``env_spec``), or None when it drafts none."""
++
++    if spec is None:
++        return None
++    costs = costs_for(rows)
++    if spec == "auto":
++        return Lookup(prompt, costs, most=MAX_DRAFTS, min_match=env_min(), gated=True, eos=eos, stop_eos=stop_eos)
++    parsed = parse_policy(spec)
++    if parsed is None:
++        raise ValueError(f"TF_EXL3_LOOKUP={spec!r}: expected auto or lN[:M]")
++    return Lookup(prompt, costs, most=parsed[0], min_match=parsed[1], gated=False, eos=eos, stop_eos=stop_eos)
++
++
++# -- the matcher ----------------------------------------------------------------------------------------------------
++class SuffixIndex:
++    """Where every ``n``-gram of a growing token history ends, for the longest earlier match of its suffix.
++
++    ``extend`` appends tokens (O(1) each); ``match`` returns (length, end): ``history[end - length:end]`` equals
++    the last ``length`` tokens, ``end < len(history)``, the longest such match among the ``candidates`` most
++    recent occurrences of the last ``n`` tokens (ties to the most recent), measured up to ``extend_to`` tokens;
++    (0, -1) when the last n-gram never occurred before."""
++
++    def __init__(self, n: int = 3, *, candidates: int = CANDIDATES, extend_to: int = EXTEND) -> None:
++        if n < 1:
++            raise ValueError("n must be positive")
++        self.n = n
++        self.candidates = candidates
++        self.extend_to = max(extend_to, n)
++        self.tokens: list[int] = []
++        self.ends: dict[tuple[int, ...], list[int]] = {}
++        self.indexed = 0            # n-grams ending at or before this many tokens are in ``ends``
++        self.owner: object = None   # the ``Lookup`` extending it (``reuse_index`` hands it to the next request)
++
++    def __len__(self) -> int:
++        return len(self.tokens)
++
++    def extend(self, tokens: Sequence[int]) -> None:
++        self.tokens.extend(int(t) for t in tokens)
++
++    def _index(self) -> None:
++        # the n-gram ending at the history's end is the query itself: it joins once a token follows it, so a match
++        # always has a continuation
++        n, t = self.n, self.tokens
++        first, last = max(self.indexed, n), len(t)          # new n-grams end at first .. last - 1
++        if first < last:
++            ends = self.ends
++            grams = zip(*(t[first - n + i:last - n + i] for i in range(n)))
++            for end, key in zip(range(first, last), grams):
++                got = ends.get(key)
++                if got is None:
++                    ends[key] = [end]
++                else:
++                    got.append(end)
++        self.indexed = max(self.indexed, last)
++
++    def match(self) -> tuple[int, int]:
++        t = self.tokens
++        L = len(t)
++        if L <= self.n:
++            return 0, -1
++        self._index()
++        ends = self.ends.get(tuple(t[L - self.n:]))
++        if not ends:
++            return 0, -1
++        best_len, best_end = 0, -1
++        for end in reversed(ends[-self.candidates:]):
++            length = self.n                     # the n-gram matches by construction
++            limit = min(self.extend_to, end)
++            while length < limit and t[end - 1 - length] == t[L - 1 - length]:
++                length += 1
++            if length > best_len:
++                best_len, best_end = length, end
++                if length >= self.extend_to:
++                    break
++        return best_len, best_end
++
++    def copy(self, end: int, count: int) -> list[int]:
++        """The ``count`` tokens that follow position ``end`` if the history repeats from there: past the history's
++        end the copy reads its own output (an overlapping match continues with its period)."""
++
++        t = self.tokens
++        L = len(t)
++        out: list[int] = []
++        for i in range(count):
++            j = end + i
++            out.append(t[j] if j < L else out[j - L])
++        return out
++
++    def propose(self, count: int, min_match: int = 1) -> tuple[list[int], int]:
++        """(up to ``count`` drafts, match length) from the longest match of at least ``min_match`` tokens."""
++
++        length, end = self.match()
++        if end < 0 or length < min_match or count <= 0:
++            return [], length
++        return self.copy(end, count), length
++
++
++_last: list[SuffixIndex] = []         # the previous request's index (prompt and reply), for the next turn
++
++
++def reuse_index(n: int, prompt: Sequence[int]) -> SuffixIndex:
++    """An index of ``prompt``: the previous request's, extended, when ``prompt`` begins with its whole history
++    (the next turn of a conversation: indexing a 100k-token prompt from scratch takes ~0.1 s), else a new one.
++    Matches are a function of the tokens alone, so reuse never changes a proposal."""
++
++    prompt = [int(t) for t in prompt]
++    idx = _last[0] if _last else None
++    if idx is None or idx.n != n or len(idx.tokens) > len(prompt) or prompt[:len(idx.tokens)] != idx.tokens:
++        idx = SuffixIndex(n)
++    idx.extend(prompt[len(idx.tokens):])
++    _last[:] = [idx]
++    return idx
++
++
++# -- per-round decision ---------------------------------------------------------------------------------------------
++def round_ms(costs: dict, arm: str, rows: int, steps: int, backlog: int) -> float:
++    """Model ms of a round. ``arm`` "m" (MTP) prices the verify window plus the head's steps; "l" (lookup) the
++    window only."""
++
++    verify = costs["verify"][min(rows, len(costs["verify"])) - 1]
++    if arm == "l":
++        return verify
++    if arm == "m":
++        return (verify + costs.get("mtp", 0.0) + costs.get("mtp_step", 0.0) * max(steps - 1, 0)
++                + costs.get("mtp_row", 0.0) * max(backlog - 1, 0))
++    return verify + costs.get("block", 0.0) + costs.get("taps_row", 0.0) * backlog
++
++
++def best_depth(p: float, costs: dict, most: int, row_ms: float = 0.0) -> tuple[int, float]:
++    """(k, rate): the number of drafts (1 to ``most``) whose expected committed tokens, 1 + p + ... + p^k, per
++    ms of a (k + 1)-row window (plus ``row_ms`` a committed row for the drafters' catch-up) is highest."""
++
++    best, best_rate = 0, 0.0
++    expected = run = 1.0
++    verify = costs["verify"]
++    for k in range(1, min(most, len(verify) - 1) + 1):
++        run *= p
++        expected += run
++        rate = expected / (verify[k] + row_ms * expected)
++        if rate > best_rate:
++            best, best_rate = k, rate
++    return best, best_rate
++
++
++class Lookup:
++    """A request's lookup drafter: ``plan`` before each round (the drafts, or [] to let the MTP arm draft),
++    ``record`` after it."""
++
++    def __init__(self, prompt: Sequence[int], costs: dict, *, most: int = MAX_DRAFTS, min_match: int = 4,
++                 gated: bool = True, eos: Sequence[int] = (), stop_eos: bool = True) -> None:
++        self.costs = costs
++        self.most = max(1, min(int(most), MAX_DRAFTS, len(costs["verify"]) - 1))
++        self.min_match = max(1, int(min_match))
++        self.gated = gated
++        self.eos = frozenset(int(t) for t in eos) if stop_eos else frozenset()
++        self.prompt = [int(t) for t in prompt]
++        self.index = reuse_index(min(self.min_match, 8), self.prompt)
++        self.index.owner = self
++        self.prompt_len = len(prompt)
++        self.synced = 0                           # tokens of the decode loop's ``out`` in the index
++        self.acc = [0.0] * len(BANDS)             # decayed kept drafts, trials per band
++        self.tri = [0.0] * len(BANDS)
++        self.alt: list[tuple[int, float]] = []    # (tokens committed, model ms) of recent non-lookup rounds
++        # a committed row is later taken by the drafter that drafts next (an MTP row)
++        self.row_ms = max(costs.get("mtp_row", 0.0), costs.get("taps_row", 0.0))
++        self.skipped = [0] * len(BANDS)          # gated-out rounds per band since its last lookup round
++        self.band = 0
++        self.rounds = self.drafted = self.accepted = 0
++
++    def _band(self, length: int) -> int:
++        b = 0
++        for i, (least, _) in enumerate(BANDS):
++            if length >= least:
++                b = i
++        return b
++
++    def p(self, band: int) -> float:
++        prior = BANDS[band][1]
++        return (self.acc[band] + prior * PRIOR_WEIGHT) / (self.tri[band] + PRIOR_WEIGHT)
++
++    def alt_rate(self) -> float:
++        """Tokens a model ms of this request's recent MTP rounds; before any, an MTP round keeping one draft."""
++
++        if self.alt:
++            return sum(k for k, _ in self.alt) / sum(ms for _, ms in self.alt)
++        c = self.costs
++        return 2.0 / (c["verify"][min(2, len(c["verify"])) - 1] + c.get("mtp", 0.0))
++
++    def sync(self, out: Sequence[int]) -> None:
++        """The history is the prompt then ``out`` (the decode loop's tokens: every committed one and the pending
++        token, which is already the exact sample for its position)."""
++
++        if self.index.owner is not self:          # a later request took the shared index: a private one
++            self.index = SuffixIndex(self.index.n)
++            self.index.extend(self.prompt + [int(t) for t in out[:self.synced]])
++            self.index.owner = self
++        if self.synced < len(out):
++            self.index.extend(out[self.synced:])
++            self.synced = len(out)
++
++    def plan(self, out: Sequence[int], room: int) -> list[int]:
++        """The drafts for the positions after ``out[-1]`` (at most ``room``), or [] for a round of the MTP arm."""
++
++        self.sync(out)
++        most = min(self.most, room)
++        if most <= 0:
++            return []
++        drafts, length = self.index.propose(most, self.min_match)
++        if self.eos:                       # a draft past the end of the reply is never kept
++            for i, d in enumerate(drafts):
++                if d in self.eos:
++                    drafts = drafts[:i]
++                    break
++        if not drafts:
++            return []
++        self.band = self._band(length)
++        if _DEBUG:
++            print("LOOKUP band=%d len=%d p=%.3f ndraft=%d alt=%.4f" % (self.band, length, self.p(self.band),
++                  len(drafts), self.alt_rate()), flush=True)
++        if self.gated:
++            b = self.band
++            k, rate = best_depth(self.p(b), self.costs, len(drafts), self.row_ms)
++            if _DEBUG:
++                print("LOOKUP gate k=%d rate=%.4f alt=%.4f skip=%s" % (k, rate, self.alt_rate(),
++                      k == 0 or rate <= self.alt_rate()), flush=True)
++            if k == 0 or rate <= self.alt_rate():
++                # a long match's acceptance is learned only by trying it: once in a while, it is
++                self.skipped[b] += 1
++                if k == 0 or BANDS[b][0] < PROBE_MATCH or self.skipped[b] < PROBE_EVERY:
++                    return []
++            self.skipped[b] = 0
++            drafts = drafts[:k]
++        return drafts
++
++    def record(self, arm: str, rows: int, steps: int, backlog: int, keep: int) -> None:
++        """After a round: ``arm`` "l" updates the band's acceptance; another arm's committed tokens and model ms
++        join the rate lookup rounds must beat."""
++
++        if arm == "l":
++            drafts = rows - 1
++            kept = keep - 1
++            b = self.band
++            self.acc[b] = self.acc[b] * DECAY + kept
++            self.tri[b] = self.tri[b] * DECAY + kept + (1 if kept < drafts else 0)
++            self.rounds += 1
++            self.drafted += drafts
++            self.accepted += kept
++            if _DEBUG:
++                print("REC l band=%d p=%.3f acc=%.2f tri=%.2f kept=%d/%d alt=%.4f" % (
++                    b, self.p(b), self.acc[b], self.tri[b], kept, drafts, self.alt_rate()), flush=True)
++            return
++        _ms = round_ms(self.costs, arm, rows, steps, backlog)
++        if _DEBUG:
++            print("REC m arm=%s rows=%d steps=%d backlog=%d keep=%d ms=%.2f alt=%.4f" % (
++                arm, rows, steps, backlog, keep, _ms, self.alt_rate()), flush=True)
++        self.alt.append((keep, _ms))
++        del self.alt[:-ALT_WINDOW]
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/multi.py b/src/tensorfold/families/qwen4_exp/cuda/multi.py
+index e4326b4..b37e60b 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/multi.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/multi.py
+@@ -21,6 +21,7 @@ from .decode import (PREFILL_ROWS, WARM_TAIL, Engine, _gathered_fits, choose_gat
+                      entry_end, prefill_begin, tp_sample_rows)
+ from . import attn_multi, gdn_multi, image_rows, prefixes
+ from .forward import commit, compute, compute_mixed, converges, stage
++from .lookup import build_lookup, env_spec
+ from .mtp import mtp_compute, mtp_stage
+ from .state import Buffers, State
+ from .multi_solo import Alone, solo
+@@ -67,6 +68,9 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+         self.pbuf = Buffers(w, prefill_rows + (rows if self.converged else 0), capacity, prefill=True)
+         self.gdn = gdn_multi.Scratch(w, rows)            # every stream's DeltaNet rows, one launch a step
+         self.held: dict[int, list[int]] = {}             # stream id -> last round's kept rows, folded in next round
++        self.lookups: dict[int, object] = {}             # stream id -> its prompt-lookup arm (TF_EXL3_LOOKUP), or none
++        self.back: dict[int, list] = {}                  # stream id -> rows a lookup round deferred, absorbed with the next MTP round
++        self.arm: dict[int, tuple] = {}                  # stream id -> (arm, rows, steps, backlog) of the drafts now pending
+         # slots start small and grow with their stream's context, up to the window, while the gate has room
+         self.free = [State(w, min(capacity, FIRST), depth + 1, kv_dtype, limit=capacity) for _ in range(slots)]
+         self.slots = list(self.free)
+@@ -399,7 +403,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+                     s.error = exc
+             last = s.error is not None or len(s.out) + len(new) >= s.count or end in self._ends(s)
+             kept.append((s, a0, rows[:len(path)], new, last))
+-        self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last])
++        self._draft_all([(s, a0, keep, new) for s, a0, keep, new, last in kept if s.draft and not last])
+         for s, _, _, new, _ in kept:
+             if s.error is not None:
+                 s.done = True
+@@ -415,44 +419,95 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+         return failed + done + ended
+ 
+     def _draft_all(self, streams: list) -> None:
+-        """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth."""
+-
+-        for s, _, _ in streams:
++        """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth.
++
++        A stream whose prompt suffix matches drafts from the prompt (``TF_EXL3_LOOKUP``) and defers its rows; they
++        are absorbed, with the rows just kept, in the next MTP round, so the MTP cache never skips a position.
++        """
++
++        for s, _, keep, _ in streams:                    # price the drafts this round verified by the arm that made them
++            info = self.arm.pop(s.sid, None)
++            if info is not None:
++                lk = self.lookups.get(s.sid)
++                if lk is not None:
++                    lk.record(info[0], info[1], info[2], info[3], len(keep))
++                    s.lookup_drafted, s.lookup_accepted = lk.drafted, lk.accepted
+             s.drafts = []
+-        room = {s.sid: min(self.depth, s.count - len(s.out) - len(keep)) for s, _, keep in streams}
+-        todo = [(s, a0, keep) for s, a0, keep in streams if room[s.sid] > 0 and self.mbuf is not None]
++        room = {s.sid: min(self.depth, s.count - len(s.out) - len(keep)) for s, _, keep, _ in streams}
++        todo = [(s, a0, keep, new) for s, a0, keep, new in streams if room[s.sid] > 0 and self.mbuf is not None]
+         if not todo:
+             return
+-        for s, _, _ in todo:
++        for s, _, _, _ in todo:
+             st = s.st
+             if st.mtp_drafted:
+                 st.set_mtp_len(st.mtp_len - st.mtp_drafted)
+                 st.mtp_drafted = 0
+-        windows = [(s.st, keep, self.buf.streams[a0:a0 + len(keep)]) for s, a0, keep in todo]
+-        segs = mtp_stage(self.w, self.mbuf, windows)
+-        logits = self._mtp(segs)
+-        for (s, _, keep), (st, a0, a1) in zip(todo, segs):
+-            st.set_mtp_len(st.mtp_len + len(keep))
+-        active = [(s, a1 - 1) for s, (_, _, a1) in zip([t[0] for t in todo], segs)]
++        spec = env_spec() if self.w.comm is None else None
++        mtp = []
++        for s, a0, keep, new in todo:
++            look = self.lookups.get(s.sid)
++            if look is None and spec is not None:
++                look = build_lookup(s.prompt, self.depth + 1, spec, eos=self.eos, stop_eos=s.stop_eos)
++                if look is not None:
++                    self.lookups[s.sid] = look
++            drafts = list(look.plan([*s.out, *new], room[s.sid])) if look is not None else []
++            back = self.back.get(s.sid, [])
++            full = sum(len(t) for _, t in back) >= self.depth + 1
++            if drafts and not full:                      # lookup arm: draft from the prompt, defer this round's rows
++                s.drafts = drafts
++                back.append((self.buf.streams[a0:a0 + len(keep)].clone(), list(keep)))
++                self.back[s.sid] = back
++                self.arm[s.sid] = ("l", 1 + len(drafts), 0, 0)
++            else:                                        # MTP arm: absorb the deferred rows and the rows just kept
++                mtp.append((s, a0, keep, look))
++        if not mtp:
++            return
++        rows, toks = {}, {}
++        for s, a0, keep, _ in mtp:
++            entries = [*self.back.pop(s.sid, []), (self.buf.streams[a0:a0 + len(keep)], list(keep))]
++            rows[s.sid] = entries[0][0] if len(entries) == 1 else torch.cat([t for t, _ in entries])
++            toks[s.sid] = [x for _, t in entries for x in t]
++        budget, seeds = self.mbuf.rows, {}
++        off = {s.sid: 0 for s, _, _, _ in mtp}
++        while any(off[s.sid] < len(toks[s.sid]) for s, _, _, _ in mtp):
++            chunk, used = [], 0
++            for s, _, _, _ in mtp:
++                left = len(toks[s.sid]) - off[s.sid]
++                if left <= 0 or used >= budget:
++                    continue
++                take = min(left, budget - used)
++                at = off[s.sid]
++                chunk.append((s, toks[s.sid][at:at + take], rows[s.sid][at:at + take]))
++                off[s.sid] = at + take
++                used += take
++            segs = mtp_stage(self.w, self.mbuf, [(s.st, tk, ten) for s, tk, ten in chunk])
++            logits = self._mtp(segs)
++            for i, ((s, tk, _), (st, a0, a1)) in enumerate(zip(chunk, segs)):
++                st.set_mtp_len(st.mtp_len + len(tk))
++                if off[s.sid] >= len(toks[s.sid]):       # the chain starts from the last row this stream absorbed
++                    seeds[s.sid] = (logits[i].clone(), self.mbuf.streams[a1 - 1:a1].clone())
++        active = [(s, seeds[s.sid][1]) for s, _, _, _ in mtp]
++        logits = torch.stack([seeds[s.sid][0] for s, _, _, _ in mtp])
+         for j in range(self.depth):
+             picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active])
+             nxt = []
+-            for (s, row), (d, p) in zip(active, picks):
++            for (s, sr), (d, p) in zip(active, picks):
+                 low = self.confidence > 0 and p < self.confidence
+                 if low and j > 0:
+                     continue
+                 s.drafts.append(d)
+                 if not low and j + 1 < room[s.sid]:
+-                    nxt.append((s, row, d))
++                    nxt.append((s, sr, d))
+             if not nxt:
+-                return
+-            windows = [(s.st, [d], self.mbuf.streams[row:row + 1]) for s, row, d in nxt]
+-            segs = mtp_stage(self.w, self.mbuf, windows)
++                break
++            segs = mtp_stage(self.w, self.mbuf, [(s.st, [d], sr) for s, sr, d in nxt])
+             logits = self._mtp(segs)
+             for s, _, _ in nxt:
+                 s.st.set_mtp_len(s.st.mtp_len + 1)
+                 s.st.mtp_drafted += 1
+-            active = [(s, a0) for (s, _, _), (_, a0, _) in zip(nxt, segs)]
++            active = [(s, self.mbuf.streams[a0:a0 + 1]) for (s, _, _), (_, a0, _) in zip(nxt, segs)]
++        for s, _, _, _ in mtp:                           # price these drafts for the next round's record
++            self.arm[s.sid] = ("m", 1 + len(s.drafts), 1 + len(s.drafts), len(toks[s.sid]))
+ 
+     def _mtp(self, segs: list) -> torch.Tensor:
+         """An MTP step over every drafting stream, its attention one launch a kernel for all of them."""
+@@ -513,6 +568,9 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+             self.link.send(["finish", [s.sid for s in done]])
+         for s in done:
+             self.held.pop(s.sid, None)
++            self.arm.pop(s.sid, None)
++            self.lookups.pop(s.sid, None)
++            self.back.pop(s.sid, None)
+             self.streams.pop(s.sid, None)
+             if not any(k[1] is s.st for k in self.kept) and all(f is not s.st for f in self.free):
+                 self._shrink(s.st)
+@@ -526,6 +584,9 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+         for s in live:
+             self.streams.pop(s.sid, None)
+             self.held.pop(s.sid, None)
++            self.arm.pop(s.sid, None)
++            self.lookups.pop(s.sid, None)
++            self.back.pop(s.sid, None)
+             self._drop_kept(s.st)
+             self._shrink(s.st)
+             self.free.append(s.st)
+diff --git a/src/tensorfold/server/metrics.py b/src/tensorfold/server/metrics.py
+index 3b511f6..77a7b0a 100644
+--- a/src/tensorfold/server/metrics.py
++++ b/src/tensorfold/server/metrics.py
+@@ -55,18 +55,23 @@ class Metrics:
+         self.generation = 0
+         self.drafted = 0
+         self.accepted = 0
++        self.lookup_drafted = 0
++        self.lookup_accepted = 0
+         self.latency = Histogram()
+         self.ttft = Histogram()
+         self.decode = Histogram()
+         self.http_requests: dict[tuple[str, int], int] = {}
+ 
+     def add(self, *, prompt: int, generation: int, drafted: int, accepted: int,
+-            latency: float | None, ttft: float | None, decode: float | None = None) -> None:
++            latency: float | None, ttft: float | None, decode: float | None = None,
++            lookup_drafted: int = 0, lookup_accepted: int = 0) -> None:
+         with self.lock:
+             self.prompt += int(prompt)
+             self.generation += int(generation)
+             self.drafted += int(drafted)
+             self.accepted += int(accepted)
++            self.lookup_drafted += int(lookup_drafted)
++            self.lookup_accepted += int(lookup_accepted)
+             if latency is not None:
+                 self.latency.observe(latency)
+             if ttft is not None:
+@@ -86,13 +91,15 @@ def of(app: Any) -> Metrics:
+ 
+ 
+ def note(app: Any, *, prompt: int = 0, generation: int = 0, drafted: int = 0, accepted: int = 0,
+-         latency: float | None = None, ttft: float | None = None, decode: float | None = None) -> None:
++         latency: float | None = None, ttft: float | None = None, decode: float | None = None,
++         lookup_drafted: int = 0, lookup_accepted: int = 0) -> None:
+     """Fold one finished request. A missing app is a no-op."""
+ 
+     if app is None:
+         return
+     of(app).add(prompt=prompt, generation=generation, drafted=drafted, accepted=accepted,
+-                latency=latency, ttft=ttft, decode=decode)
++                latency=latency, ttft=ttft, decode=decode,
++                lookup_drafted=lookup_drafted, lookup_accepted=lookup_accepted)
+ 
+ 
+ def http_request(app: Any, key: str, status: int) -> None:
+@@ -158,6 +165,7 @@ def render(app: Any) -> str:
+     with metrics.lock:
+         prompt, generation = metrics.prompt, metrics.generation
+         drafted, accepted = metrics.drafted, metrics.accepted
++        lookup_drafted, lookup_accepted = metrics.lookup_drafted, metrics.lookup_accepted
+         latency, ttft, decode = metrics.latency.copy(), metrics.ttft.copy(), metrics.decode.copy()
+         requests = dict(metrics.http_requests)
+     running, waiting = _requests(app)
+@@ -182,6 +190,12 @@ def render(app: Any) -> str:
+             [f"{PREFIX}mtp_drafted_total {drafted}"])
+     _family(lines, "mtp_accepted_total", "counter", "Draft tokens kept on finished requests.",
+             [f"{PREFIX}mtp_accepted_total {accepted}"])
++    _family(lines, "lookup_drafted_total", "counter",
++            "Prompt-lookup draft tokens verified on finished requests (lookup arm).",
++            [f"{PREFIX}lookup_drafted_total {lookup_drafted}"])
++    _family(lines, "lookup_accepted_total", "counter",
++            "Prompt-lookup draft tokens kept on finished requests (lookup arm).",
++            [f"{PREFIX}lookup_accepted_total {lookup_accepted}"])
+     _histogram(lines, "request_latency_seconds", "Seconds from arrival to the reply leaving.", latency)
+     _histogram(lines, "time_to_first_token_seconds", "Seconds from arrival to the first generated token.", ttft)
+     _histogram(lines, "request_decode_seconds",
+diff --git a/tests/cuda/test_exl3_prompt_experts.py b/tests/cuda/test_exl3_prompt_experts.py
+new file mode 100644
+index 0000000..5581bbf
+--- /dev/null
++++ b/tests/cuda/test_exl3_prompt_experts.py
+@@ -0,0 +1,190 @@
++"""EXL3 routed experts in prompt windows (experts_prompt.cuh) give every pair the grouping kernel's bits.
++
++Every codebook, mixed and 4-bit-only widths, skewed routing (experts spanning several items), skipped picks, with and
++without the weighted combine, windows on both sides of the switch row count; decode windows keep the grouping kernel."""
++
++from __future__ import annotations
++
++import math
++
++import pytest
++import torch
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
++
++
++def _trellis(k, n, k2, gen):
++    v = torch.randint(-32768, 32768, (k // 16, n // 16, 8 * k2), dtype=torch.int32, generator=gen)
++    return v.to(torch.int16).cuda().contiguous()
++
++
++def _scale(n, mag, gen):
++    sign = torch.randint(0, 2, (n,), generator=gen).float() * 2 - 1
++    return (sign * (torch.rand((n,), generator=gen) + 0.5) * mag).half().cuda()
++
++
++def _layer(E, D, I, kfun, cb, seed):
++    from tensorfold.cuda.exl3 import experts
++
++    g = torch.Generator().manual_seed(seed)
++    gate, up, down = [], [], []
++    for e in range(E):
++        kg, ku, kd = kfun(e)
++        gate.append((_trellis(D, I, kg, g), _scale(D, 1 / math.sqrt(D), g), _scale(I, 1.0, g)))
++        up.append((_trellis(D, I, ku, g), _scale(D, 1 / math.sqrt(D), g), _scale(I, 1.0, g)))
++        down.append((_trellis(I, D, kd, g), _scale(I, 1 / math.sqrt(I), g), _scale(D, 0.25, g)))
++    return experts.prepare(gate, up, down, cb)
++
++
++def _skewed_picks(E, R, k, gen):
++    """Top-k of a strongly biased router (a few experts take most rows: many member tiles), the last slot the shared
++    expert (id E - 1 here), and every 7th row's slot 0 a skipped pick (id E)."""
++
++    bias = torch.linspace(4.0, -4.0, E - 1)
++    logits = torch.randn((R, E - 1), generator=gen) + bias
++    sel = logits.topk(k, dim=1).indices.to(torch.int32)
++    sel = torch.cat([sel, torch.full((R, 1), E - 1, dtype=torch.int32)], 1)
++    sel[::7, 0] = E
++    w = torch.rand((R, k + 1), generator=gen) * 0.2 + 0.05
++    return sel.cuda().contiguous(), w.float().cuda().contiguous()
++
++
++CASES = [
++    ("mul1-4bit", 2, lambda e: (8, 8, 8)),                                                  # EXL3 4.05's experts
++    ("mul1-mixed", 2, lambda e: ((6, 6, 6) if e % 4 else (12, 12, 12))),                     # 3.05-like + 6-bit shared
++    ("mcg", 1, lambda e: ((2, 4, 6, 8, 10, 12, 14, 16)[e % 8],) * 2 + ((4, 6, 8)[e % 3],)),
++    ("3inst", 0, lambda e: ((4, 8, 16)[e % 3],) * 3),
++]
++
++
++@pytest.mark.parametrize("name,cb,kfun", CASES, ids=[c[0] for c in CASES])
++def test_prompt_kernel_gives_the_grouping_kernels_bits(name, cb, kfun, monkeypatch):
++    from tensorfold.cuda.exl3 import experts
++
++    E, D, I, TOPK, ROWS = 33, 512, 256, 6, 300
++    ex = _layer(E, D, I, kfun, cb, seed=5 + cb)
++    g = torch.Generator().manual_seed(23 + cb)
++    x = (torch.randn((ROWS, D), generator=g) * 0.5).to(torch.bfloat16).cuda()
++    sel, w = _skewed_picks(E, ROWS, TOPK, g)
++    scratch = experts.Scratch(ex, ROWS, TOPK + 1)
++
++    def run(R, mode, wts):
++        monkeypatch.setattr(experts, "PROMPT", mode)
++        scratch.y.fill_(float("nan"))                  # no row may pass on what another run left
++        scratch.z.fill_(float("nan"))
++        got = experts.routed(x[:R], sel[:R].contiguous(), w[:R].contiguous() if wts else None, ex, scratch, None, R)
++        return got.clone()
++
++    for R in (65, 129, 300):
++        for wts in (False, True):
++            ref = run(R, "group", wts)                 # the grouping kernel, one program a (expert, member tile)
++            got = run(R, "prompt", wts)
++            if not wts:                                # skipped slots stay NaN in both; every routed slot is set
++                assert torch.isfinite(ref.view(R, TOPK + 1, D)[sel[:R] < E]).all()
++            assert torch.equal(got.view(torch.int32), ref.view(torch.int32)), (name, R, wts)
++
++
++def test_prompt_rows_do_not_depend_on_the_window(monkeypatch):
++    """A row's output in a prompt window equals its output alone (one row, the grouping kernel), for 4.05's widths."""
++
++    from tensorfold.cuda.exl3 import experts
++
++    E, D, I, TOPK, ROWS = 33, 512, 256, 6, 200
++    ex = _layer(E, D, I, lambda e: (12, 12, 12) if e == E - 1 else (8, 8, 8), 2, seed=3)
++    g = torch.Generator().manual_seed(4)
++    x = (torch.randn((ROWS, D), generator=g) * 0.5).to(torch.bfloat16).cuda()
++    sel, _ = _skewed_picks(E, ROWS, TOPK, g)
++    scratch = experts.Scratch(ex, ROWS, TOPK + 1)
++    monkeypatch.setattr(experts, "PROMPT", "prompt")
++    full = experts.routed(x, sel, None, ex, scratch, None, ROWS).clone().view(ROWS, TOPK + 1, D)
++    for r in (0, 1, 77, 199):
++        one = experts.routed(x[r:r + 1], sel[r:r + 1].contiguous(), None, ex, scratch, None, 1).view(TOPK + 1, D)
++        keep = sel[r] < E
++        assert torch.equal(full[r][keep].view(torch.int32), one[keep].view(torch.int32)), r
++
++
++def test_decode_windows_keep_the_grouping_kernel(monkeypatch):
++    """At or below PROMPT_ROWS rows (decode, graphs) routed() takes the grouping path: no plan is made."""
++
++    from tensorfold.cuda.exl3 import experts
++
++    monkeypatch.setattr(experts, "PROMPT", "prompt")
++    ex = _layer(9, 512, 256, lambda e: (8, 8, 8), 2, seed=1)
++    scratch = experts.Scratch(ex, 64, 3)
++    x = torch.randn((8, 512)).to(torch.bfloat16).cuda()
++    sel = torch.randint(0, 9, (8, 3), dtype=torch.int32).cuda()
++    experts.routed(x, sel, None, ex, scratch, None, 8)
++    assert scratch._plan is None
++
++
++def test_prompt_bf16_y_is_the_rounded_fp32_y(monkeypatch):
++    """y_out (bf16, the prompt path's per-slot Y) equals the grouping kernel's fp32 Y copied into bf16."""
++
++    from tensorfold.cuda.exl3 import experts
++
++    E, D, I, TOPK, ROWS = 33, 512, 256, 6, 160
++    ex = _layer(E, D, I, lambda e: (12, 12, 12) if e == E - 1 else (8, 8, 8), 2, seed=8)
++    g = torch.Generator().manual_seed(9)
++    x = (torch.randn((ROWS, D), generator=g) * 0.5).to(torch.bfloat16).cuda()
++    logits = torch.randn((ROWS, E - 1), generator=g) + torch.linspace(4.0, -4.0, E - 1)
++    sel = logits.topk(TOPK, dim=1).indices.to(torch.int32)        # every slot routed, no expert twice in a row
++    sel = torch.cat([sel, torch.full((ROWS, 1), E - 1, dtype=torch.int32)], 1).cuda().contiguous()
++    scratch = experts.Scratch(ex, ROWS, TOPK + 1)
++    monkeypatch.setattr(experts, "PROMPT", "group")
++    ref32 = experts.routed(x, sel, None, ex, scratch, None, ROWS).clone()
++    ref = ref32.to(torch.bfloat16)
++    monkeypatch.setattr(experts, "PROMPT", "prompt")
++    scratch.y.fill_(float("nan"))
++    got32 = experts.routed(x, sel, None, ex, scratch, None, ROWS).clone()
++    bad32 = (got32.view(torch.int32) != ref32.view(torch.int32)).sum().item()
++    out = torch.full((ROWS * (TOPK + 1), D), float("nan"), dtype=torch.bfloat16, device="cuda")
++    got = experts.routed(x, sel, None, ex, scratch, None, ROWS, y_out=out)
++    assert got.data_ptr() == out.data_ptr()
++    bad = (out.view(torch.int16) != ref.view(torch.int16))
++    rows = bad.any(dim=1).nonzero().flatten().tolist()
++    assert bad32 == 0 and not rows, (bad32, int(bad.sum()), rows[:20], len(rows))
++
++
++@pytest.mark.parametrize("n,k", [(324, 10240), (10240, 320), (96, 2560), (2560, 2560), (512, 2560), (1, 2560)])
++def test_f16_prompt_tiles_give_the_sliced_bits(n, k, monkeypatch):
++    """The EXL3 pack's fp16 matmul at prompt row counts (larger tiles; slices summed in one program) equals the 16-row
++    tiles with fp32 slices and the in-order reduce, row for row."""
++
++    from tensorfold.families.qwen4_exp.cuda import exl3_mm
++
++    g = torch.Generator().manual_seed(n + k)
++    w = (torch.randn((n, k), generator=g) * 0.02).half()
++    sc = exl3_mm.Scratch(11)
++    lin = exl3_mm.f16(sc, [w], "cuda")
++    sc.part = torch.empty((max(1, lin.sk) * exl3_mm.ROWS * n,), dtype=torch.float32, device="cuda")
++    for m in (65, 300, 2048):
++        x = torch.randn((m, k), generator=g).to(torch.bfloat16).cuda()
++        for dt in (torch.float32, torch.bfloat16):
++            monkeypatch.setattr(exl3_mm, "FUSED_MIN", 0)
++            ref = lin(x, torch.empty((m, n), dtype=dt, device="cuda")).clone()
++            monkeypatch.setattr(exl3_mm, "FUSED_MIN", 64)
++            got = lin(x, torch.full((m, n), float("nan"), dtype=dt, device="cuda"))
++            assert torch.equal(got.view(torch.int16), ref.view(torch.int16)), (n, k, m, dt)
++
++
++@pytest.mark.parametrize("k,n", [(2560, 1024), (1024, 2560)])
++def test_exl3_prompt_gemm_tiles_keep_the_bits(k, n, monkeypatch):
++    """The EXL3 prompt GEMM's tiles (rows a program, K step, warps, stages) never change a row's bits: today's tiles
++    against the previous (128, 32, 8, 4, 8), 6-bit mul1 weights, ragged row counts."""
++
++    from tensorfold.cuda.exl3 import prefill as XP
++    from tensorfold.cuda.exl3.linear import Exl3Linear
++
++    g = torch.Generator().manual_seed(k + n)
++    tr = torch.randint(-32768, 32768, (k // 16, n // 16, 96), generator=g, dtype=torch.int32).to(torch.int16)
++    suh = ((torch.rand(k, generator=g) + 0.5) * (torch.randint(0, 2, (k,), generator=g) * 2 - 1) / k ** 0.5).half()
++    svh = ((torch.rand(n, generator=g) + 0.5) * (torch.randint(0, 2, (n,), generator=g) * 2 - 1)).half()
++    lin = Exl3Linear.from_tensors(tr, suh, svh, "mul1")
++    ws = XP.Workspace()
++    for m in (1, 77, 300):
++        x = torch.randn((m, k), generator=g).to(torch.bfloat16).cuda()
++        got = XP.matmul(lin, x, torch.empty((m, n), dtype=torch.bfloat16, device="cuda"), ws).clone()
++        monkeypatch.setattr(XP, "tiles", lambda kk, nn: (128, 32, 8, 4, 8))
++        ref = XP.matmul(lin, x, torch.full((m, n), float("nan"), dtype=torch.bfloat16, device="cuda"), ws)
++        monkeypatch.undo()
++        assert torch.equal(got.view(torch.int16), ref.view(torch.int16)), (k, n, m)
+diff --git a/tests/cuda/test_qwen4_exp_lookup.py b/tests/cuda/test_qwen4_exp_lookup.py
+new file mode 100644
+index 0000000..b59a389
+--- /dev/null
++++ b/tests/cuda/test_qwen4_exp_lookup.py
+@@ -0,0 +1,62 @@
++"""The prompt-lookup drafter (``qwen4_exp.cuda.lookup``): pure Python, so these run without a GPU (P7)."""
++
++from __future__ import annotations
++
++import importlib
++
++lookup = importlib.import_module("tensorfold.families.qwen4_exp.cuda.lookup")
++
++
++def test_suffix_index_finds_longest_repeat():
++    idx = lookup.SuffixIndex(3)
++    idx.extend([1, 2, 3, 4, 5, 1, 2, 3, 4, 5])
++    length, end = idx.match()
++    assert (length, end) == (5, 5)               # the whole period repeats
++    assert idx.copy(5, 5) == [1, 2, 3, 4, 5]
++    assert idx.propose(3, 4) == ([1, 2, 3], 5)
++    assert idx.propose(3, 6) == ([], 5)          # below the match threshold: no drafts
++
++
++def test_copy_overlapping_period():
++    idx = lookup.SuffixIndex(3)
++    idx.extend([1, 2, 3])
++    assert idx.copy(0, 5) == [1, 2, 3, 1, 2]
++
++
++def test_reuse_index_extends_on_prefix():
++    first = lookup.reuse_index(3, [1, 2, 3, 4])
++    assert list(first.tokens) == [1, 2, 3, 4]
++    same = lookup.reuse_index(3, [1, 2, 3, 4, 5, 6])
++    assert same is first and list(same.tokens) == [1, 2, 3, 4, 5, 6]
++    other = lookup.reuse_index(3, [9, 9, 9])
++    assert other is not first and list(other.tokens) == [9, 9, 9]
++
++
++def test_env_spec_off_by_default(monkeypatch):
++    monkeypatch.delenv("TF_EXL3_LOOKUP", raising=False)
++    assert lookup.env_spec() is None
++    for off in ("0", "false", "off", "no", ""):
++        monkeypatch.setenv("TF_EXL3_LOOKUP", off)
++        assert lookup.env_spec() is None
++    monkeypatch.setenv("TF_EXL3_LOOKUP", "l5:3")
++    assert lookup.env_spec() == "l5:3"
++    monkeypatch.setenv("TF_EXL3_LOOKUP", "1")
++    assert lookup.env_spec() == "auto"
++
++
++def test_build_lookup(monkeypatch):
++    monkeypatch.delenv("TF_EXL3_LOOKUP_MIN", raising=False)
++    assert lookup.build_lookup([1, 2, 3], 8, None) is None
++    forced = lookup.build_lookup([1, 2, 3], 8, "l7", eos=[2], stop_eos=True)
++    assert forced.gated is False and forced.most == 7 and forced.min_match == 3 and forced.eos == frozenset({2})
++    gated = lookup.build_lookup([1, 2, 3], 8, "auto")
++    assert gated.gated is True and gated.most == 7 and gated.min_match == 4
++
++
++def test_forced_plan_continues_the_repeat():
++    draft = lookup.build_lookup([1, 2, 3, 4, 5, 1, 2, 3, 4, 5], 8, "l3:3")
++    assert draft.plan([], 8) == [1, 2, 3]
++    assert draft.plan([], 2) == [1, 2]
++    # a draft that is an eos ends the reply there: the drafts from it on are cut
++    cut = lookup.build_lookup([1, 2, 3, 4, 5, 1, 2, 3, 4, 5], 8, "l3:3", eos=[2], stop_eos=True)
++    assert cut.plan([], 8) == [1]
+diff --git a/tools/p7_conc_bench.py b/tools/p7_conc_bench.py
+new file mode 100644
+index 0000000..0c54864
+--- /dev/null
++++ b/tools/p7_conc_bench.py
+@@ -0,0 +1,82 @@
++"""Concurrent P7.1 class bench: K simultaneous prompts of one class share each round's forward
++(the batched MultiDecoder path the P7.1.1 lookup wiring targets). Reports per-stream and mean decode
++tok/s from the server's own tensorfold.decode_s. Compare TF_EXL3_LOOKUP=l7:2 vs "" (MTP-only).
++
++  python3 tools/p7_conc_bench.py http://127.0.0.1:8080 MODEL --class code --streams 2 --rounds 6 --label l7:2
++"""
++
++import argparse
++import json
++import statistics
++import threading
++import urllib.request
++
++FILE = "\n".join([
++    "def add(a, b):", "    return a + b", "", "def sub(a, b):", "    return a - b", "",
++    "def mul(a, b):", "    return a * b", "", "def div(a, b):", "    return a / b", "",
++    "def mod(a, b):", "    return a % b", "", "def power(a, b):", "    return a ** b", "",
++    "def floor_div(a, b):", "    return a // b", "", "def max_of(a, b):", "    return a if a > b else b", "",
++    "def min_of(a, b):", "    return a if a < b else b", "", "def abs_of(a):",
++    "    return a if a >= 0 else -a", "", "def neg(a):", "    return -a",
++])
++CLASSES = {
++    "chat": "用中文简要解释什么是 GPU 并行计算，用一段话说明，不超过 120 字。",
++    "code": "用 Python 写一个函数 fib(n)，返回第 n 个斐波那契数，要求用迭代实现。只输出代码，不要解释。",
++    "prose": "法国首都是哪座城市？只答城市名。",
++    "repeat": "严格按下面的模式续写，逐字复现，只输出序列，不要解释：\n\napple, banana, cherry, apple, banana, cherry, apple, banana, cherry, apple,",
++    "edit": "你是一个代码编辑助手。下面是文件 utils.py 的全部内容：\n\n```python\n" + FILE +
++            "\n```\n\n请给每个函数加上类型注解，并完整输出整个文件（不要省略任何行，不要解释）。",
++    "continue": "严格续写下面的文件内容，逐字复现已有函数，然后追加一个新函数 double(a) 返回 a * 2。"
++                "只输出代码，不要解释：\n\n```python\n" + FILE,
++}
++
++
++def one(base, model, prompt, tokens, out, idx, barrier):
++    body = {"model": model, "max_tokens": tokens, "temperature": 0, "ignore_eos": True,
++            "messages": [{"role": "user", "content": prompt}], "draft": True,
++            "chat_template_kwargs": {"enable_thinking": False}}
++    req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
++                                 headers={"Content-Type": "application/json"})
++    barrier.wait()
++    with urllib.request.urlopen(req, timeout=900) as resp:
++        data = json.loads(resp.read())
++    tf = data["tensorfold"]
++    n = data["usage"]["completion_tokens"]
++    out[idx] = {"tps": (n - 1) / tf["decode_s"] if tf["decode_s"] > 0 else 0.0, "n": n,
++                "decode_s": tf["decode_s"], "rounds": tf["rounds"],
++                "ld": tf.get("lookup_drafted"), "la": tf.get("lookup_accepted")}
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("base")
++    p.add_argument("model")
++    p.add_argument("--class", dest="klass", default="code", choices=sorted(CLASSES))
++    p.add_argument("--tokens", type=int, default=128)
++    p.add_argument("--streams", type=int, default=2)
++    p.add_argument("--rounds", type=int, default=6)
++    p.add_argument("--label", default="")
++    a = p.parse_args()
++    prompt = CLASSES[a.klass]
++    means = []
++    for r in range(a.rounds):
++        out = {}
++        barrier = threading.Barrier(a.streams)
++        threads = [threading.Thread(target=one, args=(a.base, a.model, prompt, a.tokens, out, i, barrier))
++                   for i in range(a.streams)]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++        vals = [out[i] for i in sorted(out)]
++        mean = statistics.mean(v["tps"] for v in vals)
++        means.append(mean)
++        print("round", r, a.label, "perstream=", [round(v["tps"], 1) for v in vals],
++              "mean=%.1f" % mean, "ld=", [v["ld"] for v in vals], "la=", [v["la"] for v in vals],
++              "rounds=", [v["rounds"] for v in vals])
++    steady = means[1:] if len(means) > 1 else means
++    print("LABEL", a.label, "CLASS", a.klass, "OVERALL_MEAN=%.1f" % statistics.mean(means),
++          "STEADY_MEAN=%.1f" % statistics.mean(steady))
++
++
++main()
+diff --git a/tools/p7_conc_edit.py b/tools/p7_conc_edit.py
+new file mode 100644
+index 0000000..ddd0953
+--- /dev/null
++++ b/tools/p7_conc_edit.py
+@@ -0,0 +1,74 @@
++"""Concurrent P7.1 edit-class decode bench: K simultaneous edit prompts share each round's forward
++(the batched MultiDecoder path the P7.1.1 lookup wiring targets). Reports per-stream and mean decode
++tok/s from the server's own tensorfold.decode_s. Compare TF_EXL3_LOOKUP=l7:2 vs "" (MTP-only).
++
++  python3 tools/p7_conc_edit.py http://127.0.0.1:8080 MODEL --streams 2 --rounds 3 --label l7:2
++"""
++
++import argparse
++import json
++import statistics
++import threading
++import urllib.request
++
++FILE = "\n".join([
++    "def add(a, b):", "    return a + b", "", "def sub(a, b):", "    return a - b", "",
++    "def mul(a, b):", "    return a * b", "", "def div(a, b):", "    return a / b", "",
++    "def mod(a, b):", "    return a % b", "", "def power(a, b):", "    return a ** b", "",
++    "def floor_div(a, b):", "    return a // b", "", "def max_of(a, b):", "    return a if a > b else b", "",
++    "def min_of(a, b):", "    return a if a < b else b", "", "def abs_of(a):",
++    "    return a if a >= 0 else -a", "", "def neg(a):", "    return -a",
++])
++PROMPTS = [
++    "你是一个代码编辑助手。下面是文件 utils.py 的全部内容：\n\n```python\n" + FILE +
++    "\n```\n\n请给每个函数加上类型注解，并完整输出整个文件（不要省略任何行，不要解释）。",
++    "严格续写下面的文件内容，逐字复现已有函数，然后追加一个新函数 double(a) 返回 a * 2。"
++    "只输出代码，不要解释：\n\n```python\n" + FILE,
++]
++
++
++def one(base, model, prompt, tokens, out, idx, barrier):
++    body = {"model": model, "max_tokens": tokens, "temperature": 0, "ignore_eos": True,
++            "messages": [{"role": "user", "content": prompt}], "draft": True,
++            "chat_template_kwargs": {"enable_thinking": False}}
++    req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
++                                 headers={"Content-Type": "application/json"})
++    barrier.wait()
++    with urllib.request.urlopen(req, timeout=900) as resp:
++        data = json.loads(resp.read())
++    tf = data["tensorfold"]
++    n = data["usage"]["completion_tokens"]
++    out[idx] = {"tps": (n - 1) / tf["decode_s"] if tf["decode_s"] > 0 else 0.0, "n": n,
++                "decode_s": tf["decode_s"], "rounds": tf["rounds"],
++                "ld": tf.get("lookup_drafted"), "la": tf.get("lookup_accepted")}
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("base")
++    p.add_argument("model")
++    p.add_argument("--tokens", type=int, default=128)
++    p.add_argument("--streams", type=int, default=2)
++    p.add_argument("--rounds", type=int, default=3)
++    p.add_argument("--label", default="")
++    a = p.parse_args()
++    means = []
++    for r in range(a.rounds):
++        out = {}
++        barrier = threading.Barrier(a.streams)
++        threads = [threading.Thread(target=one, args=(a.base, a.model, PROMPTS[i % len(PROMPTS)],
++                   a.tokens, out, i, barrier)) for i in range(a.streams)]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++        vals = [out[i] for i in sorted(out)]
++        mean = statistics.mean(v["tps"] for v in vals)
++        means.append(mean)
++        print("round", r, a.label, "perstream=", [round(v["tps"], 1) for v in vals],
++              "mean=%.1f" % mean, "ld=", [v["ld"] for v in vals], "la=", [v["la"] for v in vals],
++              "rounds=", [v["rounds"] for v in vals])
++    print("LABEL", a.label, "OVERALL_MEAN=%.1f" % statistics.mean(means))
++
++
++main()
+diff --git a/tools/p7_cost_fit.py b/tools/p7_cost_fit.py
+new file mode 100644
+index 0000000..8a64109
+--- /dev/null
++++ b/tools/p7_cost_fit.py
+@@ -0,0 +1,42 @@
++"""P7.1.2 cost fitter: read TF_EXL3_COST_LOG JSONL, print verify[] (fwd ms per window width)
++and a least-squares fit of the MTP arm's mtp_ms ~ a + b*(steps-1) + c*(backlog-1)."""
++
++import json
++import statistics
++from collections import defaultdict
++
++import numpy as np
++
++rows_data = defaultdict(list)
++m_data = []
++n = 0
++with open("/tmp/cost.jsonl") as fh:
++    for line in fh:
++        line = line.strip()
++        if not line:
++            continue
++        r = json.loads(line)
++        n += 1
++        rows_data[r["rows"]].append(r["fwd_ms"])
++        if r["arm"] == "m":
++            m_data.append((r["steps"], r["backlog"], r["mtp_ms"]))
++
++print("total rounds:", n, "  m-arm:", len(m_data))
++print("%4s %6s %12s %10s %10s" % ("rows", "count", "fwd_ms_mean", "fwd_min", "fwd_max"))
++for rows in sorted(rows_data):
++    v = rows_data[rows]
++    print("%4d %6d %12.4f %10.4f %10.4f" % (rows, len(v), statistics.mean(v), min(v), max(v)))
++
++if m_data:
++    A = np.array([[1.0, s - 1, b - 1] for s, b, _ in m_data])
++    y = np.array([m for _, _, m in m_data])
++    coef, *_ = np.linalg.lstsq(A, y, rcond=None)
++    pred = A @ coef
++    print("\nmtp fit: mtp_ms = %.4f + %.4f*(steps-1) + %.4f*(backlog-1)" % tuple(coef))
++    print("residual std: %.4f" % float(np.std(y - pred)))
++    g = defaultdict(list)
++    for s, b, m in m_data:
++        g[(s, b)].append(m)
++    print("%6s %8s %5s %14s" % ("steps", "backlog", "n", "mtp_ms_mean"))
++    for k in sorted(g):
++        print("%6d %8d %5d %14.3f" % (k[0], k[1], len(g[k]), statistics.mean(g[k])))
+diff --git a/tools/p7_edit_bench.py b/tools/p7_edit_bench.py
+new file mode 100644
+index 0000000..6653996
+--- /dev/null
++++ b/tools/p7_edit_bench.py
+@@ -0,0 +1,111 @@
++"""P7 edit/agent-class decode bench: a file-rewrite prompt whose continuation repeats long
++spans of the prompt (the case prompt-lookup is meant to win). Greedy (temp 0), 128 tokens.
++
++  python3 tools/p7_edit_bench.py http://127.0.0.1:8080 MODEL [--tokens 128] [--reps 3] [--label L]
++"""
++
++import argparse
++import json
++import statistics
++import sys
++import time
++import urllib.request
++
++FILE = "\n".join([
++    "def add(a, b):",
++    "    return a + b",
++    "",
++    "def sub(a, b):",
++    "    return a - b",
++    "",
++    "def mul(a, b):",
++    "    return a * b",
++    "",
++    "def div(a, b):",
++    "    return a / b",
++    "",
++    "def mod(a, b):",
++    "    return a % b",
++    "",
++    "def power(a, b):",
++    "    return a ** b",
++    "",
++    "def floor_div(a, b):",
++    "    return a // b",
++    "",
++    "def max_of(a, b):",
++    "    return a if a > b else b",
++    "",
++    "def min_of(a, b):",
++    "    return a if a < b else b",
++    "",
++    "def abs_of(a):",
++    "    return a if a >= 0 else -a",
++    "",
++    "def neg(a):",
++    "    return -a",
++])
++
++PROMPTS = [
++    {"name": "edit-full-file",
++     "prompt": ("你是一个代码编辑助手。下面是文件 utils.py 的全部内容：\n\n```python\n" + FILE +
++                "\n```\n\n请给每个函数加上类型注解，并完整输出整个文件（不要省略任何行，不要解释）。")},
++    {"name": "edit-continue",
++     "prompt": ("严格续写下面的文件内容，逐字复现已有函数，然后追加一个新函数 double(a) 返回 a * 2。"
++                "只输出代码，不要解释：\n\n```python\n" + FILE)},
++]
++
++
++def stream(base: str, model: str, item: dict, tokens: int, temperature: float) -> dict:
++    body = {"model": model, "max_tokens": tokens, "temperature": temperature, "stream": True,
++            "stream_options": {"include_usage": True}, "ignore_eos": True}
++    if temperature > 0:
++        body.update(top_k=20, top_p=0.95)
++    url = base + "/v1/chat/completions"
++    body["messages"] = [{"role": "user", "content": item["prompt"]}]
++    body["chat_template_kwargs"] = {"enable_thinking": False}
++    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
++    start = time.perf_counter()
++    first = last = None
++    usage = None
++    text = []
++    with urllib.request.urlopen(req, timeout=600) as resp:
++        for raw in resp:
++            line = raw.decode().strip()
++            if not line.startswith("data:") or line == "data: [DONE]":
++                continue
++            chunk = json.loads(line[5:])
++            if chunk.get("usage"):
++                usage = chunk["usage"]
++            for choice in chunk.get("choices", []):
++                piece = choice.get("text") or (choice.get("delta") or {}).get("content") or ""
++                if piece:
++                    now = time.perf_counter()
++                    first = first if first is not None else now
++                    last = now
++                    text.append(piece)
++    n = int(usage["completion_tokens"]) if usage else None
++    return {"ttft_s": first - start, "decode_s": last - first, "tokens": n,
++            "decode_tps": (n - 1) / (last - first) if n and last > first else None, "text": "".join(text)}
++
++
++def main() -> None:
++    p = argparse.ArgumentParser()
++    p.add_argument("base")
++    p.add_argument("model")
++    p.add_argument("--tokens", type=int, default=128)
++    p.add_argument("--reps", type=int, default=3)
++    p.add_argument("--label", default="")
++    args = p.parse_args()
++    for item in PROMPTS:
++        stream(args.base, args.model, item, args.tokens, 0.0)              # warm-up
++        runs = [stream(args.base, args.model, item, args.tokens, 0.0) for _ in range(args.reps)]
++        tps = [r["decode_tps"] for r in runs if r["decode_tps"]]
++        row = {"label": args.label, "prompt": item["name"], "decode_tps_median": statistics.median(tps),
++               "decode_tps_all": [round(x, 2) for x in tps],
++               "ttft_s_median": statistics.median(r["ttft_s"] for r in runs), "sample": runs[0]["text"][:120]}
++        print(json.dumps({k: row[k] for k in ("label", "prompt", "decode_tps_median", "decode_tps_all", "ttft_s_median")}), flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/p7_probe.py b/tools/p7_probe.py
+new file mode 100644
+index 0000000..60386fc
+--- /dev/null
++++ b/tools/p7_probe.py
+@@ -0,0 +1,21 @@
++#!/usr/bin/env python3
++"""P7.1.2 field probe: one drafted request, dump the response blocks' keys and values."""
++import json
++import urllib.request
++
++BASE = "http://127.0.0.1:8080"
++MODEL = "Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5"
++body = {
++    "model": MODEL, "max_tokens": 48, "temperature": 0, "ignore_eos": True, "draft": True,
++    "messages": [{"role": "user", "content": "用中文简要解释什么是 GPU 并行计算，一段话，不超过 80 字。"}],
++    "chat_template_kwargs": {"enable_thinking": False},
++}
++req = urllib.request.Request(BASE + "/v1/chat/completions",
++                             data=json.dumps(body).encode(),
++                             headers={"Content-Type": "application/json"})
++d = json.loads(urllib.request.urlopen(req, timeout=180).read())
++for k, v in d.items():
++    if k == "choices":
++        v = [{"finish_reason": c.get("finish_reason"),
++              "message_keys": sorted((c.get("message") or {}).keys())} for c in v]
++    print(k, "=", json.dumps(v, ensure_ascii=False)[:1200])
+diff --git a/tools/p7_profile.py b/tools/p7_profile.py
+new file mode 100644
+index 0000000..6ef63a1
+--- /dev/null
++++ b/tools/p7_profile.py
+@@ -0,0 +1,143 @@
++#!/usr/bin/env python3
++"""P7.1.2 comprehensive profile: per class, per stream count.
++
++  decode mode (non-streaming): prefill_s, decode_tps, rounds, acceptance, prompt/cached tokens
++  ttft mode (SSE): client-measured time to first content token, and total wall
++
++  python3 tools/p7_profile.py http://127.0.0.1:8080 MODEL --label l7:2 --streams 1,2 --rounds 4
++"""
++
++import argparse
++import json
++import statistics
++import threading
++import time
++import urllib.request
++import uuid
++
++FILE = "\n".join([
++    "def add(a, b):", "    return a + b", "", "def sub(a, b):", "    return a - b", "",
++    "def mul(a, b):", "    return a * b", "", "def div(a, b):", "    return a / b", "",
++    "def mod(a, b):", "    return a % b", "", "def power(a, b):", "    return a ** b", "",
++    "def floor_div(a, b):", "    return a // b", "", "def max_of(a, b):", "    return a if a > b else b", "",
++    "def min_of(a, b):", "    return a if a < b else b", "", "def abs_of(a):",
++    "    return a if a >= 0 else -a", "", "def neg(a):", "    return -a",
++])
++CLASSES = {
++    "chat": "用中文简要解释什么是 GPU 并行计算，用一段话说明，不超过 120 字。",
++    "code": "用 Python 写一个函数 fib(n)，返回第 n 个斐波那契数，要求用迭代实现。只输出代码，不要解释。",
++    "prose": "法国首都是哪座城市？只答城市名。",
++    "repeat": "严格按下面的模式续写，逐字复现，只输出序列，不要解释：\n\napple, banana, cherry, apple, banana, cherry, apple, banana, cherry, apple,",
++    "edit": "你是一个代码编辑助手。下面是文件 utils.py 的全部内容：\n\n```python\n" + FILE +
++            "\n```\n\n请给每个函数加上类型注解，并完整输出整个文件（不要省略任何行，不要解释）。",
++    "continue": "严格续写下面的文件内容，逐字复现已有函数，然后追加一个新函数 double(a) 返回 a * 2。"
++                "只输出代码，不要解释：\n\n```python\n" + FILE,
++}
++
++
++def mean(xs):
++    xs = [x for x in xs if x is not None]
++    return statistics.mean(xs) if xs else float("nan")
++
++
++def body(model, prompt, tokens, stream):
++    return {"model": model, "max_tokens": tokens, "temperature": 0, "ignore_eos": True, "draft": True,
++            "messages": [{"role": "user", "content": prompt}], "stream": stream,
++            "chat_template_kwargs": {"enable_thinking": False}}
++
++
++def call_decode(base, model, prompt, tokens, out, idx, barrier):
++    req = urllib.request.Request(base + "/v1/chat/completions",
++                                 data=json.dumps(body(model, prompt, tokens, False)).encode(),
++                                 headers={"Content-Type": "application/json"})
++    barrier.wait()
++    d = json.loads(urllib.request.urlopen(req, timeout=900).read())
++    tf = d.get("tensorfold", {}) or {}
++    u = d.get("usage", {}) or {}
++    out[idx] = {"prompt": u.get("prompt_tokens"),
++                "cached": (u.get("prompt_tokens_details") or {}).get("cached_tokens"),
++                "prefill_s": tf.get("prefill_s"), "decode_s": tf.get("decode_s"),
++                "tps": tf.get("decode_tps"), "rounds": tf.get("rounds"),
++                "drafted": tf.get("drafted"), "accepted": tf.get("accepted"),
++                "ld": tf.get("lookup_drafted"), "la": tf.get("lookup_accepted")}
++
++
++def call_ttft(base, model, prompt, tokens, out, idx, barrier):
++    req = urllib.request.Request(base + "/v1/chat/completions",
++                                 data=json.dumps(body(model, prompt, tokens, True)).encode(),
++                                 headers={"Content-Type": "application/json"})
++    barrier.wait()
++    t0 = time.perf_counter()
++    ttft = None
++    tlast = t0
++    with urllib.request.urlopen(req, timeout=900) as resp:
++        for raw in resp:
++            tlast = time.perf_counter()
++            line = raw.decode("utf-8", "ignore").strip()
++            if not line.startswith("data:"):
++                continue
++            payload = line[5:].strip()
++            if payload == "[DONE]":
++                break
++            if ttft is None:
++                try:
++                    obj = json.loads(payload)
++                except Exception:
++                    continue
++                for ch in obj.get("choices", []):
++                    if (ch.get("delta") or {}).get("content"):
++                        ttft = time.perf_counter() - t0
++                        break
++    out[idx] = {"ttft": ttft, "total": tlast - t0}
++
++
++def run_cell(base, model, klass, streams, rounds, mode, tokens, unique=False):
++    base_prompt = CLASSES[klass]
++    fn = call_decode if mode == "decode" else call_ttft
++    rows = []
++    for _ in range(rounds):
++        prompts = [("[%s] " % uuid.uuid4().hex) + base_prompt for _ in range(streams)] if unique else [base_prompt] * streams
++        out = {}
++        barrier = threading.Barrier(streams)
++        threads = [threading.Thread(target=fn, args=(base, model, prompts[i], tokens, out, i, barrier))
++                   for i in range(streams)]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++        rows.append([out[i] for i in sorted(out)])
++    steady = rows[1:] if len(rows) > 1 else rows
++    flat = [v for row in steady for v in row]
++    return flat
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("base")
++    p.add_argument("model")
++    p.add_argument("--classes", default="chat,code,edit,continue")
++    p.add_argument("--streams", default="1,2")
++    p.add_argument("--rounds", type=int, default=4)
++    p.add_argument("--tokens", type=int, default=128)
++    p.add_argument("--ttft-tokens", type=int, default=64)
++    p.add_argument("--label", default="")
++    p.add_argument("--unique", action="store_true", help="prepend a per-request nonce so every prompt is a cache miss (cold prefill)")
++    a = p.parse_args()
++    classes = [c for c in a.classes.split(",") if c]
++    streams = [int(s) for s in a.streams.split(",") if s]
++    for s in streams:
++        for klass in classes:
++            d = run_cell(a.base, a.model, klass, s, a.rounds, "decode", a.tokens, a.unique)
++            acc = [c["accepted"] / c["drafted"] for c in d if c.get("drafted")]
++            print("DEC %s class=%s streams=%d cold=%d prompt=%.0f cached=%.0f prefill=%.3f decode_tps=%.1f rounds=%.1f acc=%.3f"
++                  % (a.label, klass, s, int(a.unique), mean([c["prompt"] for c in d]), mean([c["cached"] for c in d]),
++                     mean([c["prefill_s"] for c in d]), mean([c["tps"] for c in d]),
++                     mean([c["rounds"] for c in d]), mean(acc)), flush=True)
++        for klass in classes:
++            t = run_cell(a.base, a.model, klass, s, a.rounds, "ttft", a.ttft_tokens, a.unique)
++            print("TTFT %s class=%s streams=%d cold=%d ttft=%.3f total=%.3f"
++                  % (a.label, klass, s, int(a.unique), mean([c["ttft"] for c in t]), mean([c["total"] for c in t])), flush=True)
++
++
++if __name__ == "__main__":
++    main()

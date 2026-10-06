@@ -1,0 +1,116 @@
+From 36d0785b1448d93face96b99cb22a879baa1d483 Mon Sep 17 00:00:00 2001
+From: grearjake-star <228037169+grearjake-star@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 18:57:47 -0400
+Subject: [PATCH 3/6] perf(cuda): EXL3 packs' fp16 matmuls at prompt rows sum
+ their K slices in one program (same bits)
+
+The hyper-connection down (324 x 10240, 16 K slices) ran in 128-row calls that wrote fp32 slices and summed
+them in a second kernel; the 8-slice 96 x 2560, 512 x 2560 and 1 x 2560 matrices too. Above 64 rows,
+_f16_fused runs each slice from zero over its K in the same BK steps and adds the slices to 0 in order, as
+_f16_mm + _reduce do, in 64 x 128 tiles over all rows at once. Decode windows keep the 16-row tiles.
+
+GB10, 2048 rows: HC down 0.74 -> 0.28 ms, 96 x 2560 0.35 -> 0.04 ms, 512 x 2560 0.36 -> 0.11 ms a call.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../families/qwen4_exp/cuda/exl3_mm.py        | 46 +++++++++++++++++++
+ tests/cuda/test_exl3_prompt_experts.py        | 22 +++++++++
+ 2 files changed, 68 insertions(+)
+
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/exl3_mm.py b/src/tensorfold/families/qwen4_exp/cuda/exl3_mm.py
+index 6b0bf41..a8f0df3 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/exl3_mm.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/exl3_mm.py
+@@ -88,6 +88,38 @@ def _f16_mm(X, W, OUT, M, N, x_stride, o_stride, K: tl.constexpr, KS: tl.constex
+                  mask=m_ok[:, None] & n_ok[None, :])
+ 
+ 
++@triton.jit(do_not_specialize=["M"])
++def _f16_fused(X, W, OUT, M, N, x_stride, o_stride, K: tl.constexpr, KS: tl.constexpr, SK: tl.constexpr,
++               BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
++    """_f16_mm's SK slices and _reduce's in-order sum in one program: slice s from zero over its K in BK steps, then
++    0 + slice 0 + slice 1 ... (the bits of the two kernels, without the fp32 slices in memory)."""
++
++    pm = tl.program_id(0)
++    pn = tl.program_id(1)
++    rm = pm * BM + tl.arange(0, BM)
++    rn = pn * BN + tl.arange(0, BN)
++    rk = tl.arange(0, BK)
++    m_ok = rm < M
++    n_ok = rn < N
++    total = tl.zeros((BM, BN), dtype=tl.float32)
++    for ps in range(SK):
++        acc = tl.zeros((BM, BN), dtype=tl.float32)
++        k0 = ps * KS
++        for kk in range(0, KS, BK):
++            x = tl.load(X + rm[:, None] * x_stride + (k0 + kk + rk)[None, :], mask=m_ok[:, None], other=0.0)
++            w = tl.load(W + rn[:, None] * K + (k0 + kk + rk)[None, :], mask=n_ok[:, None], other=0.0)
++            acc = tl.dot(x.to(tl.float16), tl.trans(w), acc)
++        total += acc
++    tl.store(OUT + rm[:, None] * o_stride + rn[None, :], total.to(OUT.dtype.element_ty),
++             mask=m_ok[:, None] & n_ok[None, :])
++
++
++# Prompt row counts (more than FUSED_MIN rows) take larger row tiles and, with K slices, _f16_fused: the same bits
++# per row (tests/cuda/test_flashnext_P.py); decode windows keep the 16-row tiles and the slices.
++FUSED_MIN = 64
++PROMPT_TILE = (64, 128, 64, 4)           # BM, BN, BK, warps
++
++
+ @triton.jit(do_not_specialize=["M"])
+ def _reduce(P, OUT, M, N, o_stride, SK: tl.constexpr, BLOCK: tl.constexpr):
+     r = tl.program_id(0)
+@@ -143,6 +175,20 @@ class F16:
+     def __call__(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+         if out.stride(-1) != 1:
+             raise ValueError("F16: output rows must be contiguous")
++        m = x.shape[0]
++        if m > FUSED_MIN and FUSED_MIN > 0:
++            if x.stride(1) != 1 or x.shape[1] != self.k:
++                raise ValueError(f"F16: x {tuple(x.shape)} does not match K={self.k}")
++            bm, bn, bk, warps = PROMPT_TILE
++            if self.sk == 1:
++                _f16_mm[(triton.cdiv(m, bm), triton.cdiv(self.n, bn), 1)](
++                    x, self.w, out, m, self.n, x.stride(0), out.stride(0), K=self.k, KS=self.k, BM=bm, BN=bn, BK=64,
++                    F32=False, num_warps=warps, num_stages=3)
++            else:
++                _f16_fused[(triton.cdiv(m, bm), triton.cdiv(self.n, bn))](
++                    x, self.w, out, m, self.n, x.stride(0), out.stride(0), K=self.k, KS=self.k // self.sk, SK=self.sk,
++                    BM=bm, BN=bn, BK=64, num_warps=warps, num_stages=3)
++            return out
+         if self.sk == 1:
+             self._launch(x, out, False)
+             return out
+diff --git a/tests/cuda/test_exl3_prompt_experts.py b/tests/cuda/test_exl3_prompt_experts.py
+index b526069..92f092b 100644
+--- a/tests/cuda/test_exl3_prompt_experts.py
++++ b/tests/cuda/test_exl3_prompt_experts.py
+@@ -143,3 +143,25 @@ def test_prompt_bf16_y_is_the_rounded_fp32_y(monkeypatch):
+     bad = (out.view(torch.int16) != ref.view(torch.int16))
+     rows = bad.any(dim=1).nonzero().flatten().tolist()
+     assert bad32 == 0 and not rows, (bad32, int(bad.sum()), rows[:20], len(rows))
++
++
++@pytest.mark.parametrize("n,k", [(324, 10240), (10240, 320), (96, 2560), (2560, 2560), (512, 2560), (1, 2560)])
++def test_f16_prompt_tiles_give_the_sliced_bits(n, k, monkeypatch):
++    """The EXL3 pack's fp16 matmul at prompt row counts (larger tiles; slices summed in one program) equals the 16-row
++    tiles with fp32 slices and the in-order reduce, row for row."""
++
++    from tensorfold.families.qwen4_exp.cuda import exl3_mm
++
++    g = torch.Generator().manual_seed(n + k)
++    w = (torch.randn((n, k), generator=g) * 0.02).half()
++    sc = exl3_mm.Scratch(11)
++    lin = exl3_mm.f16(sc, [w], "cuda")
++    sc.part = torch.empty((max(1, lin.sk) * exl3_mm.ROWS * n,), dtype=torch.float32, device="cuda")
++    for m in (65, 300, 2048):
++        x = torch.randn((m, k), generator=g).to(torch.bfloat16).cuda()
++        for dt in (torch.float32, torch.bfloat16):
++            monkeypatch.setattr(exl3_mm, "FUSED_MIN", 0)
++            ref = lin(x, torch.empty((m, n), dtype=dt, device="cuda")).clone()
++            monkeypatch.setattr(exl3_mm, "FUSED_MIN", 64)
++            got = lin(x, torch.full((m, n), float("nan"), dtype=dt, device="cuda"))
++            assert torch.equal(got.view(torch.int16), ref.view(torch.int16)), (n, k, m, dt)
+-- 
+2.43.0
+
