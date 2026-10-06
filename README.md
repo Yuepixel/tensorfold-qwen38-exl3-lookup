@@ -16,6 +16,32 @@ cancellation leaves the next request unchanged.
 
 ---
 
+## Results at a glance
+
+| | |
+|---|---|
+| **Prefill** (cold, patched vs `v0.6.5`) | **~670–800 → 1385–1549 t/s (≈2.1×)**, bit-identical |
+| **Decode** (prompt-lookup drafter, verbatim loads) | **+10 % … +44 %** (neutral on free chat/code) |
+| **Determinism** | `token_sha` identical serial / MTP-only / lookup / auto, single & parallel |
+
+The prefill lift is patches `0001–0004` (a rebase of
+[#212](https://github.com/ashhart/TensorFold/pull/212) onto `v0.6.5`); the drafter is
+`0005`/`0006`. It is the most broadly useful part of this stack and is orthogonal to
+the drafter — full numbers in [§5](#5-results).
+
+### 🤖 Deploy it with one link (for AI agents)
+
+Hand a coding agent (Claude Code, Cursor, opencode, Codex, …) this file and it has
+everything needed to build and serve the stack on a DGX Spark:
+
+> Fetch **https://raw.githubusercontent.com/Yuepixel/tensorfold-qwen38-exl3-lookup/main/RECIPE.md**
+> and follow it to install and run Qwen3.8-Flash-Next (EXL3 3.05 bpw) on this machine.
+
+[`RECIPE.md`](RECIPE.md) is self-contained: prerequisites, exact commits, the patch
+apply, the CUDA build, the weight fetch, the serve command, and the acceptance check.
+
+---
+
 ## 1. Patches
 
 Applied in order on top of `v0.6.5` (tag `p7.1-batch-lookup-v1`):
@@ -202,7 +228,30 @@ to MTP cleanly.
 
 ---
 
-## 5. Reference performance (single stream, no `--parallel`)
+## 5. Results
+
+### 5.1 Prefill — the big one
+
+The CUDA prompt-GEMM work (`0001`–`0004`, a rebase of
+[#212](https://github.com/ashhart/TensorFold/pull/212) onto `v0.6.5`) is what lifts
+EXL3 off the floor. Cold prefill, `tools/prefill_cold.py`, `temperature 0`, random
+nonce prefix so it always cache-misses:
+
+| prompt tokens | 2048 | 8192 | 16384 | 32768 | 65536 |
+|---|---|---|---|---|---|
+| `v0.6.5` without the fix (the #258 level) | ~670–800 across the board | | | | |
+| `v0.6.5` + patches `0001`–`0004` | **1385** | **1528** | **1549** | **1537** | **1498** |
+
+≈**2.1×**, output bit-identical, decode untouched; 256k needle TTFT ≈199 s. This is
+orthogonal to the drafter and is the reusable artifact, since #212 is closed/unmerged
+and the Python line is frozen (#286). Reproduce:
+
+```sh
+python3 tools/prefill_cold.py build /models/Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5 prompts.json
+python3 tools/prefill_cold.py run  http://127.0.0.1:8080 Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5 prompts.json prefill.json
+```
+
+### 5.2 Decode — prompt-lookup drafter (single stream, no `--parallel`)
 
 `decode_tps = completion_tokens / decode_s`, `l7:2` vs MTP-only:
 
@@ -216,8 +265,21 @@ to MTP cleanly.
 | serial (no draft) | ~36 | — | — |
 
 Lookup wins where the model echoes verbatim (`edit*`, `pattern_novel`) and is
-roughly neutral on free chat/code. Parallel (`k=2`) short-reply numbers are in
-`receipt_parallel_*.json` (lower absolute tps; both streams share each round).
+roughly neutral on free chat/code.
+
+### 5.3 Dual stream (`--parallel 2`, batched path)
+
+Per-stream tps, `l7:2` vs MTP-only:
+
+| load | single MTP → lookup | dual MTP → lookup |
+|------|---------------------|-------------------|
+| continue | 115.4 → 160.2 (+38.8%) | 115.1 → 159.5 (+38.6%) |
+| edit | 116.4 → 131.0 (+12.5%) | 115.4 → 130.8 (+13.3%) |
+| chat | 41.6 → 61.0 (+46.6%) | 37.7 → 59.4 (+57.6%) |
+| code | 113.5 → 109.7 (−3.3%) | 111.1 → 107.1 (−3.6%) |
+
+Dual per-stream ≈ single, so aggregate throughput scales almost linearly. Raw rows:
+`receipt_parallel_*.json`.
 
 ---
 
