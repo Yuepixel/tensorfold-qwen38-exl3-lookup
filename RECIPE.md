@@ -4,9 +4,10 @@
 > link to this file and asked you to "install it", follow the steps below end to end,
 > report what you ran, and stop and ask if a step cannot be completed.
 
-Goal: build **TensorFold `v0.6.5` + 7 patches** and serve **Qwen3.8-Flash-Next
+Goal: build **TensorFold `v0.6.5` + 12 patches** and serve **Qwen3.8-Flash-Next
 (EXL3 3.05 bpw)** on a single **DGX Spark (GB10)**, giving **~2.4× EXL3 prefill**
-(≈1700 t/s vs ~700) and the **prompt-lookup drafter** on top, with byte-exact
+(≈1700 t/s vs ~700), the **prompt-lookup drafter** on top, plus **native image/video**
+input and an **image-history prefix cache** for multi-turn image chats, with byte-exact
 output. Full numbers and receipts: [`README.md`](README.md).
 
 ---
@@ -45,9 +46,12 @@ git -C TensorFold am /path/to/tensorfold-qwen38-exl3-lookup/patches/*.patch
 # fallback if `am` complains: for p in .../patches/*.patch; do git -C TensorFold apply "$p"; done
 ```
 
-Seven patches, in order: `0001`–`0004` are the EXL3 prompt-GEMM work (the prefill
+Twelve patches, in order: `0001`–`0004` are the EXL3 prompt-GEMM work (the prefill
 lift), `0005`/`0006` add the prompt-lookup drafter, `0007` adds the width-gated
-two-chunk ring (another +13–15 % prefill; port of PR #283). No conflicts expected.
+two-chunk ring (another +13–15 % prefill; port of PR #283). `0008`–`0011` add native
+**image + video + multi-image** input (the vision tower rides a FP16 sidecar next to the
+pack — port of PR #229), and `0012` adds the **image-history prefix cache** (cherry-pick
+of PR #263, fixes #414). No conflicts expected.
 
 ## 3. Build the CUDA extension
 
@@ -95,6 +99,10 @@ TF_EXL3_LOOKUP=l7:2 tensorfold serve \
 
 Notes:
 
+- Native **image/video** input needs the FP16 vision sidecar
+  (`TENSORFOLD_VISION_WEIGHTS=<.../vision-f16-Qwen3.8-Flash-Next-exl3-3.05bpw.safetensors>`)
+  and the `--vision` flag; tune with `TENSORFOLD_VISION_MAX_IMAGES` (default 4) and
+  `TENSORFOLD_VISION_IMAGE_TOKENS` (default 4096) — see README §5.4.
 - Removing `--parallel 2` puts a lone request on the no-scheduler path, which also
   reaches the lookup arm; with `--parallel` a *single* in-flight request is served
   MTP-only (see README §2).

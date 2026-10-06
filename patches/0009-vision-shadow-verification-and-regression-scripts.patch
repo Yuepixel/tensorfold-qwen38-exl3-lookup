@@ -1,0 +1,169 @@
+From 167d1dd4b1d8f5f6c03a6881ff94f4974e58a381 Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 02:46:43 +0800
+Subject: [PATCH 2/5] vision: P9.1 shadow verification (run_serve_vision.sh +
+ image/regression test scripts)
+
+---
+ p9_text_baseline.py | 22 +++++++++++++++++++
+ p9_vision_test.py   | 52 +++++++++++++++++++++++++++++++++++++++++++++
+ p9_vision_test2.py  | 47 ++++++++++++++++++++++++++++++++++++++++
+ run_serve_vision.sh |  4 ++++
+ 4 files changed, 125 insertions(+)
+ create mode 100644 p9_text_baseline.py
+ create mode 100644 p9_vision_test.py
+ create mode 100644 p9_vision_test2.py
+ create mode 100644 run_serve_vision.sh
+
+diff --git a/p9_text_baseline.py b/p9_text_baseline.py
+new file mode 100644
+index 0000000..845045d
+--- /dev/null
++++ b/p9_text_baseline.py
+@@ -0,0 +1,22 @@
++import json, time, hashlib, urllib.request
++
++TXT = "Write a Python function fib(n) returning the n-th Fibonacci number. Output only the code, no explanation."
++
++def chat():
++    payload = {"model": "Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5",
++               "messages": [{"role": "user", "content": TXT}],
++               "max_tokens": 200, "temperature": 0,
++               "chat_template_kwargs": {"enable_thinking": False}}
++    req = urllib.request.Request("http://127.0.0.1:8080/v1/chat/completions",
++                                 data=json.dumps(payload).encode(),
++                                 headers={"Content-Type": "application/json"})
++    t0 = time.time()
++    with urllib.request.urlopen(req, timeout=120) as r:
++        j = json.loads(r.read())
++    return j["choices"][0]["message"].get("content", ""), j.get("usage", {}), time.time() - t0
++
++c, u, d = chat()
++gt = u.get("completion_tokens", 0)
++print("TEXTONLY gen_tokens", gt, "elapsed %.2fs" % d, "tok/s %.1f" % (gt / max(d, 1e-6)))
++print("SHA256", hashlib.sha256(c.encode()).hexdigest()[:32], "LEN", len(c))
++print(c)
+diff --git a/p9_vision_test.py b/p9_vision_test.py
+new file mode 100644
+index 0000000..290bbfa
+--- /dev/null
++++ b/p9_vision_test.py
+@@ -0,0 +1,52 @@
++import base64, io, json, urllib.request, sys
++from PIL import Image, ImageDraw, ImageFont
++
++def font(sz):
++    for p in ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
++              "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"):
++        try:
++            return ImageFont.truetype(p, sz)
++        except Exception:
++            pass
++    return ImageFont.load_default()
++
++def dataurl(img):
++    b = io.BytesIO(); img.save(b, format="PNG")
++    return "data:image/png;base64," + base64.b64encode(b.getvalue()).decode()
++
++def ask(q, img, maxtok=256, thinking=False):
++    payload = {"model": "Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5",
++               "messages": [{"role": "user", "content": [
++                   {"type": "text", "text": q},
++                   {"type": "image_url", "image_url": {"url": dataurl(img)}}]}],
++               "max_tokens": maxtok, "temperature": 0,
++               "chat_template_kwargs": {"enable_thinking": thinking}}
++    req = urllib.request.Request("http://127.0.0.1:8080/v1/chat/completions",
++                                 data=json.dumps(payload).encode(),
++                                 headers={"Content-Type": "application/json"})
++    with urllib.request.urlopen(req, timeout=180) as r:
++        j = json.loads(r.read())
++    m = j["choices"][0]["message"]
++    return m.get("content", ""), j.get("usage", {})
++
++imgs = []
++im1 = Image.new("RGB", (256, 256), "white"); d = ImageDraw.Draw(im1)
++d.ellipse((40, 40, 216, 216), fill="red"); imgs.append(
++    ("1-red-circle", "What single shape is shown and what color is it? Answer in one short sentence.", im1))
++im2 = Image.new("RGB", (256, 256), "white"); d = ImageDraw.Draw(im2)
++d.rectangle((20, 20, 120, 120), fill="blue"); d.text((130, 210), "HELLO 42", fill="black", font=font(28)); imgs.append(
++    ("2-shape-text", "Describe: what colored shape is in the upper-left, and what exact text appears in the lower part?", im2))
++im3 = Image.new("RGB", (640, 160), "white"); d = ImageDraw.Draw(im3)
++d.text((12, 55), "TENSORFOLD VISION 2026", fill="black", font=font(44)); imgs.append(
++    ("3-ocr", "Transcribe the exact text shown in the image. Output only the text.", im3))
++
++for name, q, img in imgs:
++    try:
++        c, u = ask(q, img)
++        print("=== " + name + " ===")
++        print("Q:", q)
++        print("A:", c.strip())
++        print("usage:", u)
++    except Exception as e:
++        print("=== " + name + " ERROR ===", repr(e))
++print("DONE")
+diff --git a/p9_vision_test2.py b/p9_vision_test2.py
+new file mode 100644
+index 0000000..702cd75
+--- /dev/null
++++ b/p9_vision_test2.py
+@@ -0,0 +1,47 @@
++import base64, io, json, time, urllib.request, threading
++from PIL import Image, ImageDraw
++
++def dataurl(img):
++    b = io.BytesIO(); img.save(b, format="PNG")
++    return "data:image/png;base64," + base64.b64encode(b.getvalue()).decode()
++
++def chat(content, maxtok=200):
++    payload = {"model": "Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5",
++               "messages": [{"role": "user", "content": content}],
++               "max_tokens": maxtok, "temperature": 0,
++               "chat_template_kwargs": {"enable_thinking": False}}
++    req = urllib.request.Request("http://127.0.0.1:8080/v1/chat/completions",
++                                 data=json.dumps(payload).encode(),
++                                 headers={"Content-Type": "application/json"})
++    t0 = time.time()
++    with urllib.request.urlopen(req, timeout=240) as r:
++        j = json.loads(r.read())
++    return j["choices"][0]["message"].get("content", ""), j.get("usage", {}), time.time() - t0
++
++TXT = "Write a Python function fib(n) returning the n-th Fibonacci number. Output only the code, no explanation."
++
++c1, u1, d1 = chat(TXT)
++gt = u1.get("completion_tokens", 0)
++print("SINGLE ok gen_tokens", gt, "elapsed %.2fs" % d1, "tok/s %.1f" % (gt / max(d1, 1e-6)))
++
++res = [None, None, None]
++def w(i):
++    res[i] = chat(TXT)
++ts = [threading.Thread(target=w, args=(i,)) for i in range(3)]
++[t.start() for t in ts]; [t.join() for t in ts]
++outs = [r[0] for r in res]
++print("CONCURRENT x3 all_ok", all(o is not None for o in outs),
++      "| byte-equal-to-single", all(o == c1 for o in outs), "| unique", len(set(outs)))
++
++im = Image.new("RGB", (200, 200), "green"); d = ImageDraw.Draw(im)
++d.ellipse((30, 30, 170, 170), fill="yellow")
++img_content = [{"type": "text", "text": "What shape and what color is shown? One short sentence."},
++               {"type": "image_url", "image_url": {"url": dataurl(im)}}]
++mr = [None, None]
++def w2(i, content):
++    mr[i] = chat(content)
++t1 = threading.Thread(target=w2, args=(0, TXT)); t2 = threading.Thread(target=w2, args=(1, img_content))
++t1.start(); t2.start(); t1.join(); t2.join()
++print("MIXED text ok", mr[0][0] is not None, "| image ok", mr[1][0] is not None)
++print("MIXED image answer:", mr[1][0].strip())
++print("DONE")
+diff --git a/run_serve_vision.sh b/run_serve_vision.sh
+new file mode 100644
+index 0000000..f525b9e
+--- /dev/null
++++ b/run_serve_vision.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++export TF_EXL3_LOOKUP="${TF_EXL3_LOOKUP-l7:2}"
++export TENSORFOLD_VISION_WEIGHTS=/models/vision-f16-Qwen3.8-Flash-Next-exl3-3.05bpw.safetensors
++exec /usr/local/bin/tensorfold serve /models/Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5 --host 127.0.0.1 --port 8080 --parallel 2 --vision > /tmp/serve_vision.log 2>&1
+-- 
+2.43.0
+

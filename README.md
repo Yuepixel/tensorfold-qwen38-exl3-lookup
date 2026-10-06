@@ -2,11 +2,14 @@
 
 Support material for [TensorFold issue #444](https://github.com/ashhart/TensorFold/issues/444):
 a diff, the benchmark fixtures, and byte-exact `token_sha` receipts for the
-**prompt-lookup (suffix) draft arm** added to the Flash-Next CUDA/EXL3 path.
+**EXL3 prompt-GEMM prefill work**, the **prompt-lookup (suffix) draft arm**, and the
+**vision / video / image-history prefix-cache** additions, all on the Flash-Next CUDA
+path.
 
-- **Engine:** TensorFold `0.6.5` (`v0.6.5` tag) + 7 patches below
+- **Engine:** TensorFold `0.6.5` (`v0.6.5` tag) + 12 patches below
 - **Model:** `Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5` (EXL3 3.05 bpw, group-32, `h5_ng5` pack)
 - **Hardware:** NVIDIA DGX Spark (GB10), CPU/GPU unified 128 GB
+- **Modalities:** text, image, and video; multi-turn image chats keep a cached prefix
 - **Policy under test:** forced `l7:2` (baseline, `MAX_DRAFTS=7, MIN_MATCH=2`) vs experimental cost gate (`auto`) — see below
 
 The whole point of the receipts: **every draft arm must be byte-exact with the
@@ -22,6 +25,8 @@ cancellation leaves the next request unchanged.
 |---|---|
 | **Prefill** (cold, patched vs `v0.6.5`) | **~670–800 → 1696–1777 t/s (≈2.4×)**, bit-identical |
 | **Decode** (prompt-lookup drafter, verbatim loads) | **+10 % … +44 %** (neutral on free chat/code) |
+| **Vision / video** | native image + video input (PyAV), multi-image, OCR-verified |
+| **Image multi-turn cache** | turn-2 `cached_tokens` **0 → 2514 / 2550**, byte-identical to a cold re-prefill |
 | **Determinism** | `token_sha` identical serial / MTP-only / lookup / auto, single & parallel |
 
 The prefill lift is patches `0001–0004` (a rebase of
@@ -29,7 +34,8 @@ The prefill lift is patches `0001–0004` (a rebase of
 (a port of [#283](https://github.com/ashhart/TensorFold/pull/283), the width-gated
 two-chunk ring, another **+13–15 %**); the drafter is `0005`/`0006`. It is the most
 broadly useful part of this stack and is orthogonal to the drafter — full numbers in
-[§5](#5-results).
+[§5](#5-results). Patches `0008`–`0012` add native **vision**, **video + multi-image**,
+and the **image-history prefix cache** for multi-turn image chats — see §5.4–§5.5.
 
 ### 🤖 Deploy it with one link (for AI agents)
 
@@ -46,7 +52,7 @@ apply, the CUDA build, the weight fetch, the serve command, and the acceptance c
 
 ## 1. Patches
 
-Applied in order on top of `v0.6.5` (tag `p7.1-batch-lookup-v1` = `0001`–`0006`; tag `p8-ring-v1` = all seven):
+Applied in order on top of `v0.6.5` (tag `p7.1-batch-lookup-v1` = `0001`–`0006`; tag `p8-ring-v1` = `0001`–`0007`; tags `p9-vision-v1` / `p10-vision-v1` = through `0011`; tag `p11-image-prefix-v1` = all twelve):
 
 | # | Patch | Area |
 |---|-------|------|
@@ -57,26 +63,34 @@ Applied in order on top of `v0.6.5` (tag `p7.1-batch-lookup-v1` = `0001`–`0006
 | 0005 | `qwen4_exp: add prompt-lookup (suffix) draft arm wired into mtp_decode` | lookup arm |
 | 0006 | `qwen4_exp: wire prompt-lookup into the batched decoder (per-stream backlog)` | lookup batching |
 | 0007 | `perf(cuda): EXL3 prompt experts keep two trellis-word chunks in flight for gate\|up below 4 bits` | EXL3 prompt GEMM |
+| 0008 | `vision: exl3_convert supports inline vision towers and BF16 inputs` (port of #229) | vision / EXL3 convert |
+| 0009 | `vision: shadow verification + image/regression scripts` | vision bring-up |
+| 0010 | `vision: enable native image input in production` (`run_serve.sh --vision`) | vision serve |
+| 0011 | `run_serve.sh: TENSORFOLD_VISION_MAX_IMAGES / TENSORFOLD_VISION_IMAGE_TOKENS knobs` | vision knobs |
+| 0012 | `fix(flash next cuda): image prompts resume and keep prompt states, matched on the images' pixels` (cherry-pick of #263) | image prefix cache |
 
 ```sh
 git checkout v0.6.5
 git am patches/*.patch        # or: git apply patches/*.patch
 ```
 
-Combined diffstat (`v0.6.5..p8-ring`): **34 files, +2028 / −49**.
-A squashed view is in `receipts/all-changes.diff`.
+Combined diffstat (`v0.6.5..p11-image-prefix`): **53 files, +2625 / −104**.
+(`0001`–`0007` alone are 34 files, +2019 / −40.) A squashed view of the first seven is in
+`receipts/all-changes.diff`.
 
 Touched areas:
 
 ```
 src/tensorfold/cuda/exl3/{experts.cpp,experts.cu,experts.py,experts_cb0.cu,experts_cb1.cu,experts_cb2.cu,experts_prompt.cuh,prefill.py}
 src/tensorfold/cuda/{health.py,streams.py}
-src/tensorfold/families/qwen4_exp/cuda/{decode.py,engine.py,exl3_mm.py,exl3_pack.py,forward.py,lookup.py,multi.py}
+src/tensorfold/families/qwen4_exp/cuda/{decode.py,engine.py,exl3_mm.py,exl3_pack.py,forward.py,lookup.py,multi.py,multi_fill.py,image_rows.py,state.py}
+src/tensorfold/vision/{exl3_convert.py,qwen_checkpoint.py}
 src/tensorfold/server/metrics.py
-tests/cuda/test_exl3_prompt_experts.py, tests/cuda/test_qwen4_exp_lookup.py
+tests/cuda/{test_exl3_prompt_experts.py,test_qwen4_exp_lookup.py,test_flashnext_vision.py}
+tests/{test_flashnext_image_keys.py,test_flashnext_absolute_grow_host.py,test_vision_exl3_convert.py}
 tools/p7_conc_bench.py, tools/p7_conc_edit.py, tools/p7_cost_fit.py, tools/p7_edit_bench.py,
 tools/p7_probe.py, tools/p7_profile.py, tools/prefill_cold.py
-run_serve.sh
+run_serve.sh, run_serve_vision.sh
 ```
 
 ### Where the lookup arm lives
@@ -95,7 +109,9 @@ run_serve.sh
 
 ## 2. Running the server
 
-`run_serve.sh` in this tree uses `TF_EXL3_LOOKUP` (default `l7:2`):
+`run_serve.sh` in this tree uses `TF_EXL3_LOOKUP` (default `l7:2`) and serves native
+vision by default (`TF_EXL3_VISION`, with `TENSORFOLD_VISION_MAX_IMAGES` /
+`TENSORFOLD_VISION_IMAGE_TOKENS` — see §5.4):
 
 ```sh
 # baseline forced l7:2 (default)
@@ -289,6 +305,48 @@ Per-stream tps, `l7:2` vs MTP-only:
 Dual per-stream ≈ single, so aggregate throughput scales almost linearly. Raw rows:
 `receipt_parallel_*.json`.
 
+### 5.4 Vision, video, and multi-image (`0008`–`0011`)
+
+Patch `0008` ports upstream [#229](https://github.com/ashhart/TensorFold/pull/229)
+(inline vision towers, BF16 inputs) onto the EXL3 convert path; `0009`/`0010` bring the
+tower up and enable it in the production serve script; `0011` adds the two knobs. The
+vision weights ride a **FP16 sidecar** next to the 3.05 bpw pack (the EXL3 checkpoint is
+untouched). Images arrive as data URLs; the FrameAV/PyAV path (`av 19.0.1`) also decodes
+**video** frames. Knobs (served via `run_serve.sh`):
+
+| var | default | meaning |
+|---|---|---|
+| `TENSORFOLD_VISION_MAX_IMAGES` | `4` | images (or frame groups) accepted per request |
+| `TENSORFOLD_VISION_IMAGE_TOKENS` | `4096` | token budget per image |
+
+Verified OCR/description on single- and multi-image requests, a video clip transcribed
+to its on-screen text, and mixed text/image requests — all correct; `--parallel 2`
+concurrent image streams are byte-equal. (Regression scripts: `run_serve_vision.sh`,
+`p9_vision_test*.py`.)
+
+### 5.5 Image-history prefix cache (`0012`) — multi-turn images stop re-prefilling
+
+Patch `0012` cherry-picks upstream [#263](https://github.com/ashhart/TensorFold/pull/263),
+which fixes open [#414](https://github.com/ashhart/TensorFold/issues/414): with one image
+in an agent chat, **every later turn came back `cached_tokens=0`** and re-prefilled the
+whole prompt. The fix keys each image placeholder row on the image's own pixels (a
+negative row id derived from the content hash), so a resumed turn matches and keeps the
+cached prefix instead of rebuilding it.
+
+Before → after (2-turn chat, ~2.5k prompt, `temperature 0`):
+
+| turn | `cached_tokens` | `prompt_tokens` | wall |
+|---|---|---|---|
+| image, turn 1 | 0 | 2515 | 2.87 s |
+| image, turn 2 — with `0012` | **2514** | 2550 | 0.24 s |
+| image, turn 2 — before | 0 | 2550 | 1.53 s |
+
+The resumed turn's output is **byte-identical to a cold re-prefill**; the text-only
+baseline hash is unchanged; three concurrent image streams under `--parallel 2` return
+byte-equal outputs; and the prefix cache composes with the `TF_EXL3_LOOKUP=l7:2` drafter.
+Caveat: **video multi-turn cache reuse** flows through the same path but was not measured
+on its own.
+
 ---
 
 ## 6. Reproducing
@@ -315,6 +373,11 @@ Each command writes `receipt_<cmd>_<label>.json` next to itself.
 - The width-gated two-chunk ring (`0007`) ports **TensorFold PR
   [#283](https://github.com/ashhart/TensorFold/pull/283)** (`grearjake-star/ring-by-width`,
   design by Jürgen Schmied) onto `v0.6.5` + `0001`–`0006`.
+- The inline-vision-tower convert change (`0008`) ports **TensorFold PR
+  [#229](https://github.com/ashhart/TensorFold/pull/229)**.
+- The image-history prefix cache (`0012`) cherry-picks **TensorFold PR
+  [#263](https://github.com/ashhart/TensorFold/pull/263)** (by olexale), which addresses
+  open issue [#414](https://github.com/ashhart/TensorFold/issues/414).
 - Built on **TensorFold** by ashhart and contributors; EXL3 kernel work follows
   the existing Flash-Next CUDA/EXL3 path.
 - Hardware/quant recipe: Qwen3.8-Flash-Next EXL3 3.05 bpw `h5_ng5` on a single

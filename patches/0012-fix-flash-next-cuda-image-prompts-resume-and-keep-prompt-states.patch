@@ -1,0 +1,508 @@
+From e980c7382e53dab8dbda521df79261cc33e17707 Mon Sep 17 00:00:00 2001
+From: Oleksandr Leushchenko <olexa.le@gmail.com>
+Date: Fri, 2 Oct 2026 19:59:04 +0300
+Subject: [PATCH 5/5] fix(flash next cuda): image prompts resume and keep
+ prompt states, matched on their images' pixels
+
+With --vision, a request that held an image never resumed from a kept prompt state and kept none, so one
+screenshot in an agent's history made every later turn prefill the whole conversation again. Kept states are
+now matched on the prompt's ids with each image's placeholder rows replaced by a key of the image's decoded
+pixels (ImageInput.content_hash) and grid, which no token id equals. A video's frame groups are keyed the same
+way on its decoded frames (VideoInput.content_hash), so two clips of one size never share a state. A follow-up
+that resends the same media resumes past it; a different image resumes only the text before it. Requests
+without media hashes keep the old behaviour.
+
+prefill_begin attaches the prompt's image positions before the resumed MTP tail is absorbed, so the tail
+rotates as in a fresh prefill.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/recipes/flash-next-vision.md             |   4 +-
+ docs/recipes/qwen3.8-flash-next.md            |   4 +-
+ docs/vision.md                                |   4 +-
+ .../families/qwen4_exp/cuda/decode.py         |  14 +-
+ .../families/qwen4_exp/cuda/image_rows.py     |  38 ++++-
+ .../families/qwen4_exp/cuda/multi.py          |  17 ++-
+ .../families/qwen4_exp/cuda/multi_fill.py     |  13 +-
+ .../families/qwen4_exp/cuda/state.py          |   2 +-
+ tests/cuda/test_flashnext_vision.py           | 141 ++++++++++++++++++
+ tests/test_flashnext_absolute_grow_host.py    |   2 +-
+ tests/test_flashnext_image_keys.py            |  51 +++++++
+ 11 files changed, 255 insertions(+), 35 deletions(-)
+ create mode 100644 tests/test_flashnext_image_keys.py
+
+diff --git a/docs/recipes/flash-next-vision.md b/docs/recipes/flash-next-vision.md
+index 3c01000..73d96bb 100644
+--- a/docs/recipes/flash-next-vision.md
++++ b/docs/recipes/flash-next-vision.md
+@@ -4,8 +4,8 @@ Run a complete local Flash Next checkpoint with `--vision --parallel 2` (or more
+ This port supports images, including multiple images within the existing 4096 visual-token budget; video and
+ large-image extensions are not included. Image rows replace embeddings in every hyperconnection stream.
+ Multimodal RoPE follows the checkpoint's sections; text decode continues with its image-position offset.
+-Image prompts always prefill from the start and are never retained in the text-prefix cache, since identical
+-placeholder IDs can name different pixels. Grammar and ignore-EOS settings remain available.
++Image prompts use the prefix cache too; since identical placeholder IDs can name different pixels, cached
++prompts are matched on the images' pixels as well. Grammar and ignore-EOS settings remain available.
+ 
+ A floating-point tower in the indexed checkpoint is discovered normally. EXL3 packs whose vision tower is a
+ quantized sidecar need a one-time CPU conversion, stored outside the original model snapshot:
+diff --git a/docs/recipes/qwen3.8-flash-next.md b/docs/recipes/qwen3.8-flash-next.md
+index 8af9581..acdc818 100644
+--- a/docs/recipes/qwen3.8-flash-next.md
++++ b/docs/recipes/qwen3.8-flash-next.md
+@@ -386,6 +386,6 @@ TBD [release-0.3.5].
+ 
+ ## Image input on CUDA
+ 
+-Use `--vision` on one CUDA GPU with `--parallel` of at least two. Image requests always prefill fresh; text prefix
+-caching remains available. See the [image recipe](flash-next-vision.md) for tower weights, memory admission, EXL3
++Use `--vision` on one CUDA GPU with `--parallel` of at least two. Prefix caching covers image requests
++too, matched on their pixels. See the [image recipe](flash-next-vision.md) for tower weights, memory admission, EXL3
+ sidecar conversion and verification.
+diff --git a/docs/vision.md b/docs/vision.md
+index 5e6bfa6..61a006a 100644
+--- a/docs/vision.md
++++ b/docs/vision.md
+@@ -124,9 +124,9 @@ That budget is shared across the images; a higher count can reduce the detail av
+ Those expanded tokens count toward prompt usage and the context window before model execution.
+ The available memory budget may impose a smaller practical image or context limit.
+ 
+-Image requests currently start with a fresh KV cache and do not write reusable prompt checkpoints.
++Except on Flash Next CUDA, which matches cached prompts on their images' pixels, image requests start with a fresh KV cache and do not write reusable prompt checkpoints.
+ This prevents identical image-placeholder token IDs from reusing another image's state; ordinary text requests retain their prefix caching.
+-Multi-turn image conversations work when the request includes the original image content parts, but image-prefix reuse and persisted image KV are not implemented.
++Multi-turn image conversations work when the request includes the original image content parts, but persisted image KV is not implemented.
+ For Qwen, each image request carries its own multimodal rotary positions and continuation offset, including during concurrent lane rounds. GLM uses its native KDA/NoPE attention state.
+ 
+ ## Verification
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/decode.py b/src/tensorfold/families/qwen4_exp/cuda/decode.py
+index 5530e15..4252673 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/decode.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/decode.py
+@@ -299,18 +299,24 @@ def _absorbs(e: Engine, mtp: bool) -> bool:
+ 
+ 
+ @torch.no_grad()
+-def prefill_begin(e: Engine, prompt: Sequence[int], *, mtp: bool = True, resume: dict | None = None) -> int:
+-    """Empty the state, or restore a kept prompt end and absorb its tail; returns the first prompt row to commit."""
++def prefill_begin(e: Engine, prompt: Sequence[int], *, mtp: bool = True, resume: dict | None = None,
++                  vision=None) -> int:
++    """Empty the state, or restore a kept prompt end and absorb its tail; returns the first prompt row to commit.
++    ``vision``: the prompt's encoded images, attached before the tail rotates at the prompt's image positions."""
+ 
+     if not prompt:
+         raise ValueError("prefill requires at least one token")
+     if resume is None:
+         e.reset()
++        if vision is not None:
++            image_rows.attach(e.st, vision, len(prompt))
+         return 0
+     st = e.st
+     st.restore(resume["state"])
+     if not 0 < st.pos < len(prompt):
+         raise ValueError("a resumed prompt must extend the cached tokens")
++    if vision is not None:
++        image_rows.attach(st, vision, len(prompt))
+     if _absorbs(e, mtp) and resume.get("tail") is not None:
+         mtp_forward(e.w, st, e.pbuf, [prompt[st.pos]], resume["tail"])
+         st.set_mtp_len(st.mtp_len + 1)
+@@ -356,9 +362,7 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+ 
+     if vision is not None and (resume is not None or keep_at is not None or stops or keep is not None):
+         raise ValueError("an image prompt prefills from its start and keeps no token-only snapshot")
+-    start, last = prefill_begin(e, prompt, mtp=mtp, resume=resume), None
+-    if vision is not None:
+-        image_rows.attach(e.st, vision, len(prompt))
++    start, last = prefill_begin(e, prompt, mtp=mtp, resume=resume, vision=vision), None
+     if keep_at is not None and not start <= keep_at <= len(prompt):
+         raise ValueError(f"keep_at {keep_at} is outside the prefilled range [{start}, {len(prompt)}]")
+     saved = e.kept = resume if keep_at == start else None
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/image_rows.py b/src/tensorfold/families/qwen4_exp/cuda/image_rows.py
+index 73e8278..f70a529 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/image_rows.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/image_rows.py
+@@ -1,5 +1,7 @@
+ """Image embeddings and full prompt rotary positions owned by one Flash Next stream."""
+ 
++import hashlib
++
+ import torch
+ import triton
+ import triton.language as tl
+@@ -23,14 +25,36 @@ def rope_axis(pos, ROPE, DELTA, length, index, MODE: tl.constexpr, S1: tl.conste
+     return axis
+ 
+ 
+-def begin(engine, stream, tower) -> None:
+-    """Encode an image request on its admitted slot before the normal prompt passes."""
++def key(prompt, vision) -> list[int] | None:
++    """The ids a prompt's kept states are matched on: its tokens, each image's and video frame group's placeholder rows
++    (alike whatever the media) replaced by a key of its pixels and grid that no token id equals; None for media
++    without hashes, which neither resumes nor keeps a state."""
++
++    ids = [int(t) for t in prompt]
++    if vision is None:
++        return ids
++    if not hasattr(vision, "image_hashes"):
++        return None
++    media = list(zip(vision.image_spans, vision.image_hashes, vision.image_grid_thw))
++    if vision.video_hashes:                              # a video owns its grid's count of frame-group spans
++        groups = [(h, g) for h, g in zip(vision.video_hashes, vision.video_grid_thw) for _ in range(int(g[0]))]
++        media += [(span, h, g) for span, (h, g) in zip(vision.video_spans, groups)]
++    for (start, end), digest, grid in media:
++        tag = hashlib.sha256(f"{digest}/{'x'.join(str(int(v)) for v in grid)}".encode()).digest()
++        ids[start:end] = [-1 - int.from_bytes(tag[:8], "big")] * (end - start)
++    return ids
++
++
++def begin(stream, tower):
++    """Encode an image request's pictures before its prompt passes (``prefill_begin`` attaches them); None for text."""
+ 
+-    if stream.vision is not None:
+-        if tower is None:
+-            raise ValueError("image inputs require starting this server with --vision")
+-        attach(engine.st, tower.encode(stream.vision, stream.prompt), len(stream.prompt))
+-        stream.vision = None
++    if stream.vision is None:
++        return None
++    if tower is None:
++        raise ValueError("image inputs require starting this server with --vision")
++    encoded = tower.encode(stream.vision, stream.prompt)
++    stream.vision = None
++    return encoded
+ 
+ 
+ def attach(st, encoded, length: int) -> None:
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/multi.py b/src/tensorfold/families/qwen4_exp/cuda/multi.py
+index b37e60b..d1967f2 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/multi.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/multi.py
+@@ -257,10 +257,11 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+         if self.w.comm is not None and any(x is not None for x in (s.constraint, s.vision, s.probabilities)):
+             raise ValueError("concurrent Flash Next on two ranks serves text without grammars or logprobs")
+         t0 = time.perf_counter()
++        key = image_rows.key(s.prompt, s.vision)        # a media prompt resumes and keeps by its pictures too
+         if self.w.comm is not None:
+             st, resume, s.cached = self._prepare_admission(s, told)
+         else:
+-            st, resume, s.cached = self._slot_for(list(s.prompt), s.draft and s.vision is None)
++            st, resume, s.cached = self._slot_for(list(s.prompt) if key is None else key, s.draft and key is not None)
+         if self.w.comm is None:
+             try:
+                 if not self._grow(st, len(s.prompt) + self.depth + 2,
+@@ -269,14 +270,13 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+             except NoRoom:
+                 if resume is None:
+                     self.free.append(st)
+-                else:
+-                    self._remember(list(s.prompt[:s.cached]), st, resume["state"], resume["tail"])
++                else:                                    # the kept prompt end stays kept
++                    self._remember(key[:s.cached], st, resume["state"], resume["tail"])
+                 raise
+         e = _slot(self.w, st, self.buf, self.mbuf, self.pbuf, self.capacity, self.prefill_rows)
+         mtp = s.draft and self.depth > 0 and self.mbuf is not None
+         try:
+-            begin = prefill_begin(e, s.prompt, mtp=mtp, resume=resume)
+-            image_rows.begin(e, s, self.vision)
++            begin = prefill_begin(e, s.prompt, mtp=mtp, resume=resume, vision=image_rows.begin(s, self.vision))
+         except Exception:
+             self._drop_kept(st)
+             self.free.append(st)
+@@ -285,12 +285,13 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+             e.stops = list(s.stops)
+         else:
+             e.stops = sorted({p for p in self.points(s.prompt) if begin + MIN_GAP <= p < entry_end(s.prompt)}) \
+-                if s.draft and st.image_positions is None and self.points is not None else []
++                if s.draft and key is not None and self.points is not None else []
+         s.sid, s.st = self.next_id, st
+         self.next_id += 1
+         s.prefill_s = time.perf_counter() - t0
+-        same = resume is not None and self._keep_at(s) == begin         # the same prompt again: its own point
+-        self.fills[s.sid] = [e, mtp, begin, (resume["state"], resume["tail"]) if same else None]
++        self.fills[s.sid] = [e, mtp, begin, None, key]
++        if resume is not None and self._keep_at(s) == begin:            # the same prompt again: its own point
++            self.fills[s.sid][3] = (resume["state"], resume["tail"])
+         self.filling.append(s)
+ 
+     def _ends(self, s: Stream) -> tuple[int, ...]:
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/multi_fill.py b/src/tensorfold/families/qwen4_exp/cuda/multi_fill.py
+index d909da0..f462858 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/multi_fill.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/multi_fill.py
+@@ -77,7 +77,7 @@ class PromptPasses:
+ 
+         pieces, room = [], self._pass_rows() if rows is None else rows
+         for s in self._order():
+-            e, mtp, start, _ = self.fills[s.sid]
++            e, mtp, start, *_ = self.fills[s.sid]
+             n = min(next((p for p in e.stops if p > start), len(s.prompt)) - start, room)
+             ends = sum(1 for x, a, k in pieces if a + k == len(x.prompt))
+             if n == 0 or (start + n == len(s.prompt) and ends == ENDS):
+@@ -118,16 +118,15 @@ class PromptPasses:
+ 
+         return [a1 - 1 for (s, a, n), (_, _, a1) in zip(pieces, segs) if a + n == len(s.prompt)]
+ 
+-    @staticmethod
+-    def _keep_at(s: Stream) -> int | None:
++    def _keep_at(self, s: Stream) -> int | None:
+         """Where a drafting stream's prompt state is kept: one token before its end, which a next turn extends."""
+ 
+-        return entry_end(s.prompt) if s.draft and s.st.image_positions is None else None
++        return entry_end(s.prompt) if s.draft and self.fills[s.sid][4] is not None else None
+ 
+     def _point(self, s: Stream, start: int) -> int | None:
+         """The next message-start or prompt-end snapshot this prompt piece can reach."""
+ 
+-        if not s.draft or s.st.image_positions is not None:
++        if self._keep_at(s) is None:
+             return None
+         return next((p for p in self.fills[s.sid][0].stops if p > start), self._keep_at(s))
+ 
+@@ -188,10 +187,10 @@ class PromptPasses:
+         joined, head = [], 0
+         for (s, a, n), last in zip(pieces, lasts):
+             s.prefill_s += spent
+-            e, mtp, _, kept = self.fills[s.sid]
++            e, mtp, _, kept, key = self.fills[s.sid]
+             self.fills[s.sid][2] = a + n
+             if kept is not None and a < kept[0]["pos"] <= a + n:
+-                self._remember(list(s.prompt[:kept[0]["pos"]]), s.st, *kept)
++                self._remember(key[:kept[0]["pos"]], s.st, *kept)
+             self.fills[s.sid][3] = None
+             if a + n < len(s.prompt):
+                 continue
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/state.py b/src/tensorfold/families/qwen4_exp/cuda/state.py
+index 866b78f..eb7ba9d 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/state.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/state.py
+@@ -358,7 +358,7 @@ class State:
+         self.ple_history = None if snap["ple_history"] is None else snap["ple_history"].copy()
+         self.ple_last = None
+         self.set_pos(snap["pos"])
+-        self.set_rope_delta(0)                       # kept prompts are text only
++        self.set_rope_delta(0)                       # an image prompt attaches its positions after (prefill_begin)
+         self.image_positions, self.image_rows, self.image_features = None, (), None
+         self.mtp_drafted = 0
+         self.set_mtp_len(snap["mtp_len"])
+diff --git a/tests/cuda/test_flashnext_vision.py b/tests/cuda/test_flashnext_vision.py
+index 4bcd91b..96e4cd9 100644
+--- a/tests/cuda/test_flashnext_vision.py
++++ b/tests/cuda/test_flashnext_vision.py
+@@ -203,3 +203,144 @@ def test_image_message_markers_never_seed_a_text_prefix_cache():
+     ref = Engine(w, capacity=1024, max_rows=8, prefill_rows=16)
+     first = prefill(ref, prompt, None, mtp=False)
+     assert text.out == serial_decode(ref, first, 8, None, stop_eos=False).tokens
++
++
++def _picture(w, prompt, start, seed):
++    """A 2x2-merged picture's four rows from ``start``, at Qwen's positions; the text after it rotates at delta -2."""
++
++    generator = torch.Generator(device="cuda").manual_seed(seed)
++    features = torch.randn((4, w.cfg.hidden), device="cuda", generator=generator, dtype=torch.bfloat16)
++    positions = torch.arange(len(prompt), device="cuda", dtype=torch.int32).repeat(3, 1)
++    positions[:, start + 4:] -= 2
++    positions[:, start:start + 4] = start + torch.tensor([[0, 0, 0, 0], [0, 0, 1, 1], [0, 1, 0, 1]], device="cuda")
++    return EncodedVision(tuple(range(start, start + 4)), features, positions, -2)
++
++
++def _prepared(w, prompt, start, seed, digest):
++    """What a request carries into the decoder: the picture's span, hash and grid (the fake tower encodes it)."""
++
++    return SimpleNamespace(encoded=_picture(w, prompt, start, seed), image_spans=((start, start + 4),),
++                           image_hashes=(digest,), image_grid_thw=((1, 4, 4),), video_hashes=())
++
++
++KEYED_TOWER = SimpleNamespace(encode=lambda prepared, ids: prepared.encoded)
++
++
++def _drain(dec, *streams):
++    for _ in range(400):
++        if not dec.live():
++            break
++        done = dec.round()
++        assert all(s.error is None for s in streams), [s.error for s in streams]
++        dec.finish(done)
++    assert not dec.live()
++
++
++def _reference(w, prompt, count, sampling, image):
++    ref = Engine(w, capacity=1024, max_rows=8, prefill_rows=16)
++    first = prefill(ref, prompt, sampling, mtp=False, vision=image)
++    return serial_decode(ref, first, count, sampling, stop_eos=False).tokens
++
++
++@pytest.mark.parametrize("kv_dtype", ["bf16", "int8", "int4"])
++@pytest.mark.parametrize("start", [1, 9, 30])
++def test_a_follow_up_with_the_same_picture_resumes_like_a_fresh_prefill(kv_dtype, start):
++    from tensorfold.engine.exact_sampling import Sampling
++
++    w = _model()
++    sampling = Sampling(seed=67, top_k=20, top_p=0.95)
++    first = list(range(20, 60))
++    first[start:start + 4] = [17] * 4
++    second = first + list(range(70, 93))
++    stats = []
++    for warm in (True, False):                          # the follow-up after its first turn, and on its own
++        dec = MultiDecoder(w, slots=2, capacity=1024, depth=3, confidence=0.3, kv_dtype=kv_dtype, prefill_rows=16,
++                           vision=KEYED_TOWER, stop_eos=False)
++        if warm:
++            turn = Stream(first, 8, sampling, vision=_prepared(w, first, start, 9, "a"), stop_eos=False)
++            dec.admit(turn)
++            _drain(dec, turn)
++            assert turn.out == _reference(w, first, 8, sampling, _picture(w, first, start, 9))
++            assert dec.kept and all(t < 0 for t in dec.kept[-1][0][start:start + 4])
++        follow = Stream(second, 12, sampling, vision=_prepared(w, second, start, 9, "a"), stop_eos=False)
++        dec.admit(follow)
++        assert follow.cached == (len(first) - 1 if warm else 0)
++        _drain(dec, follow)
++        assert follow.out == _reference(w, second, 12, sampling, _picture(w, second, start, 9))
++        stats.append({k: follow.stats()[k] for k in ("rounds", "drafted", "accepted")})
++    assert stats[0] == stats[1]                         # the resumed MTP head drafts as a fresh one does
++
++
++@pytest.mark.parametrize("kv_dtype", ["bf16", "int8"])
++def test_a_resumed_picture_prompt_leaves_a_fresh_prefills_caches(kv_dtype):
++    """Past a picture, the resumed MTP tail rotates at the prompt's image positions, as a fresh prefill's does."""
++    from test_flashnext_forward import _rows
++
++    w = _model()
++    start = 9
++    first = list(range(20, 60))
++    first[start:start + 4] = [17] * 4
++    second = first + list(range(70, 93))
++    states = []
++    for warm in (True, False):
++        dec = MultiDecoder(w, slots=2, capacity=1024, depth=3, confidence=0.3, kv_dtype=kv_dtype, prefill_rows=16,
++                           vision=KEYED_TOWER, stop_eos=False)
++        if warm:
++            turn = Stream(first, 4, vision=_prepared(w, first, start, 9, "a"), stop_eos=False)
++            dec.admit(turn)
++            _drain(dec, turn)
++        follow = Stream(second, 1, vision=_prepared(w, second, start, 9, "a"), stop_eos=False)   # no drafts after
++        dec.admit(follow)
++        assert follow.cached == (len(first) - 1 if warm else 0)
++        _drain(dec, follow)
++        states.append(follow.st)
++    a, b = states
++    assert a.pos == b.pos == len(second) and a.mtp_len == b.mtp_len
++    pairs = [(x, y, a.pos) for x, y in zip(a.kc, b.kc)] + [(a.mtp_kc, b.mtp_kc, a.mtp_len)]
++    for x, y, n in pairs:
++        for t, u in zip(_rows(x, n), _rows(y, n)):
++            assert torch.equal(t.contiguous().view(torch.uint8), u.contiguous().view(torch.uint8))
++
++
++@pytest.mark.parametrize("change", ["picture", "grid", "text"])
++def test_a_different_picture_or_text_resumes_only_the_text_before_it(change):
++    w = _model()
++    start, point = 280, 256
++    first = list(range(1, 320))
++    first[start:start + 4] = [17] * 4
++    second = first + list(range(400, 420))
++    dec = MultiDecoder(w, slots=2, capacity=1024, depth=1, prefill_rows=128, points=lambda ids: [point],
++                       vision=KEYED_TOWER, stop_eos=False)
++    turn = Stream(first, 8, vision=_prepared(w, first, start, 9, "a"), stop_eos=False)
++    dec.admit(turn)
++    _drain(dec, turn)
++    assert sorted(len(k[0]) for k in dec.kept) == [point, len(first) - 1]
++    if change == "text":                                 # the same ids, no picture: placeholder rows are no match
++        follow, image = Stream(second, 8, stop_eos=False), None
++    else:
++        prepared = _prepared(w, second, start, 11, "b") if change == "picture" else _prepared(w, second, start, 9, "a")
++        if change == "grid":                             # the same pixels resized to another grid
++            prepared.image_grid_thw = ((1, 2, 8),)
++        follow, image = Stream(second, 8, vision=prepared, stop_eos=False), prepared.encoded
++    dec.admit(follow)
++    assert follow.cached == point
++    _drain(dec, follow)
++    assert follow.out == _reference(w, second, 8, None, image)
++
++
++def test_a_picture_follows_a_text_prompts_kept_message_start():
++    w = _model()
++    start, point = 280, 256
++    text = list(range(1, 300))
++    pictured = list(range(1, 330))
++    pictured[start:start + 4] = [17] * 4
++    dec = MultiDecoder(w, slots=2, capacity=1024, depth=1, prefill_rows=128, points=lambda ids: [point],
++                       vision=KEYED_TOWER, stop_eos=False)
++    first = Stream(text, 8, stop_eos=False)
++    dec.admit(first)
++    _drain(dec, first)
++    follow = Stream(pictured, 8, vision=_prepared(w, pictured, start, 5, "c"), stop_eos=False)
++    dec.admit(follow)
++    assert follow.cached == point
++    _drain(dec, follow)
++    assert follow.out == _reference(w, pictured, 8, None, _picture(w, pictured, start, 5))
+diff --git a/tests/test_flashnext_absolute_grow_host.py b/tests/test_flashnext_absolute_grow_host.py
+index 4899411..6ac4eb2 100644
+--- a/tests/test_flashnext_absolute_grow_host.py
++++ b/tests/test_flashnext_absolute_grow_host.py
+@@ -118,7 +118,7 @@ class AbsoluteGrowthTests(unittest.TestCase):
+               "cuda_limit_bytes": capacity.cuda_limit_bytes, "LIMIT_ENV": capacity.LIMIT_ENV,
+               "time": SimpleNamespace(perf_counter=lambda: 1.0), "MIN_GAP": 32,
+               "_slot": lambda *args: SimpleNamespace(), "prefill_begin": lambda *args, **kw: 0,
+-              "image_rows": SimpleNamespace(begin=lambda *args: None)}
++              "image_rows": SimpleNamespace(begin=lambda *args: None, key=lambda prompt, vision: list(prompt))}
+         ns["Alone"] = source_class("src/tensorfold/families/qwen4_exp/cuda/multi_solo.py", "Alone",
+                                     {"_state_changed", "_flush"}, ns)
+         cls = source_class("src/tensorfold/families/qwen4_exp/cuda/multi.py", "MultiDecoder",
+diff --git a/tests/test_flashnext_image_keys.py b/tests/test_flashnext_image_keys.py
+new file mode 100644
+index 0000000..6bba986
+--- /dev/null
++++ b/tests/test_flashnext_image_keys.py
+@@ -0,0 +1,51 @@
++"""Flash Next's kept-state keys: a picture's rows match only the same pixels at the same grid, never a token id."""
++
++from types import SimpleNamespace
++
++import pytest
++
++pytest.importorskip("torch")
++pytest.importorskip("triton")
++
++from tensorfold.families.qwen4_exp.cuda.image_rows import key
++
++
++def _vision(spans, hashes, grids, **videos):
++    return SimpleNamespace(image_spans=spans, image_hashes=hashes, image_grid_thw=grids,
++                           **({"video_hashes": ()} | videos))
++
++
++PROMPT = [5, 9, 17, 17, 17, 17, 10, 11, 17, 17, 12]
++
++
++def test_text_prompts_keep_their_ids_and_unhashed_media_gets_no_key():
++    assert key(PROMPT, None) == PROMPT
++    assert key(PROMPT, SimpleNamespace()) is None
++
++
++def test_picture_rows_carry_one_negative_key_each_and_text_is_unchanged():
++    ids = key(PROMPT, _vision(((2, 6), (8, 10)), ("a", "b"), ((1, 4, 4), (1, 2, 4))))
++    assert [ids[i] for i in (0, 1, 6, 7, 10)] == [5, 9, 10, 11, 12]
++    assert len(set(ids[2:6])) == 1 and len(set(ids[8:10])) == 1 and ids[2] != ids[8]
++    assert ids[2] < 0 and ids[8] < 0
++
++
++def test_keys_follow_pixels_and_grid():
++    def first(digest, grid):
++        return key(PROMPT[:7], _vision(((2, 6),), (digest,), (grid,)))[2]
++
++    assert first("a", (1, 4, 4)) != first("b", (1, 4, 4))
++    assert first("a", (1, 4, 4)) != first("a", (1, 2, 8))
++
++
++def test_a_video_s_frame_groups_carry_its_key_beside_a_picture():
++    prompt = [5, 17, 17, 9, 30, 18, 18, 31, 32, 18, 18, 31, 12]  # a picture, then a video's two frame groups
++
++    def keyed(video):
++        return key(prompt, _vision(((1, 3),), ("a",), ((1, 2, 2),), video_hashes=(video,),
++                                   video_grid_thw=((2, 2, 4),), video_spans=((5, 7), (9, 11))))
++
++    ids = keyed("v")
++    assert [ids[i] for i in (0, 3, 4, 7, 8, 11, 12)] == [5, 9, 30, 31, 32, 31, 12]
++    assert ids[5] < 0 and len({ids[5], ids[6], ids[9], ids[10]}) == 1 and ids[1] != ids[5]
++    assert keyed("w")[:5] == ids[:5] and keyed("w")[5] != ids[5]
+-- 
+2.43.0
+

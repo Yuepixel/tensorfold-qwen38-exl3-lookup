@@ -1,0 +1,36 @@
+From 62637806901fe1e52c888d0bd063e4178792bc4d Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 03:34:03 +0800
+Subject: [PATCH 4/5] =?UTF-8?q?P10.2:=20run=5Fserve.sh=20=E5=A2=9E=20TENSO?=
+ =?UTF-8?q?RFOLD=5FVISION=5FMAX=5FIMAGES=20/=20TENSORFOLD=5FVISION=5FIMAGE?=
+ =?UTF-8?q?=5FTOKENS=20=E6=97=8B=E9=92=AE=EF=BC=88=E9=BB=98=E8=AE=A4=204/4?=
+ =?UTF-8?q?096=EF=BC=8C=3D=20=E4=B8=8A=E6=B8=B8=E8=AF=AD=E4=B9=89=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ run_serve.sh | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/run_serve.sh b/run_serve.sh
+index 94a63f1..3983da4 100644
+--- a/run_serve.sh
++++ b/run_serve.sh
+@@ -9,6 +9,12 @@ export TF_EXL3_LOOKUP="${TF_EXL3_LOOKUP-l7:2}"
+ # (docs/recipes/flash-next-vision.md). The sidecar lives OUTSIDE the model snapshot; override with
+ # TENSORFOLD_VISION_WEIGHTS. Set TF_EXL3_VISION=0 to serve text-only (one-line revert).
+ export TENSORFOLD_VISION_WEIGHTS="${TENSORFOLD_VISION_WEIGHTS-/models/vision-f16-Qwen3.8-Flash-Next-exl3-3.05bpw.safetensors}"
++# P10.2 multi-image knobs (upstream defaults: max-images 4 across full history, image-tokens 4096
++# shared per request with <=4096 per image). Override with env to tune without editing this file.
++export TENSORFOLD_VISION_MAX_IMAGES="${TENSORFOLD_VISION_MAX_IMAGES-4}"
++export TENSORFOLD_VISION_IMAGE_TOKENS="${TENSORFOLD_VISION_IMAGE_TOKENS-4096}"
+ VISION_ARG=""
+-if [ "${TF_EXL3_VISION:-1}" != "0" ]; then VISION_ARG="--vision"; fi
++if [ "${TF_EXL3_VISION:-1}" != "0" ]; then
++  VISION_ARG="--vision --vision-max-images ${TENSORFOLD_VISION_MAX_IMAGES} --vision-image-tokens ${TENSORFOLD_VISION_IMAGE_TOKENS}"
++fi
+ exec /usr/local/bin/tensorfold serve /models/Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5 --host 127.0.0.1 --port 8080 --parallel 2 $VISION_ARG > /tmp/serve.log 2>&1
+-- 
+2.43.0
+

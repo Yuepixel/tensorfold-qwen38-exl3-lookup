@@ -1,0 +1,124 @@
+From 7a140c1efd4051adb22002f74b9f9cc499cbd370 Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 02:59:03 +0800
+Subject: [PATCH 3/5] vision: P9.2 enable native image input in production
+ (run_serve.sh --vision default + P9.2 scripts)
+
+---
+ p9.2-apply.sh       | 38 ++++++++++++++++++++++++++++++++++++++
+ p9.2-revert-test.sh | 27 +++++++++++++++++++++++++++
+ p9.2-smoke-img.sh   |  6 ++++++
+ run_serve.sh        |  8 +++++++-
+ 4 files changed, 78 insertions(+), 1 deletion(-)
+ create mode 100644 p9.2-apply.sh
+ create mode 100644 p9.2-revert-test.sh
+ create mode 100644 p9.2-smoke-img.sh
+
+diff --git a/p9.2-apply.sh b/p9.2-apply.sh
+new file mode 100644
+index 0000000..cbb8c7e
+--- /dev/null
++++ b/p9.2-apply.sh
+@@ -0,0 +1,38 @@
++#!/usr/bin/env bash
++# P9.2 apply: make the tf-exl3 profile serve native vision.
++#   - point conf.env TF_IMAGE at the vision-baked image (docker commit of the verified container)
++#   - recreate the container from that image (bakes transformers + compiled TF CUDA kernels)
++#   - relaunch via the profile start.sh, wait until /health is up
++# Assumes /src/TensorFold/run_serve.sh has ALREADY been updated to add --vision.
++# Revert: git -C /home/user/TensorFold checkout run_serve.sh (pre-vision text), or serve once
++#         with TF_EXL3_VISION=0. Pre-vision copies kept as .bak-hostfix-20261008 / .bak-vision-20261007.
++set -uo pipefail
++PROFILE=/home/user/engines/profiles/tensorfold-exl3
++IMG=tf-exl3-vision:20261008
++
++echo "== 1. conf.env -> TF_IMAGE=$IMG =="
++sed -i "s|^TF_IMAGE=.*|TF_IMAGE=$IMG|" "$PROFILE/conf.env"
++grep -n '^TF_IMAGE=' "$PROFILE/conf.env"
++
++echo "== 2. recreate container from the vision image =="
++docker exec tf-exl3 pkill -f 'tensorfold serve' 2>/dev/null || true
++sleep 2
++docker rm -f tf-exl3 2>/dev/null || true
++
++echo "== 3. bring up via profile start.sh =="
++bash "$PROFILE/start.sh" main
++echo "container image: $(docker inspect -f '{{.Config.Image}}' tf-exl3)"
++
++echo "== 4. wait for readiness (<=300s) =="
++for i in $(seq 1 150); do
++  sleep 2
++  if docker exec tf-exl3 python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=3)" >/dev/null 2>&1; then
++    echo "READY after ~$((i*2))s"; break
++  fi
++  if docker exec tf-exl3 grep -qa 'Traceback\|ModuleNotFoundError\|ImportError' /tmp/serve.log 2>/dev/null; then
++    echo "!! error pattern in serve.log:"; docker exec tf-exl3 tail -30 /tmp/serve.log; exit 1
++  fi
++done
++
++echo "== serve.log tail =="
++docker exec tf-exl3 tail -20 /tmp/serve.log
+diff --git a/p9.2-revert-test.sh b/p9.2-revert-test.sh
+new file mode 100644
+index 0000000..0532240
+--- /dev/null
++++ b/p9.2-revert-test.sh
+@@ -0,0 +1,27 @@
++#!/usr/bin/env bash
++# P9.2 revert-path test: prove TF_EXL3_VISION=0 serves text-only, then restore vision.
++set -uo pipefail
++wait_ready() {
++  local i
++  for i in $(seq 1 90); do
++    sleep 2
++    if docker exec tf-exl3 python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=3)" >/dev/null 2>&1; then
++      echo "ready ~$((i*2))s"; return 0
++    fi
++  done
++  echo "NOT READY"; return 1
++}
++
++echo "== revert test: TF_EXL3_VISION=0 (text-only) =="
++docker exec tf-exl3 pkill -f 'tensorfold serve'; sleep 4
++docker exec -e TF_EXL3_VISION=0 -d tf-exl3 bash /src/TensorFold/run_serve.sh
++wait_ready
++echo "vision lines in serve.log: $(docker exec tf-exl3 grep -c vision /tmp/serve.log)"
++echo "startup est: $(docker exec tf-exl3 grep -o 'startup estimate [0-9.]* GiB' /tmp/serve.log)"
++
++echo "== restore: vision ON (default) =="
++docker exec tf-exl3 pkill -f 'tensorfold serve'; sleep 4
++docker exec -d tf-exl3 bash /src/TensorFold/run_serve.sh
++wait_ready
++echo "vision lines in serve.log: $(docker exec tf-exl3 grep -c vision /tmp/serve.log)"
++docker exec tf-exl3 tail -3 /tmp/serve.log
+diff --git a/p9.2-smoke-img.sh b/p9.2-smoke-img.sh
+new file mode 100644
+index 0000000..65bd15c
+--- /dev/null
++++ b/p9.2-smoke-img.sh
+@@ -0,0 +1,6 @@
++#!/usr/bin/env bash
++# Offline smoke test of the vision-baked image (no container recreate, no downtime):
++# confirm transformers + editable tensorfold import and the compiled kernels are present.
++set -e
++IMG=tf-exl3-vision:20261008
++docker run --rm --gpus all -v /home/user/TensorFold:/src/TensorFold "$IMG" python3 -c "import transformers, tensorfold, os; print('transformers', transformers.__version__); print('tensorfold', tensorfold.__file__); d='/root/.cache/torch_extensions/py312_cu133'; print('kernels', sorted(os.listdir(d)) if os.path.isdir(d) else 'MISSING')"
+diff --git a/run_serve.sh b/run_serve.sh
+index d73d3c6..94a63f1 100644
+--- a/run_serve.sh
++++ b/run_serve.sh
+@@ -5,4 +5,10 @@ set -e
+ # elsewhere, byte-exact vs serial either way. Set TF_EXL3_LOOKUP="" to revert to MTP-only (A6), or to
+ # another lN[:M] / "auto" (auto is experimental; its gate cost model is not yet calibrated).
+ export TF_EXL3_LOOKUP="${TF_EXL3_LOOKUP-l7:2}"
+-exec /usr/local/bin/tensorfold serve /models/Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5 --host 0.0.0.0 --port 8080 > /tmp/serve.log 2>&1
++# P9.2 native vision: the EXL3 quantized visual tower is converted once, offline, to an FP16 sidecar
++# (docs/recipes/flash-next-vision.md). The sidecar lives OUTSIDE the model snapshot; override with
++# TENSORFOLD_VISION_WEIGHTS. Set TF_EXL3_VISION=0 to serve text-only (one-line revert).
++export TENSORFOLD_VISION_WEIGHTS="${TENSORFOLD_VISION_WEIGHTS-/models/vision-f16-Qwen3.8-Flash-Next-exl3-3.05bpw.safetensors}"
++VISION_ARG=""
++if [ "${TF_EXL3_VISION:-1}" != "0" ]; then VISION_ARG="--vision"; fi
++exec /usr/local/bin/tensorfold serve /models/Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5 --host 127.0.0.1 --port 8080 --parallel 2 $VISION_ARG > /tmp/serve.log 2>&1
+-- 
+2.43.0
+
