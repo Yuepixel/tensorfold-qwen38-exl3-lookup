@@ -1,5 +1,10 @@
 # TensorFold #444 — Qwen3.8-Flash-Next EXL3 + prompt-lookup (CUDA)
 
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![TensorFold](https://img.shields.io/badge/TensorFold-0.6.5-orange)](https://github.com/ashhart/TensorFold)
+[![GPU](https://img.shields.io/badge/NVIDIA-DGX%20Spark%20(GB10)-76B900)](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
+[![patches](https://img.shields.io/badge/patches-12-informational)](patches)
+
 Support material for [TensorFold issue #444](https://github.com/ashhart/TensorFold/issues/444):
 a diff, the benchmark fixtures, and byte-exact `token_sha` receipts for the
 **EXL3 prompt-GEMM prefill work**, the **prompt-lookup (suffix) draft arm**, and the
@@ -385,8 +390,10 @@ Each command writes `receipt_<cmd>_<label>.json` next to itself.
 
 ## 8. License
 
-Patch/tool/receipt contents follow the upstream TensorFold license. Receipts are
-data; reuse freely.
+This project's own material — the tools, receipt scripts, and documentation — is
+released under the [MIT License](LICENSE). Patch/tool/receipt contents that port or
+cherry-pick upstream TensorFold work (`0001`–`0004`, `0007`, `0008`, `0012`) remain
+under the upstream TensorFold license. Receipts are data; reuse freely.
 
 ---
 
