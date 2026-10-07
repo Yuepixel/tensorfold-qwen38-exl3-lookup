@@ -16,6 +16,7 @@ path.
 - **Hardware:** NVIDIA DGX Spark (GB10), CPU/GPU unified 128 GB
 - **Modalities:** text, image, and video; multi-turn image chats keep a cached prefix
 - **Policy under test:** forced `l7:2` (baseline, `MAX_DRAFTS=7, MIN_MATCH=2`) vs experimental cost gate (`auto`) — see below
+- **Shareable copy:** [gist.github.com/Yuepixel/fdbc20aa54fa37f382455d679452d012](https://gist.github.com/Yuepixel/fdbc20aa54fa37f382455d679452d012)
 
 The whole point of the receipts: **every draft arm must be byte-exact with the
 serial (no-draft) decode.** For all fixtures, `token_sha` is identical across
