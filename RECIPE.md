@@ -4,7 +4,7 @@
 > link to this file and asked you to "install it", follow the steps below end to end,
 > report what you ran, and stop and ask if a step cannot be completed.
 
-Goal: build **TensorFold `v0.6.5` + 12 patches** and serve **Qwen3.8-Flash-Next
+Goal: build **TensorFold `v0.6.5` + 13 patches** and serve **Qwen3.8-Flash-Next
 (EXL3 3.05 bpw)** on a single **DGX Spark (GB10)**, giving **~2.4× EXL3 prefill**
 (≈1700 t/s vs ~700), the **prompt-lookup drafter** on top, plus **native image/video**
 input and an **image-history prefix cache** for multi-turn image chats, with byte-exact
@@ -46,12 +46,14 @@ git -C TensorFold am /path/to/tensorfold-qwen38-exl3-lookup/patches/*.patch
 # fallback if `am` complains: for p in .../patches/*.patch; do git -C TensorFold apply "$p"; done
 ```
 
-Twelve patches, in order: `0001`–`0004` are the EXL3 prompt-GEMM work (the prefill
+Thirteen patches, in order: `0001`–`0004` are the EXL3 prompt-GEMM work (the prefill
 lift), `0005`/`0006` add the prompt-lookup drafter, `0007` adds the width-gated
 two-chunk ring (another +13–15 % prefill; port of PR #283). `0008`–`0011` add native
 **image + video + multi-image** input (the vision tower rides a FP16 sidecar next to the
 pack — port of PR #229), and `0012` adds the **image-history prefix cache** (cherry-pick
-of PR #263, fixes #414). No conflicts expected.
+of PR #263, fixes #414); `0013` (ours, not a port) keeps the solo graph slot hot on a
+cold prefix miss, removing the cold lone-stream decode graph-recapture penalty. No
+conflicts expected.
 
 ## 3. Build the CUDA extension
 

@@ -3,7 +3,7 @@
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![TensorFold](https://img.shields.io/badge/TensorFold-0.6.5-orange)](https://github.com/ashhart/TensorFold)
 [![GPU](https://img.shields.io/badge/NVIDIA-DGX%20Spark%20(GB10)-76B900)](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
-[![patches](https://img.shields.io/badge/patches-12-informational)](patches)
+[![patches](https://img.shields.io/badge/patches-13-informational)](patches)
 
 Support material for [TensorFold issue #444](https://github.com/ashhart/TensorFold/issues/444):
 a diff, the benchmark fixtures, and byte-exact `token_sha` receipts for the
@@ -11,7 +11,7 @@ a diff, the benchmark fixtures, and byte-exact `token_sha` receipts for the
 **vision / video / image-history prefix-cache** additions, all on the Flash-Next CUDA
 path.
 
-- **Engine:** TensorFold `0.6.5` (`v0.6.5` tag) + 12 patches below
+- **Engine:** TensorFold `0.6.5` (`v0.6.5` tag) + 13 patches below
 - **Model:** `Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5` (EXL3 3.05 bpw, group-32, `h5_ng5` pack)
 - **Hardware:** NVIDIA DGX Spark (GB10), CPU/GPU unified 128 GB
 - **Modalities:** text, image, and video; multi-turn image chats keep a cached prefix
@@ -34,6 +34,7 @@ cancellation leaves the next request unchanged.
 | **Vision / video** | native image + video input (PyAV), multi-image, OCR-verified |
 | **Image multi-turn cache** | turn-2 `cached_tokens` **0 → 2514 / 2550**, byte-identical to a cold re-prefill |
 | **Determinism** | `token_sha` identical serial / MTP-only / lookup / auto, single & parallel |
+| **Cold lone-stream decode (0013)** | graph-recapture rounds **191/888 → 0**; cold decode **21–44 → 33–123 t/s** |
 
 The prefill lift is patches `0001–0004` (a rebase of
 [#212](https://github.com/ashhart/TensorFold/pull/212) onto `v0.6.5`) plus `0007`
@@ -42,6 +43,8 @@ two-chunk ring, another **+13–15 %**); the drafter is `0005`/`0006`. It is the
 broadly useful part of this stack and is orthogonal to the drafter — full numbers in
 [§5](#5-results). Patches `0008`–`0012` add native **vision**, **video + multi-image**,
 and the **image-history prefix cache** for multi-turn image chats — see §5.4–§5.5.
+`0013` — our own fix, not a port — removes the cold-decode graph-recapture penalty on a
+lone stream (§5.6).
 
 ### 🤖 Deploy it with one link (for AI agents)
 
@@ -58,7 +61,7 @@ apply, the CUDA build, the weight fetch, the serve command, and the acceptance c
 
 ## 1. Patches
 
-Applied in order on top of `v0.6.5` (tag `p7.1-batch-lookup-v1` = `0001`–`0006`; tag `p8-ring-v1` = `0001`–`0007`; tags `p9-vision-v1` / `p10-vision-v1` = through `0011`; tag `p11-image-prefix-v1` = all twelve):
+Applied in order on top of `v0.6.5` (tag `p7.1-batch-lookup-v1` = `0001`–`0006`; tag `p8-ring-v1` = `0001`–`0007`; tags `p9-vision-v1` / `p10-vision-v1` = through `0011`; tag `p11-image-prefix-v1` = `0001`–`0012`; `0013` sits on top of that (no tag)):
 
 | # | Patch | Area |
 |---|-------|------|
@@ -74,13 +77,14 @@ Applied in order on top of `v0.6.5` (tag `p7.1-batch-lookup-v1` = `0001`–`0006
 | 0010 | `vision: enable native image input in production` (`run_serve.sh --vision`) | vision serve |
 | 0011 | `run_serve.sh: TENSORFOLD_VISION_MAX_IMAGES / TENSORFOLD_VISION_IMAGE_TOKENS knobs` | vision knobs |
 | 0012 | `fix(flash next cuda): image prompts resume and keep prompt states, matched on the images' pixels` (cherry-pick of #263) | image prefix cache |
+| 0013 | `fix(flash next cuda): keep the solo graph slot hot on a cold prefix miss (F6b)` (ours) | decode / solo graph slot |
 
 ```sh
 git checkout v0.6.5
 git am patches/*.patch        # or: git apply patches/*.patch
 ```
 
-Combined diffstat (`v0.6.5..p11-image-prefix`): **53 files, +2625 / −104**.
+Combined diffstat (`v0.6.5..p11-image-prefix`): **53 files, +2625 / −104**. `0013` adds one file, +8 / −6 (`multi_solo.py`).
 (`0001`–`0007` alone are 34 files, +2019 / −40.) A squashed view of the first seven is in
 `receipts/all-changes.diff`.
 
@@ -89,7 +93,7 @@ Touched areas:
 ```
 src/tensorfold/cuda/exl3/{experts.cpp,experts.cu,experts.py,experts_cb0.cu,experts_cb1.cu,experts_cb2.cu,experts_prompt.cuh,prefill.py}
 src/tensorfold/cuda/{health.py,streams.py}
-src/tensorfold/families/qwen4_exp/cuda/{decode.py,engine.py,exl3_mm.py,exl3_pack.py,forward.py,lookup.py,multi.py,multi_fill.py,image_rows.py,state.py}
+src/tensorfold/families/qwen4_exp/cuda/{decode.py,engine.py,exl3_mm.py,exl3_pack.py,forward.py,lookup.py,multi.py,multi_fill.py,multi_solo.py,image_rows.py,state.py}
 src/tensorfold/vision/{exl3_convert.py,qwen_checkpoint.py}
 src/tensorfold/server/metrics.py
 tests/cuda/{test_exl3_prompt_experts.py,test_qwen4_exp_lookup.py,test_flashnext_vision.py}
@@ -251,6 +255,16 @@ must then diverge into a novel token + `DONE` (MTP rounds). `ld=31/la=31`,
 `rounds=6` vs MTP-only `39`, sha unchanged — the lookup arm hands control back
 to MTP cleanly.
 
+### 4.6 Cold lone-stream byte-exactness under F6b (`0013`)
+
+F6b changes the *scheduling* of the solo graph slot, not the math: on a cold
+(prefix-missing) request the slot keeps its captured graphs instead of being swapped.
+Verified byte-exact: 4 unique-prefix fixtures, `temperature 0` — a serial run
+(`--concurrency 1 --no-draft`) and a cold, prefix-missing parallel run
+(`--concurrency 2`, which exercises the F6b path) return the **same `token_sha`** for
+every fixture. Receipt: `receipt_f6b_lookup-l7-2.json`; reproduce with
+`receipts/f6b_before_after.sh` (see §5.6).
+
 ---
 
 ## 5. Results
@@ -353,6 +367,26 @@ byte-equal outputs; and the prefix cache composes with the `TF_EXL3_LOOKUP=l7:2`
 Caveat: **video multi-turn cache reuse** flows through the same path but was not measured
 on its own.
 
+### 5.6 Cold lone-stream decode — graph-recapture removed (`0013`)
+
+With `--parallel 2`, a lone request that misses the prefix cache used to take the bail
+path in `_move_to_solo` (`self.solo.st = old`), which rebuilt an empty `Graphs` on the
+fresh slot and **lazily recaptured every decoding round** (~0.18 s/round, ~21.5 % of
+rounds). `0013` evicts/drops the kept prefix end so the request keeps the hot graph
+slot instead. Cold, `tools/p7_profile.py` (streams=1, unique prefixes):
+
+| class | decode t/s before `0013` | after `0013` |
+|---|---|---|
+| chat | 21.0 | 33.5 |
+| code | 38.3 | 111.5 |
+| edit | 49.7 | 123.1 |
+| continue | 44.1 | 116.7 |
+
+Solo-round forward passes over 0.1 s: **191 / 888 → 0 / 888**. TTFT and prefill are
+unchanged (the fix only touches decode rounds); warm-state decode also improves (`code`
+94.8 → 103.0, `edit` 103.9 → 121.5, `continue` 107.6 → 126.1). Full receipt:
+`receipt_f6b_lookup-l7-2.json`.
+
 ---
 
 ## 6. Reproducing
@@ -366,6 +400,7 @@ python3 receipts/collect.py single   auto
 python3 receipts/collect.py parallel lookup-l7-2 2
 python3 receipts/collect.py parallel mtponly     2
 python3 receipts/collect.py cancel   lookup-l7-2
+python3 receipts/f6b_before_after.sh
 ```
 
 Each command writes `receipt_<cmd>_<label>.json` next to itself.
@@ -384,6 +419,8 @@ Each command writes `receipt_<cmd>_<label>.json` next to itself.
 - The image-history prefix cache (`0012`) cherry-picks **TensorFold PR
   [#263](https://github.com/ashhart/TensorFold/pull/263)** (by olexale), which addresses
   open issue [#414](https://github.com/ashhart/TensorFold/issues/414).
+- `0013` (F6b, the solo-graph-slot cold-miss fix) is this project's own work — not a port
+  or cherry-pick.
 - Built on **TensorFold** by ashhart and contributors; EXL3 kernel work follows
   the existing Flash-Next CUDA/EXL3 path.
 - Hardware/quant recipe: Qwen3.8-Flash-Next EXL3 3.05 bpw `h5_ng5` on a single
@@ -394,7 +431,7 @@ Each command writes `receipt_<cmd>_<label>.json` next to itself.
 This project's own material — the tools, receipt scripts, and documentation — is
 released under the [MIT License](LICENSE). Patch/tool/receipt contents that port or
 cherry-pick upstream TensorFold work (`0001`–`0004`, `0007`, `0008`, `0012`) remain
-under the upstream TensorFold license. Receipts are data; reuse freely.
+under the upstream TensorFold license; `0013` is our own and MIT like the rest. Receipts are data; reuse freely.
 
 ---
 

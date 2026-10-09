@@ -29,6 +29,17 @@ Before → after (2-turn chat, ~2.5k prompt, greedy, `temperature 0`):
 
 Byte-exactness holds throughout: a resumed turn's output is **byte-identical to a cold re-prefill**, the text-only baseline hash is unchanged, and under `--parallel 2` three concurrent image streams return byte-equal outputs.
 
+### 4. Cold lone-stream decode (`0013`)
+
+One more, in this repo only (`0013`, ours — not a port or cherry-pick). With `--parallel 2`,
+a lone request that misses the prefix cache used to bail in `_move_to_solo` and rebuild an
+empty `Graphs` on the fresh slot, **lazily recapturing every decoding round** (~0.18 s
+each, ~21 % of rounds). `0013` evicts/drops the kept prefix end so the request keeps the
+hot graph slot. Cold decode goes **21–44 → 33–123 t/s** (chat/code/edit/continue),
+recapture rounds **191/888 → 0**, TTFT/prefill unchanged, and serial-vs-parallel cold
+output stays byte-exact. Numbers: `README.md` §5.6; patch `0013`; receipt
+`receipt_f6b_lookup-l7-2.json`.
+
 ### Still to polish
 
 - **Video multi-turn cache reuse** is not separately measured — it flows through the same path as images, but I did not test it on its own.

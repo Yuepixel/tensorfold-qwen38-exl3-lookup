@@ -1,0 +1,36 @@
+{
+  "fix": "F6b - keep the solo graph slot hot on a cold prefix miss",
+  "patch": "0013",
+  "base": "TensorFold v0.6.5 (609ca41) + patches 0001-0012",
+  "hardware": "NVIDIA DGX Spark (GB10), unified 128 GB",
+  "model": "Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5 (EXL3 3.05 bpw, group-32, h5_ng5 pack)",
+  "serve": [
+    "--parallel 2",
+    "--max-tokens 16384",
+    "--mtp-drafts 9",
+    "--vision",
+    "TF_EXL3_LOOKUP=l7:2"
+  ],
+  "method": "tools/p7_profile.py --classes chat,code,edit,continue --streams 1 --rounds 4 --tokens 128 --unique",
+  "cold_decode_tps": {
+    "before_0012": {"chat": 21.0, "code": 38.3, "edit": 49.7, "continue": 44.1},
+    "after_0013":  {"chat": 33.5, "code": 111.5, "edit": 123.1, "continue": 116.7}
+  },
+  "warm_decode_tps": {
+    "before_0012": {"chat": 34.0, "code": 94.8, "edit": 103.9, "continue": 107.6},
+    "after_0013":  {"chat": 34.0, "code": 103.0, "edit": 121.5, "continue": 126.1}
+  },
+  "graphs_recapture": {
+    "metric": "solo-round forward passes with fwd > 0.1 s, over 888 cold rounds",
+    "before_0012": 191,
+    "after_0013": 0
+  },
+  "byte_exact": {
+    "serial_vs_parallel_cold": true,
+    "note": "4 unique-prefix fixtures, temperature 0: token_sha identical for serial (--concurrency 1 --no-draft) vs a cold, prefix-missing parallel run (--concurrency 2), which exercises the F6b path"
+  },
+  "timing": {
+    "ttft_and_prefill_unchanged": true,
+    "note": "F6b only changes decode rounds; TTFT/prefill stay within noise"
+  }
+}

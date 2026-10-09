@@ -1,0 +1,43 @@
+From 1bb619670a6dafb5d3b3379f34ef8ca832965095 Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 08:03:23 +0800
+Subject: [PATCH] fix(flash next cuda): keep the solo graph slot hot on a cold prefix miss (F6b)
+
+The bail path (self.solo.st = old) rebuilt an empty Graphs on the request's fresh
+slot and lazily recaptured every decoding round, which was the cold-decode penalty
+(fwd ~0.18 s/round, ~21.5% of rounds). Instead, evict the oldest idle kept end to
+free a spare and retry the relocation; if nothing can be evicted, drop the kept end
+living in the graph slot, then fall through the normal path so the slot and its
+captured graphs stay put. Cost: a cold miss drops one prefix end (LRU/self).
+---
+ src/tensorfold/families/qwen4_exp/cuda/multi_solo.py | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/multi_solo.py b/src/tensorfold/families/qwen4_exp/cuda/multi_solo.py
+index 23bc86a..ba1309e 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/multi_solo.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/multi_solo.py
+@@ -84,12 +84,14 @@ class Alone:
+         target, old = self.solo.st, s.st
+         self._flush(s)
+         if any(k[1] is target for k in self.kept) and not self._relocate_kept(target, old):
+-            self.solo.st = old                   # preserve both prefix chains instead of evicting a kept slot
+-            if self.planning:
+-                self.actions.append(["solo", self._index(old)])
+-            else:
+-                self._state_changed(old)
+-            return
++            # F6b: the graph slot holds a kept prefix end that no free spare could take. Evict the
++            # oldest idle kept end to free a spare and retry the relocation; if nothing can be evicted,
++            # drop the kept end living in the graph slot. Fall through either way, so the solo slot --
++            # and its captured graphs -- stay in place. (The old bail, self.solo.st = old, rebuilt an
++            # empty Graphs on the request's fresh slot and lazily recaptured every round: the cold
++            # decode penalty.)
++            if not (self._evict_kept(target, protect=old) and self._relocate_kept(target, old)):
++                self._drop_kept(target)
+         self._drop_kept(target)
+         self.free = [f for f in self.free if f is not target]
+         self._shrink(target)
+-- 
+2.34.1
+
