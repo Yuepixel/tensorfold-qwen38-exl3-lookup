@@ -3,12 +3,15 @@
   "patch": "0013",
   "base": "TensorFold v0.6.5 (609ca41) + patches 0001-0012",
   "hardware": "NVIDIA DGX Spark (GB10), unified 128 GB",
-  "model": "Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5 (EXL3 3.05 bpw, group-32, h5_ng5 pack)",
+  "model": "Qwen3.8-Flash-Next-Uncensored-exl3-4.05bpw (Lygodactylus, refusal-removed) - the pack served 2026-10-08..2026-10-10",
+  "model_note": "F6b is engine code and pack-agnostic. The before/after numbers in this file were measured on the 4.05 bpw uncensored pack; cold_decode_tps_3.05bpw / warm_decode_tps_3.05bpw / cold_decode_tps_3.05bpw_streams2 hold the current 3.05 bpw pack re-measurement (2026-10-10).",
   "serve": [
     "--parallel 2",
     "--max-tokens 16384",
     "--mtp-drafts 9",
     "--vision",
+    "--vision-max-images 12",
+    "--vision-image-tokens 49152",
     "TF_EXL3_LOOKUP=l7:2"
   ],
   "method": "tools/p7_profile.py --classes chat,code,edit,continue --streams 1 --rounds 4 --tokens 128 --unique",
@@ -20,6 +23,9 @@
     "before_0012": {"chat": 34.0, "code": 94.8, "edit": 103.9, "continue": 107.6},
     "after_0013":  {"chat": 34.0, "code": 103.0, "edit": 121.5, "continue": 126.1}
   },
+  "cold_decode_tps_3.05bpw": {"chat": 37.7, "code": 102.2, "edit": 131.9, "continue": 119.7},
+  "warm_decode_tps_3.05bpw": {"chat": 38.2, "code": 105.7, "edit": 136.6, "continue": 124.0},
+  "cold_decode_tps_3.05bpw_streams2": {"chat": 46.3, "code": 76.7, "edit": 84.5, "continue": 97.9},
   "graphs_recapture": {
     "metric": "solo-round forward passes with fwd > 0.1 s, over 888 cold rounds",
     "before_0012": 191,

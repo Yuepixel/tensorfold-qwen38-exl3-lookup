@@ -10,8 +10,8 @@ Ports upstream #229 (inline vision towers, BF16 input) onto the EXL3 path and en
 
 The same image stack (PyAV `av 19.0.1`) handles video frames and multiple images per request, gated by two knobs:
 
-- `TENSORFOLD_VISION_MAX_IMAGES` (default 4)
-- `TENSORFOLD_VISION_IMAGE_TOKENS` (default 4096)
+- `TENSORFOLD_VISION_MAX_IMAGES` (patch default 4; reference serve 12)
+- `TENSORFOLD_VISION_IMAGE_TOKENS` (patch default 4096; reference serve 49152)
 
 Verified: single- and multi-image OCR, a video clip transcribed to its on-screen text, and mixed text/image requests — all correct, and concurrency-safe.
 

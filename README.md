@@ -12,7 +12,8 @@ a diff, the benchmark fixtures, and byte-exact `token_sha` receipts for the
 path.
 
 - **Engine:** TensorFold `0.6.5` (`v0.6.5` tag) + 13 patches below
-- **Model:** `Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5` (EXL3 3.05 bpw, group-32, `h5_ng5` pack)
+- **Model:** `Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5` (EXL3 3.05 bpw, group-32, `h5_ng5` pack — the current weights)
+- **Weight packs:** tuned on the 3.05 bpw pack above; the `0013` (F6b) decode receipt was captured while a `Lygodactylus` 4.05 bpw uncensored pack was served (2026-10-08 → 2026-10-10). §5.6 reports both packs side by side.
 - **Hardware:** NVIDIA DGX Spark (GB10), CPU/GPU unified 128 GB
 - **Modalities:** text, image, and video; multi-turn image chats keep a cached prefix
 - **Policy under test:** forced `l7:2` (baseline, `MAX_DRAFTS=7, MIN_MATCH=2`) vs experimental cost gate (`auto`) — see below
@@ -34,7 +35,7 @@ cancellation leaves the next request unchanged.
 | **Vision / video** | native image + video input (PyAV), multi-image, OCR-verified |
 | **Image multi-turn cache** | turn-2 `cached_tokens` **0 → 2514 / 2550**, byte-identical to a cold re-prefill |
 | **Determinism** | `token_sha` identical serial / MTP-only / lookup / auto, single & parallel |
-| **Cold lone-stream decode (0013)** | graph-recapture rounds **191/888 → 0**; cold decode **21–44 → 33–123 t/s** |
+| **Cold lone-stream decode (0013)** | graph-recapture rounds **191/888 → 0**; cold decode **21–44 → 33–123 t/s** (4.05 bpw uncensored) / **37.7–131.9 t/s** (current 3.05 bpw) |
 
 The prefill lift is patches `0001–0004` (a rebase of
 [#212](https://github.com/ashhart/TensorFold/pull/212) onto `v0.6.5`) plus `0007`
@@ -339,6 +340,9 @@ untouched). Images arrive as data URLs; the FrameAV/PyAV path (`av 19.0.1`) also
 | `TENSORFOLD_VISION_MAX_IMAGES` | `4` | images (or frame groups) accepted per request |
 | `TENSORFOLD_VISION_IMAGE_TOKENS` | `4096` | token budget per image |
 
+These are the patch defaults; the **reference deployment raises them to `12` / `49152`**
+(via `run_serve.sh`) so a multi-image request fits more image tokens.
+
 Verified OCR/description on single- and multi-image requests, a video clip transcribed
 to its on-screen text, and mixed text/image requests — all correct; `--parallel 2`
 concurrent image streams are byte-equal. (Regression scripts: `run_serve_vision.sh`,
@@ -373,7 +377,25 @@ With `--parallel 2`, a lone request that misses the prefix cache used to take th
 path in `_move_to_solo` (`self.solo.st = old`), which rebuilt an empty `Graphs` on the
 fresh slot and **lazily recaptured every decoding round** (~0.18 s/round, ~21.5 % of
 rounds). `0013` evicts/drops the kept prefix end so the request keeps the hot graph
-slot instead. Cold, `tools/p7_profile.py` (streams=1, unique prefixes):
+slot instead. This is engine code and is **pack-agnostic**; it was measured on both the
+3.05 bpw pack (current) and the 4.05 bpw uncensored pack (served 2026-10-08 → 2026-10-10).
+
+**Under the 3.05 bpw pack** (`h5_ng5`, current weights; re-measured 2026-10-10).
+`tools/p7_profile.py` (streams=1, unique prefixes), decode t/s with `0013`:
+
+| class | cold | warm |
+|---|---|---|
+| chat | 37.7 | 38.2 |
+| code | 102.2 | 105.7 |
+| edit | 131.9 | 136.6 |
+| continue | 119.7 | 124.0 |
+
+Cold ≈ warm (within ~3 % per class): a cold prefix miss no longer pays the recapture
+tax. A before-fix baseline was not separately re-run on this pack, but the recapture
+mechanism and its removal are identical to the 4.05 bpw run below.
+
+**Under the 4.05 bpw uncensored pack** (`Lygodactylus/Qwen3.8-Flash-Next-Uncensored-exl3-4bpw`,
+the pack served 2026-10-08 → 2026-10-10), **before → after `0013`**:
 
 | class | decode t/s before `0013` | after `0013` |
 |---|---|---|
@@ -385,7 +407,7 @@ slot instead. Cold, `tools/p7_profile.py` (streams=1, unique prefixes):
 Solo-round forward passes over 0.1 s: **191 / 888 → 0 / 888**. TTFT and prefill are
 unchanged (the fix only touches decode rounds); warm-state decode also improves (`code`
 94.8 → 103.0, `edit` 103.9 → 121.5, `continue` 107.6 → 126.1). Full receipt:
-`receipt_f6b_lookup-l7-2.json`.
+`receipt_f6b_lookup-l7-2.json` (both packs).
 
 ---
 

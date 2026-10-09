@@ -103,8 +103,9 @@ Notes:
 
 - Native **image/video** input needs the FP16 vision sidecar
   (`TENSORFOLD_VISION_WEIGHTS=<.../vision-f16-Qwen3.8-Flash-Next-exl3-3.05bpw.safetensors>`)
-  and the `--vision` flag; tune with `TENSORFOLD_VISION_MAX_IMAGES` (default 4) and
-  `TENSORFOLD_VISION_IMAGE_TOKENS` (default 4096) — see README §5.4.
+  and the `--vision` flag; the patch defaults are `TENSORFOLD_VISION_MAX_IMAGES=4` and
+  `TENSORFOLD_VISION_IMAGE_TOKENS=4096`, but the reference deployment raises them to
+  `12` / `49152` to fit more image tokens per (multi-image) request — see README §5.4.
 - Removing `--parallel 2` puts a lone request on the no-scheduler path, which also
   reaches the lookup arm; with `--parallel` a *single* in-flight request is served
   MTP-only (see README §2).
