@@ -7,7 +7,7 @@
 
 > **One DGX Spark (GB10) · TensorFold v0.6.5 (Python) + 14 patches · every number byte-exact.**
 
-![EXL3 prefill on one DGX Spark: about 670–800 t/s stock, 1,549 after the prompt-GEMM work, 1,777 after ring-by-width — roughly 2.4×](https://raw.githubusercontent.com/Yuepixel/tensorfold-qwen38-exl3-lookup/main/assets/prefill-climb.svg)
+![One DGX Spark, stock → best. Cold prefill ~670→1,777 t/s (≈2.4×); image multi-turn 2.87→0.24 s (≈12×); 6-session shared prefix 41.6→3.22 s (12.9×); cold decode 21→123 t/s (≈6×). Red = stock, amber = on the way, green = now.](https://raw.githubusercontent.com/Yuepixel/tensorfold-qwen38-exl3-lookup/main/assets/climb.svg)
 
 ### 📈 The climb — from stock to best
 
@@ -25,8 +25,6 @@ Cold `temperature 0`, one GB10, oldest/worst first:
 | + `0014` | system-block checkpoint (sys-checkpoint) | shared-prefix prefill **4.57 s → 0.38 s**; 6-session **41.6 s → 3.22 s (12.9×)** |
 
 `token_sha` identical at every stage — serial = MTP-only = lookup = auto, single & parallel. Full numbers: [§5](#5-results).
-
-![Speedups on one DGX Spark vs stock: shared-prefix 12.9×, image multi-turn 6×, cold lone-stream decode 2.5×, EXL3 prefill 2.4×, decode lookup 1.44×](https://raw.githubusercontent.com/Yuepixel/tensorfold-qwen38-exl3-lookup/main/assets/speedups.svg)
 
 An **unofficial fork/branch of [TensorFold](https://github.com/ashhart/TensorFold) `v0.6.5`**:
 an EXL3 3.05 bpw stack plus a **prompt-lookup (suffix) draft arm** for

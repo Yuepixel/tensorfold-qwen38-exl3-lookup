@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 620" width="1040" height="620" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif">
+  <rect width="1040" height="620" fill="#FFF4E8"/>
+  <text x="34" y="50" font-size="30" font-weight="700" fill="#3A2A1A">One DGX Spark (GB10): stock → best</text>
+  <text x="34" y="80" font-size="15" fill="#8A7866">EXL3 3.05 bpw · TensorFold v0.6.5 + 14 patches · every number byte-exact</text>
+
+  <g font-size="14" fill="#5A4A38">
+    <rect x="34" y="102" width="15" height="15" rx="3" fill="#E5443B"/><text x="55" y="115">stock / before</text>
+    <rect x="182" y="102" width="15" height="15" rx="3" fill="#F2A63B"/><text x="203" y="115">on the way</text>
+    <rect x="320" y="102" width="15" height="15" rx="3" fill="#6DB33F"/><text x="341" y="115">now</text>
+  </g>
+  <text x="1006" y="115" font-size="13" fill="#A0906F" text-anchor="end">each group scaled to its best · taller = better</text>
+
+  <line x1="60" y1="520" x2="980" y2="520" stroke="#E3CFB6" stroke-width="2"/>
+
+  <g stroke="#F0DFC9" stroke-width="1">
+    <line x1="290" y1="150" x2="290" y2="520"/>
+    <line x1="520" y1="150" x2="520" y2="520"/>
+    <line x1="750" y1="150" x2="750" y2="520"/>
+  </g>
+
+  <g fill="#E5443B">
+    <rect x="94" y="437" width="46" height="83" rx="4"/>
+    <rect x="324" y="502" width="46" height="18" rx="4"/>
+    <rect x="554" y="503" width="46" height="17" rx="4"/>
+    <rect x="784" y="482" width="46" height="38" rx="4"/>
+  </g>
+  <g fill="#F2A63B">
+    <rect x="152" y="349" width="46" height="171" rx="4"/>
+    <rect x="382" y="486" width="46" height="34" rx="4"/>
+    <rect x="612" y="450" width="46" height="70" rx="4"/>
+    <rect x="842" y="460" width="46" height="60" rx="4"/>
+  </g>
+  <g fill="#6DB33F">
+    <rect x="210" y="300" width="46" height="220" rx="4"/>
+    <rect x="440" y="300" width="46" height="220" rx="4"/>
+    <rect x="670" y="300" width="46" height="220" rx="4"/>
+    <rect x="900" y="300" width="46" height="220" rx="4"/>
+  </g>
+
+  <g fill="#6E5A45" font-size="14" font-weight="600" text-anchor="middle">
+    <text x="117" y="427">670</text>
+    <text x="175" y="339">1385</text>
+    <text x="233" y="290">1777</text>
+    <text x="347" y="492">2.87s</text>
+    <text x="405" y="476">1.53s</text>
+    <text x="463" y="290">0.24s</text>
+    <text x="577" y="493">41.6s</text>
+    <text x="635" y="440">10.2s</text>
+    <text x="693" y="290">3.22s</text>
+    <text x="807" y="472">21</text>
+    <text x="865" y="450">33.5</text>
+    <text x="923" y="290">123</text>
+  </g>
+  <g fill="#4E7A2A" font-size="13" font-weight="700" text-anchor="middle">
+    <text x="233" y="272">≈ 2.4×</text>
+    <text x="463" y="272">≈ 12×</text>
+    <text x="693" y="272">12.9×</text>
+    <text x="923" y="272">≈ 6×</text>
+  </g>
+
+  <g fill="#3A2A1A" font-size="15" font-weight="700" text-anchor="middle">
+    <text x="175" y="548">Cold prefill</text>
+    <text x="405" y="548">Image multi-turn</text>
+    <text x="635" y="548">6-session prefix</text>
+    <text x="865" y="548">Cold decode</text>
+  </g>
+  <g fill="#A0906F" font-size="12.5" text-anchor="middle">
+    <text x="175" y="568">tokens/s · higher = better</text>
+    <text x="405" y="568">seconds · lower = better</text>
+    <text x="635" y="568">seconds · lower = better</text>
+    <text x="865" y="568">tokens/s · higher = better</text>
+  </g>
+  <text x="520" y="602" font-size="12.5" fill="#A0906F" text-anchor="middle">stock v0.6.5 → +prompt-GEMM → +ring (prefill) · turn-1 cold → no-cache → +0012 (image) · OFF → ON r1 → ON r2 (sessions) · 4.05bpw stk → +0013 → 3.05bpw (decode)</text>
+</svg>
