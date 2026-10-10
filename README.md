@@ -59,7 +59,8 @@ Hand a coding agent (Claude Code, Cursor, opencode, Codex, …) this file and it
 everything needed to build and serve the stack on a DGX Spark:
 
 > Fetch **https://raw.githubusercontent.com/Yuepixel/tensorfold-qwen38-exl3-lookup/main/RECIPE.md**
-> and follow it to install and run Qwen3.8-Flash-Next (EXL3 3.05 bpw) on this machine.
+> and follow it to install and run Qwen3.8-Flash-Next (EXL3 3.05 bpw) on a DGX Spark
+> (GB10) — TensorFold v0.6.5 (Python engine line) + 14 patches.
 
 [`RECIPE.md`](RECIPE.md) is self-contained: prerequisites, exact commits, the patch
 apply, the CUDA build, the weight fetch, the serve command, and the acceptance check.
