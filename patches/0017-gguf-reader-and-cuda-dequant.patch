@@ -1,0 +1,2277 @@
+From daf84fab4c7a8d9351a3768ffb578422a801ec40 Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 20:09:13 +0800
+Subject: [PATCH 01/11] feat(gguf): GGUF parser MVP - mmap metadata, tensor
+ index and Q8_0 dequant (P24)
+
+---
+ pyproject.toml                  |   2 +
+ src/tensorfold/gguf/__init__.py |   5 ++
+ src/tensorfold/gguf/dequant.py  |  31 ++++++++++
+ src/tensorfold/gguf/reader.py   | 102 ++++++++++++++++++++++++++++++++
+ tests/test_gguf_q8_0.py         |  42 +++++++++++++
+ tests/test_gguf_reader.py       |  75 +++++++++++++++++++++++
+ 6 files changed, 257 insertions(+)
+ create mode 100644 src/tensorfold/gguf/__init__.py
+ create mode 100644 src/tensorfold/gguf/dequant.py
+ create mode 100644 src/tensorfold/gguf/reader.py
+ create mode 100644 tests/test_gguf_q8_0.py
+ create mode 100644 tests/test_gguf_reader.py
+
+diff --git a/pyproject.toml b/pyproject.toml
+index df71278..f1540c4 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -42,6 +42,8 @@ vision = ["Pillow>=10", "transformers>=5.3,<6", "mlx-vlm>=0.7.3,<0.8; sys_platfo
+           "av>=12; sys_platform != 'darwin'"]
+ # response_format, guided_* and structured_outputs on every server: grammar-shaped replies (xgrammar brings torch)
+ grammar = ["xgrammar>=0.2.8,<0.3"]
++# reading GGUF checkpoints (metadata, tensor index, block dequantization)
++gguf = ["gguf>=0.19"]
+ 
+ [project.scripts]
+ tensorfold = "tensorfold.cli:main"
+diff --git a/src/tensorfold/gguf/__init__.py b/src/tensorfold/gguf/__init__.py
+new file mode 100644
+index 0000000..148925d
+--- /dev/null
++++ b/src/tensorfold/gguf/__init__.py
+@@ -0,0 +1,5 @@
++"""GGUF checkpoint reading: memory-mapped metadata, a tensor index and Q8_0 dequantization."""
++from .dequant import BLOCK_Q8_0, DEQUANTIZERS, QK8_0, dequantize_q8_0
++from .reader import GgufReader, GgufTensor
++
++__all__ = ["BLOCK_Q8_0", "DEQUANTIZERS", "GgufReader", "GgufTensor", "QK8_0", "dequantize_q8_0"]
+diff --git a/src/tensorfold/gguf/dequant.py b/src/tensorfold/gguf/dequant.py
+new file mode 100644
+index 0000000..955a8b0
+--- /dev/null
++++ b/src/tensorfold/gguf/dequant.py
+@@ -0,0 +1,31 @@
++"""GGUF block dequantization to f32; Q8_0 first, matching llama.cpp's block_q8_0 layout."""
++from __future__ import annotations
++
++import numpy as np
++from numpy.typing import NDArray
++
++QK8_0 = 32
++BLOCK_Q8_0 = np.dtype([("d", "<f2"), ("qs", "i1", (QK8_0,))])
++
++
++def dequantize_q8_0(raw: NDArray, shape: tuple[int, ...]) -> NDArray[np.float32]:
++    """Dequantize Q8_0 blocks (ggml_half scale + int8[32]) to f32 of ``shape``."""
++    n_elements = int(np.prod(shape))
++    if n_elements % QK8_0:
++        raise ValueError(f"Q8_0 element count {n_elements} is not a multiple of {QK8_0}")
++    blocks = _blocks(raw, BLOCK_Q8_0, n_elements // QK8_0)
++    scales = blocks["d"].astype(np.float32)
++    values = blocks["qs"].astype(np.float32)
++    return (scales[:, None] * values).reshape(shape)
++
++
++def _blocks(raw: NDArray, dtype: np.dtype, n_blocks: int) -> NDArray:
++    flat = np.ascontiguousarray(raw, dtype=np.uint8).reshape(-1)
++    if flat.size != n_blocks * dtype.itemsize:
++        raise ValueError(f"expected {n_blocks * dtype.itemsize} bytes, got {flat.size}")
++    return flat.view(dtype)
++
++
++DEQUANTIZERS = {"q8_0": dequantize_q8_0}
++
++__all__ = ["BLOCK_Q8_0", "DEQUANTIZERS", "QK8_0", "dequantize_q8_0"]
+diff --git a/src/tensorfold/gguf/reader.py b/src/tensorfold/gguf/reader.py
+new file mode 100644
+index 0000000..68d6709
+--- /dev/null
++++ b/src/tensorfold/gguf/reader.py
+@@ -0,0 +1,102 @@
++"""GGUF checkpoints read through the ``gguf`` reference package: mmap, metadata and a tensor index."""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from pathlib import Path
++
++import numpy as np
++from numpy.typing import NDArray
++
++from .dequant import DEQUANTIZERS
++
++
++@dataclass(frozen=True)
++class GgufTensor:
++    """One entry of a GGUF tensor index, in logical (row-major) shape."""
++
++    name: str
++    shape: tuple[int, ...]
++    quant: str
++    n_bytes: int
++    offset: int
++
++
++def _logical_shape(tensor) -> tuple[int, ...]:
++    return tuple(int(d) for d in reversed(tensor.shape.tolist()))
++
++
++class GgufReader:
++    """Memory-mapped GGUF reader: metadata fields, a tensor index and block dequantization.
++
++    Wraps :class:`gguf.GGUFReader`, which memmaps the file and parses the header, so the
++    package is imported lazily and only required for actual GGUF access.
++    """
++
++    def __init__(self, path: str | Path):
++        from gguf import GGUFReader
++
++        self.path = Path(path)
++        self._reader = GGUFReader(str(self.path))
++        self._fields = self._reader.fields
++        self._tensors = {t.name: t for t in self._reader.tensors}
++
++    @property
++    def architecture(self) -> str | None:
++        return self.field("general.architecture")
++
++    def field(self, key: str, default=None):
++        value = self._reader.get_field(key)
++        return default if value is None else value.contents()
++
++    def fields(self) -> list[str]:
++        return list(self._fields)
++
++    def keys(self) -> list[str]:
++        return list(self._tensors)
++
++    def __contains__(self, name: str) -> bool:
++        return name in self._tensors
++
++    def __len__(self) -> int:
++        return len(self._tensors)
++
++    def info(self, name: str) -> GgufTensor:
++        tensor = self._tensors[name]
++        return GgufTensor(
++            name=tensor.name,
++            shape=_logical_shape(tensor),
++            quant=tensor.tensor_type.name.lower(),
++            n_bytes=int(tensor.n_bytes),
++            offset=int(tensor.data_offset),
++        )
++
++    def raw(self, name: str) -> NDArray:
++        """The tensor's stored bytes (or native dtype for F32/F16) as a memory-mapped view."""
++        return np.asarray(self._tensors[name].data)
++
++    def dequant(self, name: str) -> NDArray[np.float32]:
++        """Materialize ``name`` as float32, dequantizing supported GGUF block types."""
++        tensor = self._tensors[name]
++        kind = tensor.tensor_type.name.lower()
++        if kind in DEQUANTIZERS:
++            return DEQUANTIZERS[kind](tensor.data, _logical_shape(tensor))
++        if kind == "f32":
++            return np.asarray(tensor.data, dtype=np.float32).reshape(_logical_shape(tensor))
++        if kind == "f16":
++            return np.asarray(tensor.data, dtype=np.float16).astype(np.float32).reshape(_logical_shape(tensor))
++        raise NotImplementedError(f"tensor {name!r} uses GGUF type {kind!r}, which is not supported yet")
++
++    def close(self) -> None:
++        data = getattr(self._reader, "data", None)
++        mmap = getattr(data, "_mmap", None)
++        if mmap is not None:
++            mmap.close()
++
++    def __enter__(self) -> "GgufReader":
++        return self
++
++    def __exit__(self, *exc) -> None:
++        self.close()
++
++
++__all__ = ["GgufReader", "GgufTensor"]
+diff --git a/tests/test_gguf_q8_0.py b/tests/test_gguf_q8_0.py
+new file mode 100644
+index 0000000..d676be0
+--- /dev/null
++++ b/tests/test_gguf_q8_0.py
+@@ -0,0 +1,42 @@
++from __future__ import annotations
++
++import numpy as np
++import pytest
++from gguf import GGMLQuantizationType
++from gguf.quants import Q8_0
++
++from tensorfold.gguf.dequant import BLOCK_Q8_0, QK8_0, dequantize_q8_0
++
++
++def test_block_layout_matches_ggml():
++    assert QK8_0 == 32
++    assert BLOCK_Q8_0.itemsize == 34
++    assert GGMLQuantizationType.Q8_0.value == 8
++
++
++def test_dequantize_matches_reference_bitwise():
++    rng = np.random.default_rng(1234)
++    blocks = rng.integers(0, 256, size=(5, BLOCK_Q8_0.itemsize), dtype=np.uint8)
++    ours = dequantize_q8_0(blocks, (5 * QK8_0,))
++    reference = Q8_0.dequantize_blocks(blocks).reshape(-1)
++    assert ours.dtype == np.float32
++    assert np.array_equal(ours, reference)
++
++
++def test_round_trip_error_is_small():
++    rng = np.random.default_rng(7)
++    values = (rng.standard_normal((4, QK8_0)) * 3).astype(np.float32)
++    blocks = Q8_0.quantize_blocks(values)
++    restored = dequantize_q8_0(blocks, values.shape)
++    assert restored.shape == values.shape
++    assert np.abs(restored - values).max() <= np.abs(values).max() / 127 + 1e-4
++
++
++def test_rejects_misaligned_element_count():
++    with pytest.raises(ValueError):
++        dequantize_q8_0(np.zeros(33, dtype=np.uint8), (48,))
++
++
++def test_rejects_wrong_byte_count():
++    with pytest.raises(ValueError):
++        dequantize_q8_0(np.zeros(10, dtype=np.uint8), (32,))
+diff --git a/tests/test_gguf_reader.py b/tests/test_gguf_reader.py
+new file mode 100644
+index 0000000..639d3d0
+--- /dev/null
++++ b/tests/test_gguf_reader.py
+@@ -0,0 +1,75 @@
++from __future__ import annotations
++
++import numpy as np
++import pytest
++from gguf import GGMLQuantizationType, GGUFWriter
++from gguf.quants import Q4_0, Q8_0
++
++from tensorfold.gguf import GgufReader
++
++
++def _write_sample(path):
++    weights = ((np.arange(96, dtype=np.float32).reshape(3, 32) - 48) / 10).astype(np.float32)
++    blocks = Q8_0.quantize_blocks(weights)
++    norm = np.linspace(-1.0, 1.0, 8, dtype=np.float32).reshape(2, 4)
++
++    writer = GGUFWriter(path, "qwen3_5_moe")
++    writer.add_name("synthetic-qwen3_5_moe")
++    writer.add_block_count(2)
++    writer.add_tensor("blk.0.attn_q.weight", blocks, raw_dtype=GGMLQuantizationType.Q8_0)
++    writer.add_tensor("blk.0.attn_norm.weight", norm)
++    writer.write_header_to_file()
++    writer.write_kv_data_to_file()
++    writer.write_tensors_to_file()
++    writer.close()
++    return weights, norm
++
++
++def test_metadata_and_tensor_index(tmp_path):
++    weights, _ = _write_sample(tmp_path / "sample.gguf")
++    with GgufReader(tmp_path / "sample.gguf") as reader:
++        assert reader.architecture == "qwen3_5_moe"
++        assert reader.field("general.name") == "synthetic-qwen3_5_moe"
++        assert reader.field("qwen3_5_moe.block_count") == 2
++        assert reader.field("missing.key", "fallback") == "fallback"
++        assert set(reader.keys()) == {"blk.0.attn_q.weight", "blk.0.attn_norm.weight"}
++        assert "blk.0.attn_q.weight" in reader
++        assert len(reader) == 2
++
++        info = reader.info("blk.0.attn_q.weight")
++        assert info.shape == (3, 32)
++        assert info.quant == "q8_0"
++        assert info.n_bytes == 3 * 34
++
++        raw = reader.raw("blk.0.attn_q.weight")
++        assert raw.dtype == np.uint8
++        assert raw.shape == (3, 34)
++
++        restored = reader.dequant("blk.0.attn_q.weight")
++        assert restored.shape == (3, 32)
++        assert np.abs(restored - weights).max() <= np.abs(weights).max() / 127 + 1e-4
++
++
++def test_f32_tensor_passthrough(tmp_path):
++    _, norm = _write_sample(tmp_path / "sample.gguf")
++    with GgufReader(tmp_path / "sample.gguf") as reader:
++        info = reader.info("blk.0.attn_norm.weight")
++        assert info.quant == "f32"
++        assert info.shape == (2, 4)
++        f32 = reader.dequant("blk.0.attn_norm.weight")
++        assert f32.dtype == np.float32
++        assert np.array_equal(f32, norm)
++
++
++def test_unsupported_quant_raises(tmp_path):
++    blocks = Q4_0.quantize_blocks(np.zeros((2, 32), dtype=np.float32))
++    writer = GGUFWriter(tmp_path / "q4.gguf", "qwen3_5_moe")
++    writer.add_tensor("blk.0.attn_q.weight", blocks, raw_dtype=GGMLQuantizationType.Q4_0)
++    writer.write_header_to_file()
++    writer.write_kv_data_to_file()
++    writer.write_tensors_to_file()
++    writer.close()
++    with GgufReader(tmp_path / "q4.gguf") as reader:
++        assert reader.info("blk.0.attn_q.weight").quant == "q4_0"
++        with pytest.raises(NotImplementedError):
++            reader.dequant("blk.0.attn_q.weight")
+-- 
+2.53.0.windows.2
+
+From c43245acac133009c89619cc270a026eca385306 Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 20:22:31 +0800
+Subject: [PATCH 02/11] feat(gguf): Q4_K/Q5_K/Q6_K dequant for Q4_K_M files
+ (P25)
+
+---
+ src/tensorfold/gguf/dequant.py | 111 ++++++++++++++++++++++++++++++++-
+ tests/test_gguf_kquants.py     |  60 ++++++++++++++++++
+ 2 files changed, 168 insertions(+), 3 deletions(-)
+ create mode 100644 tests/test_gguf_kquants.py
+
+diff --git a/src/tensorfold/gguf/dequant.py b/src/tensorfold/gguf/dequant.py
+index 955a8b0..f11031a 100644
+--- a/src/tensorfold/gguf/dequant.py
++++ b/src/tensorfold/gguf/dequant.py
+@@ -1,11 +1,20 @@
+-"""GGUF block dequantization to f32; Q8_0 first, matching llama.cpp's block_q8_0 layout."""
++"""GGUF block dequantization to f32, matching llama.cpp's ggml block layouts.
++
++Q8_0 plus the K-quants used by real Q4_K_M files: Q4_K, Q5_K and Q6_K. Each returns
++float32 values in logical (row-major) shape; all match the ``gguf`` reference bit-exact.
++"""
+ from __future__ import annotations
+ 
+ import numpy as np
+ from numpy.typing import NDArray
+ 
+ QK8_0 = 32
++QK_K = 256
+ BLOCK_Q8_0 = np.dtype([("d", "<f2"), ("qs", "i1", (QK8_0,))])
++_K_SCALE_SIZE = 12
++_Q4_K_SIZE = 144
++_Q5_K_SIZE = 176
++_Q6_K_SIZE = 210
+ 
+ 
+ def dequantize_q8_0(raw: NDArray, shape: tuple[int, ...]) -> NDArray[np.float32]:
+@@ -19,6 +28,77 @@ def dequantize_q8_0(raw: NDArray, shape: tuple[int, ...]) -> NDArray[np.float32]
+     return (scales[:, None] * values).reshape(shape)
+ 
+ 
++def dequantize_q4_k(raw: NDArray, shape: tuple[int, ...]) -> NDArray[np.float32]:
++    """Dequantize Q4_K superblocks (256 values: d/dmin f16, 12 scale bytes, 128 nibbles)."""
++    blocks = _k_blocks(raw, _Q4_K_SIZE, shape)
++    n_blocks = blocks.shape[0]
++    d, rest = np.hsplit(blocks, [2])
++    dmin, rest = np.hsplit(rest, [2])
++    scales, qs = np.hsplit(rest, [_K_SCALE_SIZE])
++
++    d = d.view(np.float16).astype(np.float32)
++    dmin = dmin.view(np.float16).astype(np.float32)
++    sc, m = _get_scale_min_k4(scales)
++
++    d = (d * sc.astype(np.float32)).reshape((n_blocks, -1, 1))
++    dm = (dmin * m.astype(np.float32)).reshape((n_blocks, -1, 1))
++    qs = qs.reshape((n_blocks, -1, 1, 32)) >> np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2, 1))
++    qs = (qs & np.uint8(0x0F)).reshape((n_blocks, -1, 32)).astype(np.float32)
++    return (d * qs - dm).reshape((n_blocks, QK_K)).reshape(shape)
++
++
++def dequantize_q5_k(raw: NDArray, shape: tuple[int, ...]) -> NDArray[np.float32]:
++    """Dequantize Q5_K superblocks (d/dmin f16, 12 scale bytes, 32 high bits, 128 nibbles)."""
++    blocks = _k_blocks(raw, _Q5_K_SIZE, shape)
++    n_blocks = blocks.shape[0]
++    d, rest = np.hsplit(blocks, [2])
++    dmin, rest = np.hsplit(rest, [2])
++    scales, rest = np.hsplit(rest, [_K_SCALE_SIZE])
++    qh, qs = np.hsplit(rest, [QK_K // 8])
++
++    d = d.view(np.float16).astype(np.float32)
++    dmin = dmin.view(np.float16).astype(np.float32)
++    sc, m = _get_scale_min_k4(scales)
++
++    d = (d * sc.astype(np.float32)).reshape((n_blocks, -1, 1))
++    dm = (dmin * m.astype(np.float32)).reshape((n_blocks, -1, 1))
++    ql = qs.reshape((n_blocks, -1, 1, 32)) >> np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2, 1))
++    qh = qh.reshape((n_blocks, -1, 1, 32)) >> np.array([i for i in range(8)], dtype=np.uint8).reshape((1, 1, 8, 1))
++    ql = (ql & np.uint8(0x0F)).reshape((n_blocks, -1, 32))
++    qh = (qh & np.uint8(0x01)).reshape((n_blocks, -1, 32))
++    q = (ql | (qh << np.uint8(4))).astype(np.float32)
++    return (d * q - dm).reshape((n_blocks, QK_K)).reshape(shape)
++
++
++def dequantize_q6_k(raw: NDArray, shape: tuple[int, ...]) -> NDArray[np.float32]:
++    """Dequantize Q6_K superblocks (d f16, 16 int8 scales, 64 high bits, 128 low nibbles)."""
++    blocks = _k_blocks(raw, _Q6_K_SIZE, shape)
++    n_blocks = blocks.shape[0]
++    ql, rest = np.hsplit(blocks, [QK_K // 2])
++    qh, rest = np.hsplit(rest, [QK_K // 4])
++    scales, d = np.hsplit(rest, [QK_K // 16])
++
++    scales = scales.view(np.int8).astype(np.float32)
++    d = d.view(np.float16).astype(np.float32)
++    d = (d * scales).reshape((n_blocks, QK_K // 16, 1))
++    ql = ql.reshape((n_blocks, -1, 1, 64)) >> np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2, 1))
++    ql = (ql & np.uint8(0x0F)).reshape((n_blocks, -1, 32))
++    qh = qh.reshape((n_blocks, -1, 1, 32)) >> np.array([0, 2, 4, 6], dtype=np.uint8).reshape((1, 1, 4, 1))
++    qh = (qh & np.uint8(0x03)).reshape((n_blocks, -1, 32))
++    q = (ql | (qh << np.uint8(4))).astype(np.int8) - np.int8(32)
++    q = q.reshape((n_blocks, QK_K // 16, -1)).astype(np.float32)
++    return (d * q).reshape((n_blocks, QK_K)).reshape(shape)
++
++
++def _get_scale_min_k4(scales: NDArray) -> tuple[NDArray, NDArray]:
++    n_blocks = scales.shape[0]
++    scales = scales.view(np.uint8).reshape((n_blocks, 3, 4))
++    d, m, m_d = np.split(scales, 3, axis=-2)
++    sc = np.concatenate([d & 0x3F, (m_d & 0x0F) | ((d >> 2) & 0x30)], axis=-1)
++    mn = np.concatenate([m & 0x3F, (m_d >> 4) | ((m >> 2) & 0x30)], axis=-1)
++    return sc.reshape((n_blocks, 8)), mn.reshape((n_blocks, 8))
++
++
+ def _blocks(raw: NDArray, dtype: np.dtype, n_blocks: int) -> NDArray:
+     flat = np.ascontiguousarray(raw, dtype=np.uint8).reshape(-1)
+     if flat.size != n_blocks * dtype.itemsize:
+@@ -26,6 +106,31 @@ def _blocks(raw: NDArray, dtype: np.dtype, n_blocks: int) -> NDArray:
+     return flat.view(dtype)
+ 
+ 
+-DEQUANTIZERS = {"q8_0": dequantize_q8_0}
++def _k_blocks(raw: NDArray, size: int, shape: tuple[int, ...]) -> NDArray:
++    n_elements = int(np.prod(shape))
++    if n_elements % QK_K:
++        raise ValueError(f"K-quant element count {n_elements} is not a multiple of {QK_K}")
++    flat = np.ascontiguousarray(raw, dtype=np.uint8).reshape(-1)
++    n_blocks = n_elements // QK_K
++    if flat.size != n_blocks * size:
++        raise ValueError(f"expected {n_blocks * size} bytes, got {flat.size}")
++    return flat.reshape((n_blocks, size))
++
++
++DEQUANTIZERS = {
++    "q8_0": dequantize_q8_0,
++    "q4_k": dequantize_q4_k,
++    "q5_k": dequantize_q5_k,
++    "q6_k": dequantize_q6_k,
++}
+ 
+-__all__ = ["BLOCK_Q8_0", "DEQUANTIZERS", "QK8_0", "dequantize_q8_0"]
++__all__ = [
++    "BLOCK_Q8_0",
++    "DEQUANTIZERS",
++    "QK8_0",
++    "QK_K",
++    "dequantize_q4_k",
++    "dequantize_q5_k",
++    "dequantize_q6_k",
++    "dequantize_q8_0",
++]
+diff --git a/tests/test_gguf_kquants.py b/tests/test_gguf_kquants.py
+new file mode 100644
+index 0000000..9419960
+--- /dev/null
++++ b/tests/test_gguf_kquants.py
+@@ -0,0 +1,60 @@
++from __future__ import annotations
++
++import numpy as np
++import pytest
++from gguf.quants import Q4_K, Q5_K, Q6_K
++
++from tensorfold.gguf.dequant import (
++    QK_K,
++    dequantize_q4_k,
++    dequantize_q5_k,
++    dequantize_q6_k,
++)
++
++_SIZES = {"q4_k": 144, "q5_k": 176, "q6_k": 210}
++_REFERENCE = {"q4_k": Q4_K, "q5_k": Q5_K, "q6_k": Q6_K}
++_FUNCS = {"q4_k": dequantize_q4_k, "q5_k": dequantize_q5_k, "q6_k": dequantize_q6_k}
++
++
++@pytest.mark.parametrize("kind", ["q4_k", "q5_k", "q6_k"])
++def test_block_sizes(kind: str) -> None:
++    assert QK_K == 256
++    from gguf.constants import GGML_QUANT_SIZES
++    from gguf import GGMLQuantizationType
++
++    qtype = {"q4_k": GGMLQuantizationType.Q4_K, "q5_k": GGMLQuantizationType.Q5_K, "q6_k": GGMLQuantizationType.Q6_K}[kind]
++    assert GGML_QUANT_SIZES[qtype] == (QK_K, _SIZES[kind])
++
++
++@pytest.mark.parametrize("kind", ["q4_k", "q5_k", "q6_k"])
++def test_bit_exact_vs_reference(kind: str) -> None:
++    rng = np.random.default_rng(1234)
++    n_blocks = 5
++    raw = rng.integers(0, 256, size=(n_blocks, _SIZES[kind]), dtype=np.uint8)
++    raw[:, 0:4] = 0
++    raw[:, 0:2] = np.array([0x00, 0x38], dtype=np.uint8)
++
++    reference = _REFERENCE[kind].dequantize_blocks(raw).astype(np.float32).reshape(-1)
++    ours = _FUNCS[kind](raw.reshape(-1), (n_blocks * QK_K,))
++    np.testing.assert_array_equal(ours, reference)
++
++
++@pytest.mark.parametrize("kind", ["q4_k", "q5_k", "q6_k"])
++def test_shape_round_trip(kind: str) -> None:
++    rng = np.random.default_rng(7)
++    raw = rng.integers(0, 256, size=(2, 3, _SIZES[kind]), dtype=np.uint8)
++    raw[..., 0:4] = 0
++    out = _FUNCS[kind](raw.reshape(-1), (2, 3 * QK_K))
++    assert out.shape == (2, 3 * QK_K)
++    assert out.dtype == np.float32
++
++
++@pytest.mark.parametrize("kind", ["q4_k", "q5_k", "q6_k"])
++def test_wrong_byte_count(kind: str) -> None:
++    with pytest.raises(ValueError):
++        _FUNCS[kind](np.zeros(_SIZES[kind] + 1, dtype=np.uint8), (QK_K,))
++
++
++def test_misaligned_element_count() -> None:
++    with pytest.raises(ValueError):
++        dequantize_q4_k(np.zeros(64, dtype=np.uint8), (128,))
+-- 
+2.53.0.windows.2
+
+From c4c3715c92d81e1e74edc88869f7c969423b9d30 Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 20:34:36 +0800
+Subject: [PATCH 03/11] feat(gguf): read GGUF packs as dense bf16 through the
+ CUDA engine (P25)
+
+---
+ src/tensorfold/cuda/capacity.py               |  12 +-
+ src/tensorfold/families/__init__.py           |  13 +-
+ src/tensorfold/families/qwen3_5/__init__.py   |   2 +-
+ .../families/qwen3_5/cuda/affine_memory.py    |   5 +-
+ .../families/qwen3_5/cuda/weights.py          |  78 ++++++-
+ .../families/qwen3_5_moe/__init__.py          |  13 +-
+ src/tensorfold/gguf/hf.py                     | 202 ++++++++++++++++++
+ 7 files changed, 304 insertions(+), 21 deletions(-)
+ create mode 100644 src/tensorfold/gguf/hf.py
+
+diff --git a/src/tensorfold/cuda/capacity.py b/src/tensorfold/cuda/capacity.py
+index 18730cc..064328a 100644
+--- a/src/tensorfold/cuda/capacity.py
++++ b/src/tensorfold/cuda/capacity.py
+@@ -81,7 +81,9 @@ class Plan:
+ 
+ 
+ def config(model_dir: str | Path) -> dict:
+-    raw = json.loads((Path(model_dir) / "config.json").read_text())
++    from tensorfold.families import read_config
++
++    raw = read_config(model_dir)                     # config.json, or a GGUF's synthesized config
+     text = dict(raw.get("text_config") or raw)
+     text["_quantization"] = raw.get("quantization") or raw.get("quantization_config") or {}
+     return text
+@@ -98,6 +100,14 @@ def headers(model_dir: str | Path, *, rank: int | None = None, files: list[Path]
+         files = ([path / n for n in sorted(set(json.loads(index.read_text())["weight_map"].values()))]
+                  if index.exists() else sorted(path.glob("*.safetensors")))
+     if not files:
++        from tensorfold.gguf import hf
++
++        reader = hf.open_file(path)                  # a GGUF directory's tensor index comes from the file
++        if reader is not None:
++            try:
++                return hf.to_headers(reader)
++            finally:
++                reader.close()
+         raise ValueError("startup memory estimate needs the checkpoint tensor headers")
+     out = {}
+     for file in files:
+diff --git a/src/tensorfold/families/__init__.py b/src/tensorfold/families/__init__.py
+index 34fdb77..0223e97 100644
+--- a/src/tensorfold/families/__init__.py
++++ b/src/tensorfold/families/__init__.py
+@@ -48,7 +48,18 @@ def families() -> dict[str, Family]:
+ 
+ 
+ def read_config(model_dir: str | Path) -> dict[str, Any]:
+-    return json.loads((Path(model_dir) / "config.json").read_text())
++    path = Path(model_dir) / "config.json"
++    if path.is_file():
++        return json.loads(path.read_text())
++    from tensorfold.gguf import hf
++
++    reader = hf.open_file(model_dir)                 # a GGUF directory has no config.json
++    if reader is None:
++        raise FileNotFoundError(f"{path} is missing and {model_dir} holds no .gguf checkpoint")
++    try:
++        return hf.to_hf_config(reader)
++    finally:
++        reader.close()
+ 
+ 
+ RECIPES_URL = "https://github.com/ashhart/TensorFold/blob/main/docs/recipes/README.md"
+diff --git a/src/tensorfold/families/qwen3_5/__init__.py b/src/tensorfold/families/qwen3_5/__init__.py
+index 598863a..79792e7 100644
+--- a/src/tensorfold/families/qwen3_5/__init__.py
++++ b/src/tensorfold/families/qwen3_5/__init__.py
+@@ -12,7 +12,7 @@ TITLE = "Qwen3.8 dense"
+ LANES = True
+ MODELS = ("TensorFold/Qwen3.8-27B-MLX-4bit", "turboderp/Qwen3.8-27B-exl3", "nvidia/Qwen3.8-27B-NVFP4")
+ DRAFTER = "z-lab/Qwen3.8-27B-DFlash2"
+-QUANT_METHODS = {"cuda": ("mlx", "exl3", "modelopt", "compressed-tensors")}   # MLX affine, EXL3, NVFP4 / FP8
++QUANT_METHODS = {"cuda": ("mlx", "exl3", "modelopt", "compressed-tensors", "gguf")}   # MLX affine, EXL3, NVFP4 / FP8, GGUF
+ EXL3_VARIANT = "any"                           # every EXL3 codebook and width (tensorfold.families.EXL3_VARIANT_ANY)
+ KERNEL_PACKAGE = "tensorfold.kernels.qwen.dense.v1"
+ KERNEL_VERSION = "v1"
+diff --git a/src/tensorfold/families/qwen3_5/cuda/affine_memory.py b/src/tensorfold/families/qwen3_5/cuda/affine_memory.py
+index bb6bb6d..8adbaf8 100644
+--- a/src/tensorfold/families/qwen3_5/cuda/affine_memory.py
++++ b/src/tensorfold/families/qwen3_5/cuda/affine_memory.py
+@@ -3,7 +3,6 @@
+ from __future__ import annotations
+ 
+ from functools import lru_cache
+-import json
+ import math
+ from pathlib import Path
+ 
+@@ -17,8 +16,10 @@ def weight_transform(model_dir, *, one_gpu: bool = False):
+ 
+     @lru_cache(maxsize=1)
+     def metadata():
++        from tensorfold.families import read_config
++
+         path = Path(model_dir)
+-        return json.loads((path / "config.json").read_text()), headers(path)
++        return read_config(path), headers(path)
+ 
+     def tiled(path: str) -> bool:
+         """4-bit words in groups of 64 with bf16 scales and biases: what loading tiles."""
+diff --git a/src/tensorfold/families/qwen3_5/cuda/weights.py b/src/tensorfold/families/qwen3_5/cuda/weights.py
+index 7f8d09d..a4496c2 100644
+--- a/src/tensorfold/families/qwen3_5/cuda/weights.py
++++ b/src/tensorfold/families/qwen3_5/cuda/weights.py
+@@ -135,15 +135,21 @@ class Config:
+ 
+     @classmethod
+     def read(cls, model_dir: str | Path) -> "Config":
+-        raw = json.loads((Path(model_dir) / "config.json").read_text())
++        from tensorfold.families import read_config
++
++        model_dir = Path(model_dir)
++        gen = model_dir / "generation_config.json"
++        # EXL3 packs name the chat turn's end, <|im_end|>, in generation_config.json only
++        gen_eos = json.loads(gen.read_text()).get("eos_token_id") if gen.exists() else None
++        return cls.from_raw(read_config(model_dir), gen_eos=gen_eos)
++
++    @classmethod
++    def from_raw(cls, raw: dict, *, gen_eos=None) -> "Config":
+         t = raw.get("text_config", raw)
+         rope = t.get("rope_parameters") or {}
+         head_dim = int(t.get("head_dim") or t["hidden_size"] // t["num_attention_heads"])
+-        gen = Path(model_dir) / "generation_config.json"
+         found: list[int] = []
+-        # EXL3 packs name the chat turn's end, <|im_end|>, in generation_config.json only
+-        for value in (raw.get("eos_token_id", t.get("eos_token_id")),
+-                      json.loads(gen.read_text()).get("eos_token_id") if gen.exists() else None):
++        for value in (raw.get("eos_token_id", t.get("eos_token_id")), gen_eos):
+             found += [] if value is None else [int(e) for e in value] if isinstance(value, list) else [int(value)]
+         if not found:
+             raise ValueError("no eos_token_id in config.json or generation_config.json")
+@@ -269,12 +275,16 @@ class _Tensors:
+ 
+ def load(model_dir: str | Path, device: str = "cuda", *, tiled: bool = False, mlp=None,
+          nvfp4_mlp=None) -> Weights:
+-    """MLX affine 4-bit (``tiled``: projections packed as read; ``mlp(prefix, get, qlinear, cfg)``: a layer's MLP fields), an EXL3 pack, or NVFP4 (``nvfp4_mlp(prefix, tensors, cfg)``: a layer's MLP fields)."""
++    """MLX affine 4-bit (``tiled``: projections packed as read; ``mlp(prefix, get, qlinear, cfg)``: a layer's MLP fields), an EXL3 pack, NVFP4 (``nvfp4_mlp(prefix, tensors, cfg)``: a layer's MLP fields), or a GGUF checkpoint dequantized to bf16 dense."""
+ 
+     from .exl3_load import load_exl3, quant_config
+     from .nvfp4_load import load_nvfp4, quantized
++    from tensorfold.gguf import hf
+ 
+     model_dir = Path(model_dir)
++    gguf = hf.find_file(model_dir)
++    if gguf is not None:
++        return load_gguf(gguf, device, tiled=tiled, mlp=mlp)
+     if quant_config(model_dir) is not None:
+         return load_exl3(model_dir, device)
+     if quantized(model_dir):
+@@ -312,6 +322,12 @@ def load(model_dir: str | Path, device: str = "cuda", *, tiled: bool = False, ml
+             return tile(q)                                 # tile() leaves any format but 4-bit g64 as stored
+         return q
+ 
++    return _assemble(cfg, get, qlinear, device, tiled=tiled, mlp=mlp, leftover=lambda: list(t), close=t.close)
++
++
++def _assemble(cfg: "Config", get, qlinear, device: str, *, tiled: bool, mlp, leftover=None, close=None) -> Weights:
++    """Build ``Weights`` from a config and a ``get``/``qlinear`` pair, whatever format they read."""
++
+     layers = []
+     for i in range(cfg.layers):
+         p = f"model.layers.{i}."
+@@ -339,10 +355,52 @@ def load(model_dir: str | Path, device: str = "cuda", *, tiled: bool = False, ml
+     half = cfg.rope_dims // 2
+     inv = cfg.rope_theta ** (-torch.arange(0, half, dtype=torch.float64) / half)
+     w.inv_freq = inv.to(torch.float32).to(device)
+-    left = list(t)
+-    t.close()
+-    if left:
+-        raise ValueError(f"unused checkpoint tensors: {left[:5]} ...")
++    if close is not None:
++        close()
++    if leftover is not None:
++        left = leftover()
++        if left:
++            raise ValueError(f"unused checkpoint tensors: {left[:5]} ...")
+     if tiled:
+         torch.cuda.empty_cache()
+     return w
++
++
++def load_gguf(gguf_path: str | Path, device: str = "cuda", *, tiled: bool = False, mlp=None) -> Weights:
++    """A GGUF checkpoint, its tensors dequantized to bf16 and read through the dense (``layout='dense'``) kernels."""
++
++    import numpy as np
++
++    from tensorfold.gguf import GgufReader
++    from tensorfold.gguf import hf
++
++    reader = GgufReader(gguf_path)
++    try:
++        back = {mapped: gguf for gguf, mapped in hf.name_map(reader).items()}
++        if hf.tied_lm_head(reader):
++            back["lm_head.weight"] = back["model.embed_tokens.weight"]
++        cache: dict[str, torch.Tensor] = {}
++
++        def get(name: str) -> torch.Tensor:
++            gguf_name = back.get(name)
++            if gguf_name is None:
++                raise ValueError(f"GGUF checkpoint has no tensor for {name}")
++            held = cache.get(gguf_name)
++            if held is None:
++                array = np.ascontiguousarray(reader.dequant(gguf_name))
++                held = torch.from_numpy(array).to(device)
++                held = held.to(torch.float32 if name.endswith((".A_log", ".dt_bias")) else torch.bfloat16)
++                held = held.contiguous()
++                cache[gguf_name] = held
++            return held
++
++        def qlinear(name: str, pack: bool = True) -> QLinear:
++            w = get(name + ".weight")
++            if w.ndim != 2:
++                raise ValueError(f"{name} is not a 2-D projection in this GGUF checkpoint")
++            return QLinear(w, None, None, layout="dense", bits=0, gs=0)
++
++        cfg = Config.from_raw(hf.to_hf_config(reader))
++        return _assemble(cfg, get, qlinear, device, tiled=tiled, mlp=mlp)
++    finally:
++        reader.close()
+diff --git a/src/tensorfold/families/qwen3_5_moe/__init__.py b/src/tensorfold/families/qwen3_5_moe/__init__.py
+index 5389214..219b24e 100644
+--- a/src/tensorfold/families/qwen3_5_moe/__init__.py
++++ b/src/tensorfold/families/qwen3_5_moe/__init__.py
+@@ -16,23 +16,24 @@ DRAFTER = ""                  # Macs and CUDA draft with the checkpoint's MTP la
+ DFLASH = "z-lab/Qwen3.6-35B-A3B-DFlash"       # Macs, --drafter: chains of each position's own argmax
+ KERNEL_PACKAGE = "tensorfold.kernels.qwen.dense.v1"
+ KERNEL_VERSION = "v1"
+-# the CUDA engine's kernels read MLX affine weights of this (bits, group size), or an NVFP4 / FP8 export
+-QUANT_METHODS = {"cuda": ("mlx", "modelopt", "compressed-tensors")}
++# the CUDA engine's kernels read MLX affine weights of this (bits, group size), an NVFP4 / FP8 export, or a GGUF pack
++QUANT_METHODS = {"cuda": ("mlx", "modelopt", "compressed-tensors", "gguf")}
+ CUDA_QUANTIZATION = (4, 64)
+ CUDA_PREFILL_FP8 = True            # --prefill-fp8: the attention and DeltaNet projections' FP8 prompt kernel
+ 
+ 
+ def check(model_dir: str | Path) -> None:
+-    """One GPU: MLX 4-bit weights in groups of 64, or a ModelOpt/compressed-tensors NVFP4 (W4A16-packed) export."""
++    """One GPU: MLX 4-bit weights in groups of 64, a ModelOpt/compressed-tensors NVFP4 (W4A16-packed) export, or a
++    GGUF pack dequantized to bf16 dense."""
+ 
+     from tensorfold.families import OWN_MODEL_HELP, describe_quantization, quant_method, quantization, read_config
+ 
+     config = read_config(model_dir)
+-    if quant_method(config) in ("modelopt", "compressed-tensors"):
++    if quant_method(config) in ("modelopt", "compressed-tensors", "gguf"):
+         return
+     if quantization(config) != CUDA_QUANTIZATION:
+-        raise ValueError(f"{TITLE}'s CUDA engine reads MLX 4-bit weights in groups of 64 ({MODELS[0]}) or an NVFP4 "
+-                         f"export; this checkpoint has {describe_quantization(read_config(model_dir))}. {OWN_MODEL_HELP}")
++        raise ValueError(f"{TITLE}'s CUDA engine reads MLX 4-bit weights in groups of 64 ({MODELS[0]}), an NVFP4 "
++                         f"export, or a GGUF pack; this checkpoint has {describe_quantization(config)}. {OWN_MODEL_HELP}")
+ 
+ 
+ def mtp_file(model_dir: Path) -> Path | None:
+diff --git a/src/tensorfold/gguf/hf.py b/src/tensorfold/gguf/hf.py
+new file mode 100644
+index 0000000..849cd8d
+--- /dev/null
++++ b/src/tensorfold/gguf/hf.py
+@@ -0,0 +1,202 @@
++"""Read a GGUF checkpoint as a dense bf16 model: an HF-style config, header index and tensor names.
++
++A GGUF file carries its hyperparameters and tensors under llama.cpp names; the CUDA
++loaders here expect a Hugging Face ``config.json`` and ``model.layers.*`` tensor names.
++This module bridges the two so a GGUF directory can be detected, admitted and loaded
++through the same code paths a safetensors checkpoint uses.
++"""
++from __future__ import annotations
++
++from pathlib import Path
++
++from .reader import GgufReader
++
++# llama.cpp general.architecture -> TensorFold model_type
++ARCH_MODEL_TYPES = {
++    "qwen35": "qwen3_5",
++    "qwen35moe": "qwen3_5_moe",
++}
++
++# GGUF block tensor suffix -> HF module suffix (Qwen3.5 Gated-DeltaNet + attention, shared FFN)
++_BLOCK = {
++    "attn_norm.weight": "input_layernorm.weight",
++    "post_attention_norm.weight": "post_attention_layernorm.weight",
++    "ffn_gate.weight": "mlp.gate_proj.weight",
++    "ffn_up.weight": "mlp.up_proj.weight",
++    "ffn_down.weight": "mlp.down_proj.weight",
++    # Gated DeltaNet (linear attention) layers
++    "attn_qkv.weight": "linear_attn.in_proj_qkv.weight",
++    "attn_gate.weight": "linear_attn.in_proj_z.weight",
++    "ssm_alpha.weight": "linear_attn.in_proj_a.weight",
++    "ssm_beta.weight": "linear_attn.in_proj_b.weight",
++    "ssm_out.weight": "linear_attn.out_proj.weight",
++    "ssm_conv1d.weight": "linear_attn.conv1d.weight",
++    "ssm_a": "linear_attn.A_log",
++    "ssm_dt.bias": "linear_attn.dt_bias",
++    "ssm_norm.weight": "linear_attn.norm.weight",
++    # full-attention layers
++    "attn_q.weight": "self_attn.q_proj.weight",
++    "attn_k.weight": "self_attn.k_proj.weight",
++    "attn_v.weight": "self_attn.v_proj.weight",
++    "attn_output.weight": "self_attn.o_proj.weight",
++    "attn_q_norm.weight": "self_attn.q_norm.weight",
++    "attn_k_norm.weight": "self_attn.k_norm.weight",
++}
++
++_GLOBAL = {
++    "token_embd.weight": "model.embed_tokens.weight",
++    "output_norm.weight": "model.norm.weight",
++    "output.weight": "lm_head.weight",
++}
++
++_F32_NAMES = (".A_log", ".dt_bias")
++
++
++def find_file(model_dir: str | Path) -> Path | None:
++    """The GGUF file of a directory, or None when the directory holds none."""
++
++    files = sorted(Path(model_dir).glob("*.gguf"))
++    return files[0] if files else None
++
++
++def has_gguf(model_dir: str | Path) -> bool:
++    return find_file(model_dir) is not None
++
++
++def open_file(model_dir: str | Path) -> GgufReader | None:
++    path = find_file(model_dir)
++    return None if path is None else GgufReader(path)
++
++
++def model_type(reader: GgufReader) -> str:
++    arch = reader.architecture or ""
++    known = ARCH_MODEL_TYPES.get(arch)
++    if known is None:
++        raise NotImplementedError(
++            f"GGUF architecture {arch!r} is not supported yet (known: {', '.join(sorted(ARCH_MODEL_TYPES))})")
++    return known
++
++
++def hf_name(gguf_name: str) -> str | None:
++    """The Hugging Face tensor name a GGUF tensor maps to, or None when it has no dense equivalent."""
++
++    if gguf_name in _GLOBAL:
++        return _GLOBAL[gguf_name]
++    if gguf_name.startswith("blk."):
++        _, index, rest = gguf_name.split(".", 2)
++        suffix = _BLOCK.get(rest)
++        return None if suffix is None else f"model.layers.{index}.{suffix}"
++    return None
++
++
++def name_map(reader: GgufReader) -> dict[str, str]:
++    """GGUF tensor name -> HF tensor name, for every tensor this reader maps."""
++
++    out = {}
++    for name in reader.keys():
++        mapped = hf_name(name)
++        if mapped is not None:
++            out[name] = mapped
++    return out
++
++
++def tied_lm_head(reader: GgufReader) -> bool:
++    """Whether the checkpoint ties the output head to the token embedding (no separate output.weight)."""
++
++    return "output.weight" not in reader
++
++
++def _section(reader: GgufReader) -> tuple[int, int, int]:
++    values = reader.field("qwen35.rope.dimension_sections") or reader.field(
++        f"{reader.architecture}.rope.dimension_sections") or []
++    values = [int(v) for v in values][:3]
++    while len(values) < 3:
++        values.append(0)
++    return values[0], values[1], values[2]
++
++
++def to_hf_config(reader: GgufReader) -> dict:
++    """An HF-style config dict (with a ``text_config`` and a gguf quantization block) for a Qwen3.5 GGUF."""
++
++    arch = reader.architecture or ""
++    prefix = f"{arch}."
++
++    def get(key: str, default=None):
++        return reader.field(prefix + key, default)
++
++    mt = model_type(reader)
++    hidden = int(get("embedding_length"))
++    heads = int(get("attention.head_count"))
++    head_dim = int(get("attention.key_length") or hidden // heads)
++    interval = int(get("full_attention_interval", 4))
++    layers = int(get("block_count"))
++    eps = float(get("attention.layer_norm_rms_epsilon", 1e-6))
++    rope_dims = int(get("rope.dimension_count") or head_dim // 4)
++    rope = {
++        "rope_theta": float(get("rope.freq_base", 10000000.0)),
++        "partial_rotary_factor": rope_dims / head_dim,
++        "mrope_section": list(_section(reader)),
++    }
++    vocab = int(reader.info("token_embd.weight").shape[0]) if "token_embd.weight" in reader \
++        else len(reader.field("tokenizer.ggml.tokens") or [])
++    eos = reader.field("tokenizer.ggml.eos_token_id", 0)
++    eos = list(eos) if isinstance(eos, (list, tuple)) else [eos]
++    text = {
++        "model_type": mt,
++        "hidden_size": hidden,
++        "intermediate_size": int(get("feed_forward_length")),
++        "num_hidden_layers": layers,
++        "num_attention_heads": heads,
++        "num_key_value_heads": int(get("attention.head_count_kv", heads)),
++        "head_dim": head_dim,
++        "vocab_size": vocab,
++        "linear_num_key_heads": int(get("ssm.group_count")),
++        "linear_num_value_heads": int(get("ssm.group_count")),
++        "linear_key_head_dim": int(get("ssm.state_size")),
++        "linear_value_head_dim": int(get("ssm.state_size")),
++        "linear_conv_kernel_dim": int(get("ssm.conv_kernel", 4)),
++        "full_attention_interval": interval,
++        "rms_norm_eps": eps,
++        "rope_parameters": rope,
++        "rope_theta": rope["rope_theta"],
++        "partial_rotary_factor": rope["partial_rotary_factor"],
++        "max_position_embeddings": int(get("context_length", 0)),
++        "num_experts": int(get("expert_count", 0)),
++        "num_experts_per_tok": int(get("expert_used_count", 0)),
++        "moe_intermediate_size": int(get("expert_feed_forward_length", 0)),
++        "tie_word_embeddings": tied_lm_head(reader),
++        "layer_types": ["full_attention" if (i + 1) % interval == 0 else "linear_attention" for i in range(layers)],
++    }
++    return {
++        "model_type": mt,
++        "text_config": text,
++        "max_position_embeddings": text["max_position_embeddings"],
++        "eos_token_id": eos,
++        "tie_word_embeddings": text["tie_word_embeddings"],
++        "quantization_config": {"quant_method": "gguf"},
++    }
++
++
++def to_headers(reader: GgufReader) -> dict:
++    """A safetensors-shaped header index (HF names) of the dequantized (bf16, fp32 for A_log/dt_bias) tensors."""
++
++    dtype_of = lambda name: "F32" if name.endswith(_F32_NAMES) else "BF16"  # noqa: E731
++    item = {"F32": 4, "BF16": 2}
++    out = {}
++    for gguf_name, mapped in name_map(reader).items():
++        shape = list(reader.info(gguf_name).shape)
++        dtype = dtype_of(mapped)
++        n_bytes = 1
++        for dim in shape:
++            n_bytes *= dim
++        n_bytes *= item[dtype]
++        out[mapped] = {"dtype": dtype, "shape": shape, "data_offsets": [0, n_bytes]}
++    if tied_lm_head(reader):                      # the head is a view of the embedding
++        embed = out.get("model.embed_tokens.weight")
++        if embed is not None:
++            out["lm_head.weight"] = dict(embed)
++    return out
++
++
++__all__ = ["ARCH_MODEL_TYPES", "find_file", "has_gguf", "hf_name", "model_type", "name_map", "open_file",
++           "tied_lm_head", "to_hf_config", "to_headers"]
+-- 
+2.53.0.windows.2
+
+From d51ac2775a5820aecd6bbd18d27a0f07b734e639 Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 20:45:06 +0800
+Subject: [PATCH 04/11] fix(gguf): resolve_affine returns None for gguf so
+ dense packs skip affine metadata (P25)
+
+---
+ src/tensorfold/quantization.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/tensorfold/quantization.py b/src/tensorfold/quantization.py
+index 5e4d9ef..b3e43d4 100644
+--- a/src/tensorfold/quantization.py
++++ b/src/tensorfold/quantization.py
+@@ -52,6 +52,8 @@ def resolve_affine(config: dict, path: str | None = None) -> AffineSpec | None:
+     if block is None:
+         return None
+     method = block.get('quant_method')
++    if method == 'gguf':
++        return None
+     if method not in (None, 'mlx', 'affine'):
+         raise ValueError(f'{method} is not an MLX affine checkpoint')
+     global_spec = _spec(block)
+-- 
+2.53.0.windows.2
+
+From f377e7a165fe55d53f717d8240445f7f7a708f01 Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 21:10:50 +0800
+Subject: [PATCH 05/11] fix(gguf): map linear_num_value_heads from
+ ssm.time_step_rank (27B: 48 value vs 16 key heads)
+
+---
+ src/tensorfold/gguf/hf.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/tensorfold/gguf/hf.py b/src/tensorfold/gguf/hf.py
+index 849cd8d..ed549fd 100644
+--- a/src/tensorfold/gguf/hf.py
++++ b/src/tensorfold/gguf/hf.py
+@@ -151,7 +151,7 @@ def to_hf_config(reader: GgufReader) -> dict:
+         "head_dim": head_dim,
+         "vocab_size": vocab,
+         "linear_num_key_heads": int(get("ssm.group_count")),
+-        "linear_num_value_heads": int(get("ssm.group_count")),
++        "linear_num_value_heads": int(get("ssm.time_step_rank", get("ssm.group_count"))),
+         "linear_key_head_dim": int(get("ssm.state_size")),
+         "linear_value_head_dim": int(get("ssm.state_size")),
+         "linear_conv_kernel_dim": int(get("ssm.conv_kernel", 4)),
+-- 
+2.53.0.windows.2
+
+From 76b36354eb240e214fa97848fe0d0ae7899b0976 Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 22:24:11 +0800
+Subject: [PATCH 06/11] fix(gguf): reverse llama.cpp GDN V-head tiling +
+ ssm_a->A_log (27B)
+
+Reverses the grouped<->tiled V-head reorder llama.cpp bakes into GGUF (its own inverse) for in_proj_qkv/z/a/b, dt_bias, conv1d, out_proj; maps ssm_a=-exp(A_log) back to A_log=log(-A). Mirrors vLLM vllm-gguf-plugin adapter + PR#144.
+---
+ .../families/qwen3_5/cuda/weights.py          | 46 ++++++++++++++++++-
+ 1 file changed, 44 insertions(+), 2 deletions(-)
+
+diff --git a/src/tensorfold/families/qwen3_5/cuda/weights.py b/src/tensorfold/families/qwen3_5/cuda/weights.py
+index a4496c2..8eebdc6 100644
+--- a/src/tensorfold/families/qwen3_5/cuda/weights.py
++++ b/src/tensorfold/families/qwen3_5/cuda/weights.py
+@@ -381,6 +381,49 @@ def load_gguf(gguf_path: str | Path, device: str = "cuda", *, tiled: bool = Fals
+             back["lm_head.weight"] = back["model.embed_tokens.weight"]
+         cache: dict[str, torch.Tensor] = {}
+ 
++        hc = hf.to_hf_config(reader)
++        cfg = Config.from_raw(hc)
++        kh, vh, dk, dv = cfg.k_heads, cfg.v_heads, cfg.dk, cfg.dv
++        vpk = vh // kh if kh else 1
++        apply_reorder = kh > 0 and vh > 0 and kh != vh
++
++        def _spread(t: torch.Tensor, dim: int, head_dim: int) -> torch.Tensor:
++            # llama.cpp's grouped->tiled V-head reorder is a transpose of (num_k_heads,
++            # num_v_per_k) in the head dimensions, so it is its own inverse: applying it to
++            # the GGUF (tiled) weight restores the HF (grouped) order TensorFold reads.
++            shape = list(t.shape)
++            new = shape[:dim] + [kh, vpk, head_dim] + shape[dim + 1:]
++            t = t.reshape(*new)
++            perm = list(range(len(new)))
++            perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
++            return t.permute(*perm).contiguous().reshape(*shape)
++
++        def _reorder(name: str, t: torch.Tensor) -> torch.Tensor:
++            if not apply_reorder or "linear_attn." not in name:
++                return t
++            if name.endswith(".linear_attn.in_proj_qkv.weight"):
++                qk = 2 * kh * dk
++                return torch.cat([t[:qk], _spread(t[qk:], 0, dv)], dim=0)
++            if name.endswith(".linear_attn.in_proj_z.weight"):
++                return _spread(t, 0, dv)
++            if name.endswith((".linear_attn.in_proj_a.weight", ".linear_attn.in_proj_b.weight")):
++                return _spread(t, 0, 1)
++            if name.endswith(".linear_attn.A_log"):
++                # llama.cpp stores ssm_a as A = -exp(A_log); the TensorFold kernel wants A_log.
++                if t.ndim == 1:
++                    return torch.log(-_spread(t.unsqueeze(-1), 0, 1).squeeze(-1))
++                return torch.log(-_spread(t, -1, 1))
++            if name.endswith(".linear_attn.dt_bias"):
++                if t.ndim == 1:
++                    return _spread(t.unsqueeze(-1), 0, 1).squeeze(-1)
++                return _spread(t, -1, 1)
++            if name.endswith(".linear_attn.conv1d.weight"):
++                qk = 2 * kh * dk
++                return torch.cat([t[:qk], _spread(t[qk:], 0, dv)], dim=0)
++            if name.endswith(".linear_attn.out_proj.weight"):
++                return _spread(t, 1, dv)
++            return t
++
+         def get(name: str) -> torch.Tensor:
+             gguf_name = back.get(name)
+             if gguf_name is None:
+@@ -390,7 +433,7 @@ def load_gguf(gguf_path: str | Path, device: str = "cuda", *, tiled: bool = Fals
+                 array = np.ascontiguousarray(reader.dequant(gguf_name))
+                 held = torch.from_numpy(array).to(device)
+                 held = held.to(torch.float32 if name.endswith((".A_log", ".dt_bias")) else torch.bfloat16)
+-                held = held.contiguous()
++                held = _reorder(name, held.contiguous())
+                 cache[gguf_name] = held
+             return held
+ 
+@@ -400,7 +443,6 @@ def load_gguf(gguf_path: str | Path, device: str = "cuda", *, tiled: bool = Fals
+                 raise ValueError(f"{name} is not a 2-D projection in this GGUF checkpoint")
+             return QLinear(w, None, None, layout="dense", bits=0, gs=0)
+ 
+-        cfg = Config.from_raw(hf.to_hf_config(reader))
+         return _assemble(cfg, get, qlinear, device, tiled=tiled, mlp=mlp)
+     finally:
+         reader.close()
+-- 
+2.53.0.windows.2
+
+From 2fae2a47ea34a2bed06c9cbaee5b4d16bf27b012 Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 22:45:58 +0800
+Subject: [PATCH 07/11] fix(gguf): correct GDN V-head reorder direction
+ (tiled->grouped)
+
+_spread reshaped the head axis as (kh, vpk) then transposed; GGML/vLLM's
+weight_to_vllm uses (heads_per_group=vpk, num_groups=kh), i.e.
+out[g]=in[(g%vpk)*kh + g//vpk]. A (kh,vpk) transpose is not an involution
+(kh!=vpk), so the previous code applied the inverse permutation, corrupting
+every GDN value-head tensor (in_proj_qkv/z, a/b, A_log, dt_bias, conv1d,
+out_proj) -> garbage logits and repetition after ~20 tokens.
+
+Verified: reference.py first-token argmax 17x23 -> '3' (matches llama.cpp
+oracle), 2+2 -> '4', Count -> '1'; E2E serve 27B Q4_K_M: 391 / Hello! / 4,
+105-token story coherent with no repetition.
+---
+ src/tensorfold/families/qwen3_5/cuda/weights.py | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/src/tensorfold/families/qwen3_5/cuda/weights.py b/src/tensorfold/families/qwen3_5/cuda/weights.py
+index 8eebdc6..6914af5 100644
+--- a/src/tensorfold/families/qwen3_5/cuda/weights.py
++++ b/src/tensorfold/families/qwen3_5/cuda/weights.py
+@@ -388,11 +388,14 @@ def load_gguf(gguf_path: str | Path, device: str = "cuda", *, tiled: bool = Fals
+         apply_reorder = kh > 0 and vh > 0 and kh != vh
+ 
+         def _spread(t: torch.Tensor, dim: int, head_dim: int) -> torch.Tensor:
+-            # llama.cpp's grouped->tiled V-head reorder is a transpose of (num_k_heads,
+-            # num_v_per_k) in the head dimensions, so it is its own inverse: applying it to
+-            # the GGUF (tiled) weight restores the HF (grouped) order TensorFold reads.
++            # llama.cpp stores GDN value-heads in tiled order (member-major within each
++            # k-head). GGML/vLLM's weight_to_vllm restores grouped order with a
++            # (heads_per_group, num_k_heads, head_dim) reshape+transpose, i.e.
++            # out[g] = in[(g % vpk) * kh + g // vpk]. A (kh, vpk) transpose is NOT an
++            # involution when kh != vpk, so the reshape order (vpk, kh) matters: it must
++            # match (heads_per_group, num_groups).
+             shape = list(t.shape)
+-            new = shape[:dim] + [kh, vpk, head_dim] + shape[dim + 1:]
++            new = shape[:dim] + [vpk, kh, head_dim] + shape[dim + 1:]
+             t = t.reshape(*new)
+             perm = list(range(len(new)))
+             perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+-- 
+2.53.0.windows.2
+
+From b1777c4ac8cad83821d070edc54d46e10f0f0bc0 Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 23:22:32 +0800
+Subject: [PATCH 08/11] feat(gguf): synthesize tokenizer.json from GGUF
+ metadata (bare GGUF dirs)
+
+ensure_sidecar() builds a HF tokenizer.json + tokenizer_config.json straight
+from the GGUF tokenizer fields (vocab, merges, token_type, chat_template),
+mirroring the Qwen2 byte-level BPE pre-tokenizer (NFC + Split regex + ByteLevel)
+so tokenization is byte-identical to the reference Qwen sidecar.
+
+- gguf/tokenizer.py: build_tokenizer_json, build_tokenizer_config, ensure_sidecar
+  (excludes type-5 UNUSED tokens; special ids = control+user_defined+bos/eos/pad).
+- cli.py: call ensure_sidecar after hub.resolve for any GGUF dir (prints written names).
+- gguf/__init__.py: export ensure_sidecar, has_gguf.
+- tests/test_gguf_tokenizer.py: structure + config + round-trip + skip-when-present.
+
+Validated on 27B Q4_K_M: synthesized tokenizer tokenizes 12/12 samples identically
+to the real sidecar; a bare dir (only the .gguf) auto-writes the tokenizer and
+serves 2+2 -> 4.
+---
+ src/tensorfold/cli.py            |   5 +
+ src/tensorfold/gguf/__init__.py  |   5 +-
+ src/tensorfold/gguf/tokenizer.py | 157 +++++++++++++++++++++++++++++++
+ tests/test_gguf_tokenizer.py     |  65 +++++++++++++
+ 4 files changed, 231 insertions(+), 1 deletion(-)
+ create mode 100644 src/tensorfold/gguf/tokenizer.py
+ create mode 100644 tests/test_gguf_tokenizer.py
+
+diff --git a/src/tensorfold/cli.py b/src/tensorfold/cli.py
+index d2039d2..c42387e 100644
+--- a/src/tensorfold/cli.py
++++ b/src/tensorfold/cli.py
+@@ -375,6 +375,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
+     needs_full_snapshot = hub.is_repo_id(args.model) and not hub._cached_weights_complete(
+         config_dir, required_files=required_files)
+     model_dir = hub.resolve(args.model, required_files=required_files)
++    from tensorfold.gguf import ensure_sidecar, has_gguf
++    if has_gguf(model_dir):
++        written = ensure_sidecar(model_dir)      # a bare GGUF dir gets tokenizer.json from its own metadata
++        if written:
++            print(f"[tensorfold] wrote {' and '.join(written)} from the GGUF tokenizer metadata", flush=True)
+     if needs_full_snapshot and check is not None:
+         check(model_dir)                         # checks that need the complete index, such as an MTP head
+ 
+diff --git a/src/tensorfold/gguf/__init__.py b/src/tensorfold/gguf/__init__.py
+index 148925d..8853a5b 100644
+--- a/src/tensorfold/gguf/__init__.py
++++ b/src/tensorfold/gguf/__init__.py
+@@ -1,5 +1,8 @@
+ """GGUF checkpoint reading: memory-mapped metadata, a tensor index and Q8_0 dequantization."""
+ from .dequant import BLOCK_Q8_0, DEQUANTIZERS, QK8_0, dequantize_q8_0
++from .hf import has_gguf
+ from .reader import GgufReader, GgufTensor
++from .tokenizer import ensure_sidecar
+ 
+-__all__ = ["BLOCK_Q8_0", "DEQUANTIZERS", "GgufReader", "GgufTensor", "QK8_0", "dequantize_q8_0"]
++__all__ = ["BLOCK_Q8_0", "DEQUANTIZERS", "GgufReader", "GgufTensor", "QK8_0", "dequantize_q8_0",
++           "ensure_sidecar", "has_gguf"]
+diff --git a/src/tensorfold/gguf/tokenizer.py b/src/tensorfold/gguf/tokenizer.py
+new file mode 100644
+index 0000000..6f171ce
+--- /dev/null
++++ b/src/tensorfold/gguf/tokenizer.py
+@@ -0,0 +1,157 @@
++"""Synthesize a Hugging Face ``tokenizer.json`` from a GGUF file's embedded tokenizer metadata.
++
++A GGUF file carries its vocabulary (``tokenizer.ggml.tokens``), merge rules
++(``tokenizer.ggml.merges``), special-token ids and chat template under llama.cpp keys,
++but TensorFold's CUDA server loads a Hugging Face ``tokenizer.json`` from the model
++directory. This module rebuilds that file (and a small ``tokenizer_config.json``) so a
++bare GGUF directory needs no hand-copied sidecar.
++"""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++from .hf import open_file
++
++# llama.cpp tokenizer.ggml.token_type: 1=NORMAL, 2=UNKNOWN, 3=CONTROL, 4=USER_DEFINED,
++# 5=UNUSED, 6=BYTE.
++_CONTROL = 3
++_USER_DEFINED = 4
++_UNUSED = 5
++
++# The Qwen2 pre-tokenizer regex (matches the HF Qwen tokenizer.json): letters stay word-initial
++# with one preceding punctuation byte, digits are isolated per byte, so BPE can merge '(x' etc.
++_QWEN_SPLIT_RE = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}"
++                  r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
++
++
++def _as_list(value) -> list:
++    if value is None:
++        return []
++    if isinstance(value, str):
++        return [value]
++    try:
++        return list(value)
++    except TypeError:                                # a scalar metadata value (e.g. a numpy int)
++        return [value]
++
++
++def build_tokenizer_json(reader) -> dict:
++    """A Hugging Face ``tokenizer.json`` dict for a GPT-2-style (byte-level BPE) GGUF tokenizer."""
++
++    tokens = [str(t) for t in _as_list(reader.field("tokenizer.ggml.tokens"))]
++    if not tokens:
++        raise ValueError("GGUF file carries no tokenizer.ggml.tokens")
++    types = [int(t) for t in _as_list(reader.field("tokenizer.ggml.token_type"))]
++    merges = [str(m) for m in _as_list(reader.field("tokenizer.ggml.merges"))]
++
++    vocab: dict[str, int] = {}
++    for i, token in enumerate(tokens):
++        token_type = types[i] if i < len(types) else 1
++        if token_type == _UNUSED:                    # llama.cpp marks padding slots 5=UNUSED; they are not real tokens
++            continue
++        vocab[token] = i
++
++    special_ids: set[int] = set()
++    for kind, token_type in zip(tokens, types):
++        if token_type in (_CONTROL, _USER_DEFINED):
++            special_ids.add(vocab[kind])
++    for key in ("tokenizer.ggml.bos_token_id", "tokenizer.ggml.eos_token_id", "tokenizer.ggml.padding_token_id"):
++        for tid in _as_list(reader.field(key)):
++            special_ids.add(int(tid))
++
++    added_tokens = [
++        {"id": i, "content": tokens[i], "single_word": False, "lstrip": False,
++         "rstrip": False, "normalized": False, "special": True}
++        for i in sorted(special_ids) if 0 <= i < len(tokens)
++    ]
++
++    return {
++        "version": "1.0",
++        "truncation": None,
++        "padding": None,
++        "added_tokens": added_tokens,
++        "normalizer": {"type": "NFC"},
++        "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
++            {"type": "Split", "pattern": {"Regex": _QWEN_SPLIT_RE}, "behavior": "Isolated", "invert": False},
++            {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": True, "use_regex": False},
++        ]},
++        "post_processor": None,
++        "decoder": {"type": "ByteLevel", "add_prefix_space": True,
++                    "trim_offsets": True, "use_regex": True},
++        "model": {
++            "type": "BPE",
++            "dropout": None,
++            "unk_token": None,
++            "continuing_subword_prefix": None,
++            "end_of_word_suffix": None,
++            "fuse_unk": False,
++            "byte_fallback": False,
++            "vocab": vocab,
++            "merges": [m.split(" ", 1) for m in merges if m],
++        },
++    }
++
++
++def build_tokenizer_config(reader) -> dict:
++    """A minimal ``tokenizer_config.json`` (chat template + special tokens) for a GGUF model."""
++
++    def first(key):
++        for value in _as_list(reader.field(key)):
++            return value
++        return None
++
++    tokens = [str(t) for t in _as_list(reader.field("tokenizer.ggml.tokens"))]
++
++    def token_of(key) -> str | None:
++        index = first(key)
++        return tokens[int(index)] if index is not None and int(index) < len(tokens) else None
++
++    config = {
++        "tokenizer_class": "Qwen2Tokenizer",
++        "model_max_length": int(reader.field("tokenizer.ggml.model_max_length", 131072) or 131072),
++        "add_bos_token": bool(reader.field("tokenizer.ggml.add_bos_token", False)),
++        "add_eos_token": bool(reader.field("tokenizer.ggml.add_eos_token", False)),
++        "clean_up_tokenization_spaces": False,
++    }
++    for key, name in (("tokenizer.ggml.bos_token_id", "bos_token"),
++                      ("tokenizer.ggml.eos_token_id", "eos_token"),
++                      ("tokenizer.ggml.padding_token_id", "pad_token"),
++                      ("tokenizer.ggml.unknown_token_id", "unk_token")):
++        token = token_of(key)
++        if token is not None:
++            config[name] = token
++    template = reader.field("tokenizer.chat_template")
++    if template:
++        config["chat_template"] = str(template)
++    return config
++
++
++def ensure_sidecar(model_dir: str | Path) -> list[str]:
++    """Write ``tokenizer.json``/``tokenizer_config.json`` beside a GGUF when they are absent.
++
++    Returns the names of the files written (empty when nothing was missing). A directory
++    that already holds a ``tokenizer.json`` is left untouched.
++    """
++
++    directory = Path(model_dir)
++    if (directory / "tokenizer.json").is_file():
++        return []
++    reader = open_file(directory)
++    if reader is None:
++        return []
++    written: list[str] = []
++    with reader:
++        for filename, builder in (("tokenizer.json", build_tokenizer_json),
++                                  ("tokenizer_config.json", build_tokenizer_config)):
++            path = directory / filename
++            if path.is_file():
++                continue
++            tmp = path.with_suffix(path.suffix + ".tmp")
++            tmp.write_text(json.dumps(builder(reader), ensure_ascii=False), encoding="utf-8")
++            tmp.replace(path)
++            written.append(filename)
++    return written
++
++
++__all__ = ["build_tokenizer_config", "build_tokenizer_json", "ensure_sidecar"]
+diff --git a/tests/test_gguf_tokenizer.py b/tests/test_gguf_tokenizer.py
+new file mode 100644
+index 0000000..b4d4ba5
+--- /dev/null
++++ b/tests/test_gguf_tokenizer.py
+@@ -0,0 +1,65 @@
++"""Synthesized tokenizer.json: structure and a round-trip through the Hugging Face tokenizers backend."""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++
++from tensorfold.gguf.reader import GgufReader
++from tensorfold.gguf.tokenizer import _as_list, build_tokenizer_config, build_tokenizer_json, ensure_sidecar
++
++# A small converted Qwen3.5 GGUF checked into local model storage; skipped when absent.
++SAMPLE = Path(r"E:\Models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf")
++
++pytestmark = pytest.mark.skipif(not SAMPLE.is_file(), reason="sample GGUF not present")
++
++
++def _reader():
++    return GgufReader(SAMPLE)
++
++
++def test_build_tokenizer_json_structure():
++    with _reader() as reader:
++        tokens = [str(t) for t in _as_list(reader.field("tokenizer.ggml.tokens"))]
++        types = [int(t) for t in _as_list(reader.field("tokenizer.ggml.token_type"))]
++        tok = build_tokenizer_json(reader)
++    expected = {tokens[i]: i for i in range(len(tokens))
++                if not (i < len(types) and types[i] == 5)}      # 5=UNUSED padding slots are dropped
++    assert tok["version"] == "1.0"
++    assert tok["model"]["type"] == "BPE"
++    assert tok["pre_tokenizer"]["type"] == "Sequence"
++    assert tok["pre_tokenizer"]["pretokenizers"][0]["type"] == "Split"
++    assert tok["normalizer"] == {"type": "NFC"}
++    assert len(tok["model"]["vocab"]) == len(expected)
++    assert tok["model"]["vocab"] == expected
++    assert all(len(m) == 2 for m in tok["model"]["merges"])
++    assert tok["added_tokens"] and all(t["special"] for t in tok["added_tokens"])
++    assert [t["id"] for t in tok["added_tokens"]] == sorted(t["id"] for t in tok["added_tokens"])
++
++
++def test_tokenizer_config_has_metadata():
++    with _reader() as reader:
++        config = build_tokenizer_config(reader)
++    assert config["tokenizer_class"] == "Qwen2Tokenizer"
++    assert config["model_max_length"] > 0
++
++
++def test_round_trip_through_tokenizers(tmp_path):
++    tokenizers = pytest.importorskip("tokenizers")
++    with _reader() as reader:
++        (tmp_path / "tokenizer.json").write_text(
++            json.dumps(build_tokenizer_json(reader), ensure_ascii=False), encoding="utf-8")
++        (tmp_path / "tokenizer_config.json").write_text(
++            json.dumps(build_tokenizer_config(reader), ensure_ascii=False), encoding="utf-8")
++    backend = tokenizers.Tokenizer.from_file(str(tmp_path / "tokenizer.json"))
++    ids = backend.encode("Hello, world! 123 + why is the sky blue?").ids
++    assert ids and all(isinstance(i, int) for i in ids)
++    assert backend.decode(ids) == "Hello, world! 123 + why is the sky blue?"
++
++
++def test_ensure_sidecar_skips_when_present(tmp_path):
++    with _reader() as reader:
++        (tmp_path / "tokenizer.json").write_text("{}", encoding="utf-8")
++        assert ensure_sidecar(tmp_path) == []           # a present tokenizer.json short-circuits
++    assert (tmp_path / "tokenizer.json").read_text(encoding="utf-8") == "{}"
+-- 
+2.53.0.windows.2
+
+From 49d1cd1b97b4c1d5e6c76c5b59f83e84423754cf Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 23:43:50 +0800
+Subject: [PATCH 09/11] cuda: GGUF (ggml) fused dequant matmul for qwen3_5 (P26
+ #2)
+
+Add layout=ggml QLinear that keeps raw q8_0/q4_k/q5_k/q6_k blocks resident and
+dequantizes inside the Triton matmul kernel (tensorfold ggml()), instead of
+pre-converting weights to bf16. MLP/attention/lm_head projections now load as
+raw GGUF blocks; GDN (linear_attn.*, needs V-head reorder), embeddings and
+F32/F16 tensors stay on the dense path. Verified on GB10: 4/4 kernel types match
+the CPU dequantizer, and Qwen3.5-0.8B-Q4_K_M.gguf serves coherent output end-to-end.
+---
+ src/tensorfold/cuda/kernels/affine.py         | 12 +++
+ src/tensorfold/cuda/kernels/affine_kernels.py | 78 +++++++++++++++++++
+ .../families/qwen3_5/cuda/weights.py          | 23 +++++-
+ tests/test_gguf_cuda_ggml.py                  | 58 ++++++++++++++
+ 4 files changed, 169 insertions(+), 2 deletions(-)
+ create mode 100644 tests/test_gguf_cuda_ggml.py
+
+diff --git a/src/tensorfold/cuda/kernels/affine.py b/src/tensorfold/cuda/kernels/affine.py
+index 164218c..07275ea 100644
+--- a/src/tensorfold/cuda/kernels/affine.py
++++ b/src/tensorfold/cuda/kernels/affine.py
+@@ -34,6 +34,10 @@ def _validate(x, q):
+         if q.weight.ndim != 2 or q.weight.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+             raise ValueError("dense projections need a 2-D floating-point checkpoint weight")
+         n, k = q.weight.shape
++    elif q.layout == "ggml":
++        if q.weight.ndim != 3 or q.weight.dtype != torch.uint8 or q.qblock <= 0 or q.weight.shape[1] * q.qblock <= 0:
++            raise ValueError("ggml projections need a 3-D uint8 block tensor and its block width")
++        n, k = int(q.weight.shape[0]), int(q.weight.shape[1]) * q.qblock
+     else:
+         if q.layout != "mlx":
+             raise ValueError("generic affine kernels read the original MLX word layout")
+@@ -61,6 +65,14 @@ def matmul(x, q, *, f32: bool = False):
+     if q.layout == "dense":
+         kernels.dense[(x.shape[0], triton.cdiv(n, 4))](x, q.weight, out, N=n, K=k, BLOCK=128,
+                                                      num_warps=4, enable_fp_fusion=False)
++    elif q.layout == "ggml":
++        qt, blk, byt = kernels.GGML_BLOCK[q.qtype]
++        if k % blk:
++            raise ValueError(f"ggml input width {k} is not a whole number of {q.qtype} blocks of {blk}")
++        rb = q.weight.shape[1] * byt
++        kernels.ggml[(triton.cdiv(x.shape[0], 16), triton.cdiv(n, 32))](
++            x, q.weight, out, x.shape[0], rb, N=n, K=k, BLK=blk, BYTES=byt, QT=qt,
++            num_warps=4, enable_fp_fusion=False)
+     else:
+         kernels.matmul[(triton.cdiv(x.shape[0], 16), triton.cdiv(n, 32))](
+             x, q.weight, q.scales, q.biases, out, x.shape[0], N=n, K=k, BITS=q.bits, GS=q.gs,
+diff --git a/src/tensorfold/cuda/kernels/affine_kernels.py b/src/tensorfold/cuda/kernels/affine_kernels.py
+index 95b7bcd..3b63285 100644
+--- a/src/tensorfold/cuda/kernels/affine_kernels.py
++++ b/src/tensorfold/cuda/kernels/affine_kernels.py
+@@ -46,6 +46,84 @@ def dense(X, W, OUT, N: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr):
+     tl.store(OUT + row * N + cols, acc, mask=cols < N)
+ 
+ 
++# GGUF (ggml) block formats. The CUDA engine keeps the raw quantized blocks on the GPU and
++# reconstructs each block's values inside the matmul, so a GGUF projection never holds a bf16 copy.
++# type -> (enum, elements per block, bytes per block)
++GGML_BLOCK = {"q8_0": (0, 32, 34), "q4_k": (1, 256, 144), "q5_k": (2, 256, 176), "q6_k": (3, 256, 210)}
++
++
++@triton.jit
++def _f16(lo, hi):
++    return (lo.to(tl.uint16) | (hi.to(tl.uint16) << 8)).to(tl.float16, bitcast=True).to(tl.float32)
++
++
++@triton.jit
++def ggml(X, W, OUT, M, RB, N: tl.constexpr, K: tl.constexpr, BLK: tl.constexpr, BYTES: tl.constexpr,
++         QT: tl.constexpr):
++    """x [M, K] bf16 against a GGUF [N, K] weight whose raw blocks are dequantized here, 16 rows x 32 outputs a tile."""
++
++    rows = tl.program_id(0) * 16 + tl.arange(0, 16)
++    cols = tl.program_id(1) * 32 + tl.arange(0, 32)
++    colok = cols < N
++    base0 = cols[:, None] * RB
++    j = tl.arange(0, BLK)
++    acc = tl.zeros((16, 32), tl.float32)
++    for b in range(0, K // BLK):
++        xk = b * BLK + j
++        x = tl.load(X + rows[:, None] * K + xk[None, :], mask=rows[:, None] < M, other=0)
++        base = base0 + b * BYTES
++        if QT == 0:                                                # Q8_0: d f16, then 32 int8
++            d = _f16(tl.load(W + base), tl.load(W + base + 1))
++            qb = tl.load(W + base + 2 + j[None, :], mask=colok[:, None], other=0).to(tl.int8, bitcast=True)
++            wv = d * qb.to(tl.float32)
++        elif QT == 1:                                              # Q4_K: d, dmin f16, 12 scale bytes, 128 nibbles
++            d = _f16(tl.load(W + base), tl.load(W + base + 1))
++            dmin = _f16(tl.load(W + base + 2), tl.load(W + base + 3))
++            s8 = tl.arange(0, 8)
++            t = tl.where(s8 < 4, s8, s8 - 4)
++            bt = tl.load(W + base + 4 + t[None, :], mask=colok[:, None], other=0)
++            b4 = tl.load(W + base + 8 + t[None, :], mask=colok[:, None], other=0)
++            b8 = tl.load(W + base + 12 + t[None, :], mask=colok[:, None], other=0)
++            sc = tl.where(s8[None, :] < 4, bt & 0x3F, (b8 & 0x0F) | ((bt >> 2) & 0x30))
++            mm = tl.where(s8[None, :] < 4, b4 & 0x3F, (b8 >> 4) | ((b4 >> 2) & 0x30))
++            Sce = tl.reshape(tl.broadcast_to(sc[:, :, None], (32, 8, BLK // 8)), (32, BLK)).to(tl.float32)
++            Mme = tl.reshape(tl.broadcast_to(mm[:, :, None], (32, 8, BLK // 8)), (32, BLK)).to(tl.float32)
++            g, wb, sub = j // 64, j % 32, (j // 32) % 2
++            qb = tl.load(W + base + 16 + (g * 32 + wb)[None, :], mask=colok[:, None], other=0)
++            q = (qb >> (sub * 4)[None, :]) & 0xF
++            wv = d * Sce * q.to(tl.float32) - dmin * Mme
++        elif QT == 2:                                              # Q5_K: as Q4_K plus a 32-byte high-bit plane
++            d = _f16(tl.load(W + base), tl.load(W + base + 1))
++            dmin = _f16(tl.load(W + base + 2), tl.load(W + base + 3))
++            s8 = tl.arange(0, 8)
++            t = tl.where(s8 < 4, s8, s8 - 4)
++            bt = tl.load(W + base + 4 + t[None, :], mask=colok[:, None], other=0)
++            b4 = tl.load(W + base + 8 + t[None, :], mask=colok[:, None], other=0)
++            b8 = tl.load(W + base + 12 + t[None, :], mask=colok[:, None], other=0)
++            sc = tl.where(s8[None, :] < 4, bt & 0x3F, (b8 & 0x0F) | ((bt >> 2) & 0x30))
++            mm = tl.where(s8[None, :] < 4, b4 & 0x3F, (b8 >> 4) | ((b4 >> 2) & 0x30))
++            Sce = tl.reshape(tl.broadcast_to(sc[:, :, None], (32, 8, BLK // 8)), (32, BLK)).to(tl.float32)
++            Mme = tl.reshape(tl.broadcast_to(mm[:, :, None], (32, 8, BLK // 8)), (32, BLK)).to(tl.float32)
++            g, wb, sub = j // 64, j % 32, (j // 32) % 2
++            qb = tl.load(W + base + 48 + (g * 32 + wb)[None, :], mask=colok[:, None], other=0)
++            qh = tl.load(W + base + 16 + wb[None, :], mask=colok[:, None], other=0)
++            q = ((qb >> (sub * 4)[None, :]) & 0xF) | (((qh >> (j // 32)[None, :]) & 1) << 4)
++            wv = d * Sce * q.to(tl.float32) - dmin * Mme
++        else:                                                      # Q6_K: 16 sub-scales, 128 low nibbles, 64 2-bit planes
++            a, rem = j // 128, j % 128
++            bb, c, db, w2 = rem // 64, rem % 64, rem // 32, j % 32
++            ql = tl.load(W + base + (a * 64 + c)[None, :], mask=colok[:, None], other=0)
++            nib = (ql >> (bb * 4)[None, :]) & 0xF
++            qh = tl.load(W + base + 128 + (a * 32 + w2)[None, :], mask=colok[:, None], other=0)
++            hi = (qh >> (db * 2)[None, :]) & 3
++            q = ((nib | (hi << 4)).to(tl.int32) - 32).to(tl.float32)
++            sc = tl.load(W + base + 192 + (j // 16)[None, :], mask=colok[:, None], other=0)
++            d = _f16(tl.load(W + base + 208), tl.load(W + base + 209))
++            wv = d * sc.to(tl.int8, bitcast=True).to(tl.float32) * q
++        acc += tl.dot(x, tl.trans(wv.to(tl.bfloat16)), input_precision="ieee")
++    tl.store(OUT + rows[:, None] * N + cols[None, :], acc, mask=(rows[:, None] < M) & colok[None, :])
++
++
+ @triton.jit
+ def embed(IDS, W, S, B, OUT, N: tl.constexpr, K: tl.constexpr, BITS: tl.constexpr, GS: tl.constexpr,
+           BLOCK: tl.constexpr):
+diff --git a/src/tensorfold/families/qwen3_5/cuda/weights.py b/src/tensorfold/families/qwen3_5/cuda/weights.py
+index 6914af5..0955702 100644
+--- a/src/tensorfold/families/qwen3_5/cuda/weights.py
++++ b/src/tensorfold/families/qwen3_5/cuda/weights.py
+@@ -16,10 +16,13 @@ class QLinear:
+     weight: torch.Tensor      # original MLX words, or the optimized four-bit tile layout
+     scales: torch.Tensor | None
+     biases: torch.Tensor | None
+-    layout: str = "mlx"       # "mlx" as stored, or "tiled" (``qmm_fast.tile``)
++    layout: str = "mlx"       # "mlx" as stored, "tiled" (``qmm_fast.tile``), "dense" or "ggml"
+     rows: int = 0             # N when tiled (the tiled words are padded to 64 columns)
+     gs: int = 64              # inputs per quantization group
+     bits: int = 4
++    qtype: str = ""           # GGUF block type when layout == "ggml" (q8_0/q4_k/q5_k/q6_k)
++    qblock: int = 0           # values per GGUF block (32 or 256)
++    qbytes: int = 0           # bytes per GGUF block
+ 
+     @property
+     def n(self) -> int:
+@@ -29,6 +32,8 @@ class QLinear:
+     def k(self) -> int:
+         if self.layout == "dense":
+             return int(self.weight.shape[1])
++        if self.layout == "ggml":
++            return int(self.weight.shape[1]) * self.qblock
+         return int(self.weight.shape[1]) * 64 if self.layout == "tiled" else int(self.scales.shape[1]) * self.gs
+ 
+     def nbytes(self) -> int:
+@@ -36,7 +41,7 @@ class QLinear:
+ 
+     @cached_property
+     def fast(self) -> bool:
+-        return (self.bits, self.gs) == (4, 64) and self.layout != "dense" and all(
++        return (self.bits, self.gs) == (4, 64) and self.layout not in ("dense", "ggml") and all(
+             t.dtype == torch.bfloat16 for t in (self.scales, self.biases))
+ 
+ 
+@@ -441,6 +446,20 @@ def load_gguf(gguf_path: str | Path, device: str = "cuda", *, tiled: bool = Fals
+             return held
+ 
+         def qlinear(name: str, pack: bool = True) -> QLinear:
++            from tensorfold.cuda.kernels.affine_kernels import GGML_BLOCK
++
++            gguf_name = back.get(name + ".weight")
++            info = reader.info(gguf_name) if gguf_name is not None else None
++            # Keep the raw GGUF blocks on the GPU for the projections that need no GDN reorder; the
++            # fused dequant+matmul kernel reads them. Embedding (index_select), the tiled GDN
++            # projections and any F32/F16 weight stay on the dense path.
++            if (info is not None and info.quant in GGML_BLOCK and "linear_attn." not in name
++                    and name != "model.embed_tokens"):
++                _enum, blk, byt = GGML_BLOCK[info.quant]
++                raw = np.array(reader.raw(gguf_name), dtype=np.uint8)
++                nb = raw.shape[1] // byt
++                held = torch.from_numpy(raw).to(device).reshape(raw.shape[0], nb, byt).contiguous()
++                return QLinear(held, None, None, layout="ggml", bits=0, gs=0, qtype=info.quant, qblock=blk, qbytes=byt)
+             w = get(name + ".weight")
+             if w.ndim != 2:
+                 raise ValueError(f"{name} is not a 2-D projection in this GGUF checkpoint")
+diff --git a/tests/test_gguf_cuda_ggml.py b/tests/test_gguf_cuda_ggml.py
+new file mode 100644
+index 0000000..1b1cd55
+--- /dev/null
++++ b/tests/test_gguf_cuda_ggml.py
+@@ -0,0 +1,58 @@
++"""The fused GGUF dequant+matmul CUDA kernel must reproduce the CPU dequantizer bit-for-bit in bf16."""
++from __future__ import annotations
++
++import numpy as np
++import pytest
++
++torch = pytest.importorskip("torch")
++pytest.importorskip("triton")
++
++from tensorfold.gguf.dequant import DEQUANTIZERS
++from tensorfold.cuda.kernels import affine
++from tensorfold.families.qwen3_5.cuda.weights import QLinear
++
++BLOCKS = {"q8_0": (32, 34), "q4_k": (256, 144), "q5_k": (256, 176), "q6_k": (256, 210)}
++
++
++def _raw(qtype: str, n: int, k: int) -> np.ndarray:
++    blk, byt = BLOCKS[qtype]
++    rng = np.random.default_rng(1234)
++    nb = k // blk
++    raw = rng.integers(0, 256, size=(n, nb * byt), dtype=np.uint8)
++    scale = np.float16(0.02)
++    for row in range(n):
++        for b in range(nb):
++            base = b * byt
++            if qtype == "q8_0":
++                raw[row, base:base + 2] = np.frombuffer(scale.tobytes(), dtype=np.uint8)
++            elif qtype == "q6_k":
++                raw[row, base + 208:base + 210] = np.frombuffer(scale.tobytes(), dtype=np.uint8)
++            else:
++                raw[row, base:base + 2] = np.frombuffer(scale.tobytes(), dtype=np.uint8)
++                raw[row, base + 2:base + 4] = np.frombuffer(np.float16(0.01).tobytes(), dtype=np.uint8)
++    return raw
++
++
++@pytest.mark.parametrize("qtype", list(BLOCKS))
++def test_ggml_matmul_matches_dequant(qtype):
++    if not torch.cuda.is_available():
++        pytest.skip("needs CUDA")
++    blk, byt = BLOCKS[qtype]
++    n, k, m = 64, 512, 32
++    raw = _raw(qtype, n, k)
++    ref = DEQUANTIZERS[qtype](raw, (n, k))
++    assert ref.shape == (n, k)
++
++    held = torch.from_numpy(raw).cuda().reshape(n, k // blk, byt).contiguous()
++    q = QLinear(held, None, None, layout="ggml", qtype=qtype, qblock=blk, qbytes=byt)
++    assert (q.n, q.k) == (n, k)
++
++    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
++    out = affine.matmul(x, q).float()
++
++    wb = torch.from_numpy(ref).cuda().bfloat16().float()
++    want = x.float() @ wb.T
++    err = (out - want).abs().max().item()
++    # ``out`` is BF16 while ``want`` stays F32, so the gap is the output's own BF16 rounding.
++    tol = 0.03 * want.abs().max().item() + 0.05
++    assert err < tol, f"{qtype} max abs error {err} (tol {tol})"
+-- 
+2.53.0.windows.2
+
+From 0f8c8f77cca6074cb0f1358e7ec197e7e679ed95 Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 23:56:38 +0800
+Subject: [PATCH 10/11] gguf: map qwen35moe expert/router tensors to HF names
+ (P26 #3 S1)
+
+---
+ src/tensorfold/gguf/hf.py |  9 ++++++++
+ tests/test_gguf_hf_moe.py | 47 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 56 insertions(+)
+ create mode 100644 tests/test_gguf_hf_moe.py
+
+diff --git a/src/tensorfold/gguf/hf.py b/src/tensorfold/gguf/hf.py
+index ed549fd..99d698f 100644
+--- a/src/tensorfold/gguf/hf.py
++++ b/src/tensorfold/gguf/hf.py
+@@ -24,6 +24,15 @@ _BLOCK = {
+     "ffn_gate.weight": "mlp.gate_proj.weight",
+     "ffn_up.weight": "mlp.up_proj.weight",
+     "ffn_down.weight": "mlp.down_proj.weight",
++    # Mixture-of-Experts (qwen35moe): router, routed experts and the shared expert
++    "ffn_gate_inp.weight": "mlp.gate.weight",
++    "ffn_gate_inp_shexp.weight": "mlp.shared_expert_gate.weight",
++    "ffn_gate_exps.weight": "mlp.switch_mlp.gate_proj.weight",
++    "ffn_up_exps.weight": "mlp.switch_mlp.up_proj.weight",
++    "ffn_down_exps.weight": "mlp.switch_mlp.down_proj.weight",
++    "ffn_gate_shexp.weight": "mlp.shared_expert.gate_proj.weight",
++    "ffn_up_shexp.weight": "mlp.shared_expert.up_proj.weight",
++    "ffn_down_shexp.weight": "mlp.shared_expert.down_proj.weight",
+     # Gated DeltaNet (linear attention) layers
+     "attn_qkv.weight": "linear_attn.in_proj_qkv.weight",
+     "attn_gate.weight": "linear_attn.in_proj_z.weight",
+diff --git a/tests/test_gguf_hf_moe.py b/tests/test_gguf_hf_moe.py
+new file mode 100644
+index 0000000..2c98787
+--- /dev/null
++++ b/tests/test_gguf_hf_moe.py
+@@ -0,0 +1,47 @@
++from __future__ import annotations
++
++import numpy as np
++from gguf import GGUFWriter
++
++from tensorfold.gguf import GgufReader
++from tensorfold.gguf.hf import hf_name, name_map
++
++MOE_NAMES = {
++    "blk.0.ffn_gate_inp.weight": "model.layers.0.mlp.gate.weight",
++    "blk.0.ffn_gate_inp_shexp.weight": "model.layers.0.mlp.shared_expert_gate.weight",
++    "blk.3.ffn_gate_exps.weight": "model.layers.3.mlp.switch_mlp.gate_proj.weight",
++    "blk.3.ffn_up_exps.weight": "model.layers.3.mlp.switch_mlp.up_proj.weight",
++    "blk.3.ffn_down_exps.weight": "model.layers.3.mlp.switch_mlp.down_proj.weight",
++    "blk.3.ffn_gate_shexp.weight": "model.layers.3.mlp.shared_expert.gate_proj.weight",
++    "blk.3.ffn_up_shexp.weight": "model.layers.3.mlp.shared_expert.up_proj.weight",
++    "blk.3.ffn_down_shexp.weight": "model.layers.3.mlp.shared_expert.down_proj.weight",
++}
++
++
++def test_moe_suffixes_map_to_hf_names():
++    for gguf_name, expected in MOE_NAMES.items():
++        assert hf_name(gguf_name) == expected
++
++
++def test_dense_ffn_still_maps_without_collision():
++    assert hf_name("blk.0.ffn_gate.weight") == "model.layers.0.mlp.gate_proj.weight"
++    assert hf_name("blk.0.ffn_up.weight") == "model.layers.0.mlp.up_proj.weight"
++    assert hf_name("blk.0.ffn_down.weight") == "model.layers.0.mlp.down_proj.weight"
++
++
++def test_name_map_over_synthetic_moe_gguf(tmp_path):
++    path = tmp_path / "moe.gguf"
++    writer = GGUFWriter(path, "qwen35moe")
++    writer.add_name("synthetic-qwen35moe")
++    writer.add_block_count(4)
++    for gguf_name in MOE_NAMES:
++        writer.add_tensor(gguf_name, np.zeros((4, 8), dtype=np.float32))
++    writer.write_header_to_file()
++    writer.write_kv_data_to_file()
++    writer.write_tensors_to_file()
++    writer.close()
++
++    with GgufReader(path) as reader:
++        assert reader.architecture == "qwen35moe"
++        mapping = name_map(reader)
++    assert {k: mapping[k] for k in MOE_NAMES} == MOE_NAMES
+-- 
+2.53.0.windows.2
+
+From e95354166c64f7ef6af3fe32488df2cdd092bca6 Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 00:16:51 +0800
+Subject: [PATCH 11/11] cuda: grouped GGUF dequant expert kernels for
+ qwen3_5_moe (P26 #3)
+
+Read MoE routed experts directly from raw GGUF blocks (q4_k/q5_k/q6_k) via grouped Triton kernels; shared expert (q8_0) via a bf16 dense path into the last slot. Reuses Plan/route/combine/MoEBuffers unchanged. moe.dispatch now calls expert-container methods run_gate_up/run_down. Verified e2e on GB10: Qwen3.6-35B-A3B-UD-Q4_K_M loads 22.7s, coherent + correct answers (391+9=400).
+---
+ src/tensorfold/cuda/experts.py                |  10 +
+ src/tensorfold/cuda/gguf_experts.py           | 200 ++++++++++++++++++
+ src/tensorfold/cuda/moe.py                    |   4 +-
+ .../families/qwen3_5/cuda/weights.py          |  10 +
+ .../families/qwen3_5_moe/cuda/weights.py      |  25 +++
+ src/tensorfold/gguf/hf.py                     |   2 +-
+ tests/test_gguf_moe_experts.py                |  86 ++++++++
+ 7 files changed, 334 insertions(+), 3 deletions(-)
+ create mode 100644 src/tensorfold/cuda/gguf_experts.py
+ create mode 100644 tests/test_gguf_moe_experts.py
+
+diff --git a/src/tensorfold/cuda/experts.py b/src/tensorfold/cuda/experts.py
+index 54fd7ee..f8e3363 100644
+--- a/src/tensorfold/cuda/experts.py
++++ b/src/tensorfold/cuda/experts.py
+@@ -80,6 +80,16 @@ class Experts:
+     def bytes_per_expert(self) -> int:
+         return (self.up[0].numel() + self.down[0].numel()) * 4
+ 
++    def run_gate_up(self, x: torch.Tensor, plan: Plan, out: torch.Tensor, rows: int) -> None:
++        """Layer method form of the module ``gate_up``, so ``moe.moe`` can run any container's."""
++
++        gate_up(x, self, plan, out, rows)
++
++    def run_down(self, act: torch.Tensor, plan: Plan, out: torch.Tensor, rows: int) -> None:
++        """Layer method form of the module ``down``, so ``moe.moe`` can run any container's."""
++
++        down(act, self, plan, out, rows)
++
+ 
+ def make(up: list[tuple], down: tuple, gs: int, *, limit: float = 0.0) -> Experts:
+     """One layer's MLX arrays: ``up`` [gate, up] (SwiGLU) or [up] (relu^2), ``down``, each (words, scales, biases)."""
+diff --git a/src/tensorfold/cuda/gguf_experts.py b/src/tensorfold/cuda/gguf_experts.py
+new file mode 100644
+index 0000000..5a1997d
+--- /dev/null
++++ b/src/tensorfold/cuda/gguf_experts.py
+@@ -0,0 +1,200 @@
++"""Grouped MoE experts read straight from GGUF blocks: the routed experts keep their raw
++q4_k/q5_k/q6_k blocks on the GPU and are dequantized inside a grouped matmul, while the
++(small, differently quantized) shared expert is dequantized once to dense bf16.
++
++This mirrors ``cuda/experts.py``'s interface — ``width``/``dims``/``count``/``swiglu`` and
++the ``run_gate_up``/``run_down`` methods — so ``cuda/moe.py`` runs either container unchanged.
++The plan (``route``/``Plan``) and the combine step are weight-format-agnostic and reused as is.
++"""
++
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++from .kernels.affine_kernels import GGML_BLOCK
++
++
++@triton.jit
++def _deq(W, base, colok, j, BLK: tl.constexpr, QT: tl.constexpr):
++    """Dequantize one block's values for 32 output rows: W holds the raw bytes, ``base`` is
++    the block's byte offset per output row (``cols[:, None] * RB`` plus the block offset),
++    and ``j`` is arange(BLK). Same block formats as ``affine_kernels.ggml``."""
++
++    if QT == 0:                                                    # Q8_0: d f16, then 32 int8
++        d = (tl.load(W + base).to(tl.uint16) | (tl.load(W + base + 1).to(tl.uint16) << 8)).to(
++            tl.float16, bitcast=True).to(tl.float32)
++        qb = tl.load(W + base + 2 + j[None, :], mask=colok[:, None], other=0).to(tl.int8, bitcast=True)
++        return d * qb.to(tl.float32)
++    elif QT == 1:                                                  # Q4_K: d, dmin f16, 12 scale bytes, 128 nibbles
++        d = (tl.load(W + base).to(tl.uint16) | (tl.load(W + base + 1).to(tl.uint16) << 8)).to(
++            tl.float16, bitcast=True).to(tl.float32)
++        dmin = (tl.load(W + base + 2).to(tl.uint16) | (tl.load(W + base + 3).to(tl.uint16) << 8)).to(
++            tl.float16, bitcast=True).to(tl.float32)
++        s8 = tl.arange(0, 8)
++        t = tl.where(s8 < 4, s8, s8 - 4)
++        bt = tl.load(W + base + 4 + t[None, :], mask=colok[:, None], other=0)
++        b4 = tl.load(W + base + 8 + t[None, :], mask=colok[:, None], other=0)
++        b8 = tl.load(W + base + 12 + t[None, :], mask=colok[:, None], other=0)
++        sc = tl.where(s8[None, :] < 4, bt & 0x3F, (b8 & 0x0F) | ((bt >> 2) & 0x30))
++        mm = tl.where(s8[None, :] < 4, b4 & 0x3F, (b8 >> 4) | ((b4 >> 2) & 0x30))
++        Sce = tl.reshape(tl.broadcast_to(sc[:, :, None], (32, 8, BLK // 8)), (32, BLK)).to(tl.float32)
++        Mme = tl.reshape(tl.broadcast_to(mm[:, :, None], (32, 8, BLK // 8)), (32, BLK)).to(tl.float32)
++        g, wb, sub = j // 64, j % 32, (j // 32) % 2
++        qb = tl.load(W + base + 16 + (g * 32 + wb)[None, :], mask=colok[:, None], other=0)
++        q = (qb >> (sub * 4)[None, :]) & 0xF
++        return d * Sce * q.to(tl.float32) - dmin * Mme
++    elif QT == 2:                                                  # Q5_K: Q4_K plus a 32-byte high-bit plane
++        d = (tl.load(W + base).to(tl.uint16) | (tl.load(W + base + 1).to(tl.uint16) << 8)).to(
++            tl.float16, bitcast=True).to(tl.float32)
++        dmin = (tl.load(W + base + 2).to(tl.uint16) | (tl.load(W + base + 3).to(tl.uint16) << 8)).to(
++            tl.float16, bitcast=True).to(tl.float32)
++        s8 = tl.arange(0, 8)
++        t = tl.where(s8 < 4, s8, s8 - 4)
++        bt = tl.load(W + base + 4 + t[None, :], mask=colok[:, None], other=0)
++        b4 = tl.load(W + base + 8 + t[None, :], mask=colok[:, None], other=0)
++        b8 = tl.load(W + base + 12 + t[None, :], mask=colok[:, None], other=0)
++        sc = tl.where(s8[None, :] < 4, bt & 0x3F, (b8 & 0x0F) | ((bt >> 2) & 0x30))
++        mm = tl.where(s8[None, :] < 4, b4 & 0x3F, (b8 >> 4) | ((b4 >> 2) & 0x30))
++        Sce = tl.reshape(tl.broadcast_to(sc[:, :, None], (32, 8, BLK // 8)), (32, BLK)).to(tl.float32)
++        Mme = tl.reshape(tl.broadcast_to(mm[:, :, None], (32, 8, BLK // 8)), (32, BLK)).to(tl.float32)
++        g, wb, sub = j // 64, j % 32, (j // 32) % 2
++        qb = tl.load(W + base + 48 + (g * 32 + wb)[None, :], mask=colok[:, None], other=0)
++        qh = tl.load(W + base + 16 + wb[None, :], mask=colok[:, None], other=0)
++        q = ((qb >> (sub * 4)[None, :]) & 0xF) | (((qh >> (j // 32)[None, :]) & 1) << 4)
++        return d * Sce * q.to(tl.float32) - dmin * Mme
++    else:                                                          # Q6_K: 16 sub-scales, 128 low nibbles, 64 2-bit planes
++        a, rem = j // 128, j % 128
++        bb, c, db, w2 = rem // 64, rem % 64, rem // 32, j % 32
++        ql = tl.load(W + base + (a * 64 + c)[None, :], mask=colok[:, None], other=0)
++        nib = (ql >> (bb * 4)[None, :]) & 0xF
++        qh = tl.load(W + base + 128 + (a * 32 + w2)[None, :], mask=colok[:, None], other=0)
++        hi = (qh >> (db * 2)[None, :]) & 3
++        q = ((nib | (hi << 4)).to(tl.int32) - 32).to(tl.float32)
++        sc = tl.load(W + base + 192 + (j // 16)[None, :], mask=colok[:, None], other=0)
++        d = (tl.load(W + base + 208).to(tl.uint16) | (tl.load(W + base + 209).to(tl.uint16) << 8)).to(
++            tl.float16, bitcast=True).to(tl.float32)
++        return d * sc.to(tl.int8, bitcast=True).to(tl.float32) * q
++
++
++@triton.jit
++def ggml_gate_up(X, GA, UP, OUT, ITEMS, COUNTS, MEMBERS, E_ROUTED,
++                 SLOTS: tl.constexpr, RB: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
++                 BLK: tl.constexpr, QT: tl.constexpr, TILE: tl.constexpr):
++    """Program (item, 32 output columns): an item's member (token, expert) pairs run the
++    expert's gate and up projections from raw GGUF blocks, SwiGLU's them and write the
++    activation to OUT[pair, :]. Items of the shared expert (id E_ROUTED) are skipped."""
++
++    it = tl.program_id(0)
++    if it < tl.load(COUNTS):
++        e = tl.load(ITEMS + it * 3)
++        if e < E_ROUTED:
++            first = tl.load(ITEMS + it * 3 + 1)
++            cnt = tl.load(ITEMS + it * 3 + 2)
++            cols = tl.program_id(1) * 32 + tl.arange(0, 32)
++            colok = cols < N
++            j = tl.arange(0, BLK)
++            step = RB // (K // BLK)                               # bytes per block
++            ebase = e * N * RB
++            gbase = ebase + cols[:, None] * RB
++            ubase = ebase + cols[:, None] * RB
++            for t in tl.static_range(TILE // 16):
++                mi = t * 16 + tl.arange(0, 16)
++                ok = mi < cnt
++                p = tl.load(MEMBERS + first + mi, mask=ok, other=0)
++                r = p // SLOTS
++                accg = tl.zeros((16, 32), tl.float32)
++                accu = tl.zeros((16, 32), tl.float32)
++                for b in range(0, K // BLK):
++                    xk = b * BLK + j
++                    x = tl.load(X + r[:, None] * K + xk[None, :], mask=ok[:, None], other=0)
++                    wg = _deq(GA, gbase + b * step, colok, j, BLK, QT)
++                    wu = _deq(UP, ubase + b * step, colok, j, BLK, QT)
++                    accg += tl.dot(x, tl.trans(wg.to(tl.bfloat16)), input_precision="ieee")
++                    accu += tl.dot(x, tl.trans(wu.to(tl.bfloat16)), input_precision="ieee")
++                act = (accg / (1.0 + tl.exp(-accg))) * accu
++                tl.store(OUT + p[:, None] * N + cols[None, :], act.to(tl.bfloat16), mask=ok[:, None] & colok[None, :])
++
++
++@triton.jit
++def ggml_down(ACT, W, OUT, ITEMS, COUNTS, MEMBERS, E_ROUTED,
++              SLOTS: tl.constexpr, RB: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
++              BLK: tl.constexpr, QT: tl.constexpr, TILE: tl.constexpr, OUT_F32: tl.constexpr):
++    """Program (item, 32 output columns): an item's member pairs run the expert's down
++    projection from raw GGUF blocks into OUT[pair, :]; shared-expert items are skipped."""
++
++    it = tl.program_id(0)
++    if it < tl.load(COUNTS):
++        e = tl.load(ITEMS + it * 3)
++        if e < E_ROUTED:
++            first = tl.load(ITEMS + it * 3 + 1)
++            cnt = tl.load(ITEMS + it * 3 + 2)
++            cols = tl.program_id(1) * 32 + tl.arange(0, 32)
++            colok = cols < N
++            j = tl.arange(0, BLK)
++            step = RB // (K // BLK)
++            base = e * N * RB + cols[:, None] * RB
++            for t in tl.static_range(TILE // 16):
++                mi = t * 16 + tl.arange(0, 16)
++                ok = mi < cnt
++                p = tl.load(MEMBERS + first + mi, mask=ok, other=0)
++                acc = tl.zeros((16, 32), tl.float32)
++                for b in range(0, K // BLK):
++                    kk = b * BLK + j
++                    x = tl.load(ACT + p[:, None] * K + kk[None, :], mask=ok[:, None], other=0)
++                    wv = _deq(W, base + b * step, colok, j, BLK, QT)
++                    acc += tl.dot(x, tl.trans(wv.to(tl.bfloat16)), input_precision="ieee")
++                out = acc if OUT_F32 else acc.to(tl.bfloat16)
++                tl.store(OUT + p[:, None] * N + cols[None, :], out, mask=ok[:, None] & colok[None, :])
++
++
++class GgufExperts:
++    """One qwen35moe layer's routed experts (raw GGUF blocks) plus the dense shared expert.
++
++    ``gate``/``up`` are [E, I, RB] uint8 (q4_k); ``down_w`` is [E, D, RB] uint8 (q5_k or
++    q6_k, per layer), RB being ``(K / block) * bytes``. The shared expert's three
++    projections are dequantized once to dense bf16 (tiny next to the routed blocks).
++    """
++
++    swiglu = True
++
++    def __init__(self, gate: torch.Tensor, up: torch.Tensor, down_w: torch.Tensor,
++                 gate_quant: str, down_quant: str, sh_gate: torch.Tensor, sh_up: torch.Tensor,
++                 sh_down: torch.Tensor) -> None:
++        self.count, width, _ = gate.shape
++        _, dims, _ = down_w.shape
++        self.width, self.dims = int(width), int(dims)
++        self.gate, self.up, self.down_w = gate.contiguous(), up.contiguous(), down_w.contiguous()
++        self.up_qt, self.up_blk, _ = GGML_BLOCK[gate_quant]
++        self.down_qt, self.down_blk, _ = GGML_BLOCK[down_quant]
++        self.up_rb, self.down_rb = self.gate.shape[2], self.down_w.shape[2]
++        self.sh_gate = sh_gate.contiguous().to(torch.bfloat16)
++        self.sh_up = sh_up.contiguous().to(torch.bfloat16)
++        self.sh_down = sh_down.contiguous().to(torch.bfloat16)
++
++    def run_gate_up(self, x: torch.Tensor, plan, out: torch.Tensor, rows: int) -> None:
++        """x [R, D] bf16 -> out [R * slots, I] bf16: each routed pair's SwiGLU activation from
++        raw blocks, then the shared expert's activation into the last slot."""
++
++        grid = (plan.items.shape[0], triton.cdiv(self.width, 32))
++        ggml_gate_up[grid](x, self.gate, self.up, out, plan.items, plan.counts, plan.members, self.count,
++                           SLOTS=plan.slots, RB=self.up_rb, N=self.width, K=self.dims, BLK=self.up_blk,
++                           QT=self.up_qt, TILE=plan.tile, num_warps=4, enable_fp_fusion=False)
++        shared = out.view(-1, plan.slots, self.width)[:rows, plan.slots - 1, :]
++        gate = x[:rows] @ self.sh_gate.t()
++        up = x[:rows] @ self.sh_up.t()
++        shared.copy_((gate * torch.sigmoid(gate) * up).to(shared.dtype))
++
++    def run_down(self, act: torch.Tensor, plan, out: torch.Tensor, rows: int) -> None:
++        """act [R * slots, I] bf16 -> out [R * slots, D] (fp32 decode, bf16 prefill): each
++        routed pair's down projection from raw blocks, then the shared expert into the last slot."""
++
++        grid = (plan.items.shape[0], triton.cdiv(self.dims, 32))
++        ggml_down[grid](act, self.down_w, out, plan.items, plan.counts, plan.members, self.count,
++                        SLOTS=plan.slots, RB=self.down_rb, N=self.dims, K=self.width, BLK=self.down_blk,
++                        QT=self.down_qt, TILE=plan.tile, OUT_F32=(out.dtype == torch.float32),
++                        num_warps=4, enable_fp_fusion=False)
++        shared = out.view(-1, plan.slots, self.dims)[:rows, plan.slots - 1, :]
++        a = act.view(-1, plan.slots, self.width)[:rows, plan.slots - 1, :]
++        shared.copy_((a @ self.sh_down.t()).to(shared.dtype))
+diff --git a/src/tensorfold/cuda/moe.py b/src/tensorfold/cuda/moe.py
+index c30200f..738ec0d 100644
+--- a/src/tensorfold/cuda/moe.py
++++ b/src/tensorfold/cuda/moe.py
+@@ -133,8 +133,8 @@ def moe(x: torch.Tensor, router_rows: torch.Tensor, ex, buf: MoEBuffers, top_k:
+         nvx.down(buf.act.view(-1, ex.width), ex, buf.plan, buf.y.view(-1, ex.dims), rows)
+         return buf
+     select(buf.logits[:rows], buf, top_k, experts)
+-    grouped.gate_up(x, ex, buf.plan, buf.act.view(-1, ex.width), rows)
+-    grouped.down(buf.act.view(-1, ex.width), ex, buf.plan, buf.y.view(-1, ex.dims), rows)
++    ex.run_gate_up(x, buf.plan, buf.act.view(-1, ex.width), rows)
++    ex.run_down(buf.act.view(-1, ex.width), buf.plan, buf.y.view(-1, ex.dims), rows)
+     return buf
+ 
+ 
+diff --git a/src/tensorfold/families/qwen3_5/cuda/weights.py b/src/tensorfold/families/qwen3_5/cuda/weights.py
+index 0955702..3afbcc9 100644
+--- a/src/tensorfold/families/qwen3_5/cuda/weights.py
++++ b/src/tensorfold/families/qwen3_5/cuda/weights.py
+@@ -445,6 +445,16 @@ def load_gguf(gguf_path: str | Path, device: str = "cuda", *, tiled: bool = Fals
+                 cache[gguf_name] = held
+             return held
+ 
++        def raw(name: str):
++            """A tensor's raw GGUF bytes (uint8) and its header, for the GGUF experts' blocks."""
++
++            gguf_name = back.get(name)
++            if gguf_name is None:
++                raise ValueError(f"GGUF checkpoint has no tensor for {name}")
++            return np.array(reader.raw(gguf_name), dtype=np.uint8), reader.info(gguf_name)
++
++        get.raw = raw                                            # the MoE loader reads expert blocks directly
++
+         def qlinear(name: str, pack: bool = True) -> QLinear:
+             from tensorfold.cuda.kernels.affine_kernels import GGML_BLOCK
+ 
+diff --git a/src/tensorfold/families/qwen3_5_moe/cuda/weights.py b/src/tensorfold/families/qwen3_5_moe/cuda/weights.py
+index bc20519..cd5da4f 100644
+--- a/src/tensorfold/families/qwen3_5_moe/cuda/weights.py
++++ b/src/tensorfold/families/qwen3_5_moe/cuda/weights.py
+@@ -33,6 +33,9 @@ def dequantize(words: torch.Tensor, scales: torch.Tensor, biases: torch.Tensor,
+ def routed(prefix: str, get: Callable, top_k: int) -> Routed:
+     """A layer's router rows (dequantized once to bf16, the shared expert's gate row last) and experts (shared last)."""
+ 
++    if hasattr(get, "raw"):                                     # GGUF: routed experts keep their raw blocks
++        return _routed_gguf(prefix, get, top_k)
++
+     def triple(name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+         w = get(name + ".weight")
+         return (w.view(torch.int32) if w.dtype != torch.int32 else w), get(name + ".scales"), get(name + ".biases")
+@@ -89,6 +92,28 @@ def routed4(prefix: str, t, cfg) -> dict:
+     return {"moe": Routed(router.to(torch.bfloat16).contiguous(), experts, int(cfg.top_k))}
+ 
+ 
++def _routed_gguf(prefix: str, get: Callable, top_k: int) -> Routed:
++    """A GGUF layer's router (the two F32 input projections) and experts: the routed experts stay
++    as raw q4_k/q5_k/q6_k blocks on the GPU, the shared expert dequantized once to dense bf16."""
++
++    from tensorfold.cuda.gguf_experts import GgufExperts
++
++    gate_inp = get(prefix + "gate.weight")
++    shexp_inp = get(prefix + "shared_expert_gate.weight").reshape(1, -1)
++    router = torch.cat([gate_inp.to(torch.bfloat16), shexp_inp.to(torch.bfloat16)]).contiguous()
++
++    gate_arr, gate_info = get.raw(prefix + "switch_mlp.gate_proj.weight")
++    up_arr, _ = get.raw(prefix + "switch_mlp.up_proj.weight")
++    down_arr, down_info = get.raw(prefix + "switch_mlp.down_proj.weight")
++    device = router.device
++    experts = GgufExperts(torch.from_numpy(gate_arr).to(device), torch.from_numpy(up_arr).to(device),
++                          torch.from_numpy(down_arr).to(device), gate_info.quant, down_info.quant,
++                          get(prefix + "shared_expert.gate_proj.weight"),
++                          get(prefix + "shared_expert.up_proj.weight"),
++                          get(prefix + "shared_expert.down_proj.weight"))
++    return Routed(router, experts, int(top_k))
++
++
+ def load(model_dir: str | Path) -> Weights:
+     """The checkpoint on the GPU, projections packed for the shared matmul and experts for the grouped kernels."""
+ 
+diff --git a/src/tensorfold/gguf/hf.py b/src/tensorfold/gguf/hf.py
+index 99d698f..af4a6a9 100644
+--- a/src/tensorfold/gguf/hf.py
++++ b/src/tensorfold/gguf/hf.py
+@@ -153,7 +153,7 @@ def to_hf_config(reader: GgufReader) -> dict:
+     text = {
+         "model_type": mt,
+         "hidden_size": hidden,
+-        "intermediate_size": int(get("feed_forward_length")),
++        "intermediate_size": int(get("feed_forward_length", get("expert_feed_forward_length", 0)) or 0),
+         "num_hidden_layers": layers,
+         "num_attention_heads": heads,
+         "num_key_value_heads": int(get("attention.head_count_kv", heads)),
+diff --git a/tests/test_gguf_moe_experts.py b/tests/test_gguf_moe_experts.py
+new file mode 100644
+index 0000000..62e1cc9
+--- /dev/null
++++ b/tests/test_gguf_moe_experts.py
+@@ -0,0 +1,86 @@
++"""The grouped GGUF MoE kernels must reproduce per-expert CPU dequant + SwiGLU/down in bf16."""
++from __future__ import annotations
++
++import numpy as np
++import pytest
++
++torch = pytest.importorskip("torch")
++pytest.importorskip("triton")
++
++from tensorfold.gguf.dequant import DEQUANTIZERS
++from tensorfold.cuda.gguf_experts import GgufExperts
++
++BLOCKS = {"q4_k": (256, 144), "q5_k": (256, 176)}
++
++
++def _raw(qtype: str, n: int, k: int, seed: int) -> np.ndarray:
++    blk, byt = BLOCKS[qtype]
++    rng = np.random.default_rng(seed)
++    nb = k // blk
++    raw = rng.integers(0, 256, size=(n, nb * byt), dtype=np.uint8)
++    for row in range(n):
++        for b in range(nb):
++            base = b * byt
++            raw[row, base:base + 2] = np.frombuffer(np.float16(0.02).tobytes(), np.uint8)
++            raw[row, base + 2:base + 4] = np.frombuffer(np.float16(0.01).tobytes(), np.uint8)
++    return raw
++
++
++class _Plan:
++    """The subset of ``cuda.experts.Plan`` the kernels read: one routed item (expert 0, all rows)
++    and one shared item (id E), every row at slot 0 routed and slot 1 shared."""
++
++    def __init__(self, rows: int, slots: int, experts: int) -> None:
++        self.slots, self.tile = slots, 16
++        self.items = torch.tensor([[0, 0, rows], [experts, rows, rows]], dtype=torch.int32, device="cuda")
++        self.counts = torch.tensor([2, 1], dtype=torch.int32, device="cuda")
++        members = []
++        for slot in range(slots):
++            members += [r * slots + slot for r in range(rows)]
++        self.members = torch.tensor(members, dtype=torch.int32, device="cuda")
++
++
++@pytest.mark.parametrize("quant", list(BLOCKS))
++def test_grouped_gate_up_and_down_match_reference(quant):
++    if not torch.cuda.is_available():
++        pytest.skip("needs CUDA")
++    E, I, D, R, slots = 2, 256, 256, 3, 2
++
++    gate = torch.from_numpy(np.stack([_raw(quant, I, D, 1 + e) for e in range(E)])).cuda()
++    up = torch.from_numpy(np.stack([_raw(quant, I, D, 10 + e) for e in range(E)])).cuda()
++    down = torch.from_numpy(np.stack([_raw(quant, D, I, 20 + e) for e in range(E)])).cuda()
++    sh_gate = torch.randn(I, D, device="cuda", dtype=torch.bfloat16)
++    sh_up = torch.randn(I, D, device="cuda", dtype=torch.bfloat16)
++    sh_down = torch.randn(D, I, device="cuda", dtype=torch.bfloat16)
++
++    ex = GgufExperts(gate, up, down, quant, quant, sh_gate, sh_up, sh_down)
++    assert (ex.count, ex.width, ex.dims, ex.swiglu) == (E, I, D, True)
++
++    plan = _Plan(R, slots, E)
++    x = torch.randn(R, D, device="cuda", dtype=torch.bfloat16)
++
++    act = torch.empty(R * slots, I, device="cuda", dtype=torch.bfloat16)
++    ex.run_gate_up(x, plan, act, R)
++
++    g0 = torch.from_numpy(DEQUANTIZERS[quant](_raw(quant, I, D, 1), (I, D))).cuda().float()
++    u0 = torch.from_numpy(DEQUANTIZERS[quant](_raw(quant, I, D, 10), (I, D))).cuda().float()
++    xf = x.float()
++    ref_routed = (xf @ g0.T) * torch.sigmoid(xf @ g0.T) * (xf @ u0.T)
++    ref_shared = (xf @ sh_gate.float().T) * torch.sigmoid(xf @ sh_gate.float().T) * (xf @ sh_up.float().T)
++    a = act.float().view(R, slots, I)
++    tol = 0.05 * ref_routed.abs().max().item() + 0.1
++    assert (a[:, 0, :] - ref_routed).abs().max().item() < tol
++    tol_sh = 0.03 * ref_shared.abs().max().item() + 0.1
++    assert (a[:, 1, :] - ref_shared).abs().max().item() < tol_sh
++
++    out = torch.empty(R * slots, D, device="cuda", dtype=torch.float32)
++    ex.run_down(act, plan, out, R)
++
++    d0 = torch.from_numpy(DEQUANTIZERS[quant](_raw(quant, D, I, 20), (D, I))).cuda().float()
++    y = out.view(R, slots, D)
++    ref_y = (act.float() @ d0.T).view(R, slots, D)
++    ref_ys = act.float().view(R, slots, I)[:, 1, :] @ sh_down.float().T
++    tol_d = 0.05 * ref_y.abs().max().item() + 0.1
++    assert (y[:, 0, :] - ref_y[:, 0, :]).abs().max().item() < tol_d
++    tol_ds = 0.03 * ref_ys.abs().max().item() + 0.1
++    assert (y[:, 1, :] - ref_ys).abs().max().item() < tol_ds
+-- 
+2.53.0.windows.2
+

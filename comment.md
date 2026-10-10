@@ -44,6 +44,10 @@ output stays byte-exact. Numbers: `README.md` §5.6; patch `0013`; receipt
 
 `0015` (ours) writes an evicted kept prefix to disk and resumes the **longest** stored prefix on a later miss, so a **cold restart** stops re-prefilling repeated prompts. It is *not* a hot-path speedup — the kept prefix already lives in VRAM; the value is surviving a restart. Honest scope: **off by default** (`TF_SPILL_GIB`), `--parallel` only, text only. A/B (one GB10, `temperature 0`): a re-sent ~6k prefix after a cold restart came back `cached_tokens` **0 → 4096** with an **identical `token_sha`** (wall 3.43 → 2.12 s); under a 10-session stress, **4/10** prefixes resumed from disk after a cold restart, with no regression on the misses. Numbers: `README.md` §5.8; notes `receipts/P21-prefix-spill-notes.md`.
 
+### 6. Off-theme additions (`0016`–`0017`)
+
+Two further patches ship in this repo, unrelated to the Qwen3.8-Flash-Next EXL3 stack above: `0016` (ours) adds a **compressed-tensors NVFP4** read path for `Qwen3.6-35B-A3B` routed experts (MoE) on the CUDA backend, and `0017` (ours) adds a generic **GGUF reader** with on-the-fly CUDA dequant — a dense `qwen3_5` path plus grouped `qwen3_5_moe` expert kernels. Both are additive; neither changes the EXL3 path or any number in this post.
+
 ### Still to polish
 
 - **Video multi-turn cache reuse** is not separately measured — it flows through the same path as images, but I did not test it on its own.

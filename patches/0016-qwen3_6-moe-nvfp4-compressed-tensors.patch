@@ -1,0 +1,483 @@
+From 88a787fed448438be1f8b790f5a8a8158d8c04d6 Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 10:13:29 +0000
+Subject: [PATCH] feat(qwen3.6 moe cuda): read compressed-tensors NVFP4 routed
+ experts + MTP
+
+- qwen3_5/nvfp4_load: optional mlp= callback so the MoE family builds its own
+  mlp fields; intermediate falls back to shared_expert/moe_intermediate_size
+- cuda/moe: dispatch nvx.Experts4 in moe()
+- qwen3_5_moe: QUANT_METHODS + check() admit modelopt/compressed-tensors
+- qwen3_5_moe/cuda/weights: routed4() folds E routed experts + the shared expert
+  into one Experts4 table (E+1 rows), reciprocal global scale for compressed-tensors;
+  MTP nvfp4 path from model-mtp.safetensors (bf16 fc/attn as dense QLinear,
+  experts quantized from the fused bf16 gate_up/down); MTP_FILES naming
+- qwen3_5_moe/cuda: engine admission + MTP weights; mtp.py uses _mm and glue.embedding
+- test: tests/test_qwen36_moe_check.py
+---
+ src/tensorfold/cuda/moe.py                    |  16 ++-
+ .../families/qwen3_5/cuda/nvfp4_load.py       |  20 +++-
+ .../families/qwen3_5/cuda/weights.py          |   7 +-
+ .../families/qwen3_5_moe/__init__.py          |  16 ++-
+ .../families/qwen3_5_moe/cuda/engine.py       |  15 ++-
+ .../families/qwen3_5_moe/cuda/mtp.py          |   9 +-
+ .../families/qwen3_5_moe/cuda/weights.py      | 106 +++++++++++++++++-
+ tests/test_qwen36_moe_check.py                |  69 ++++++++++++
+ 8 files changed, 229 insertions(+), 29 deletions(-)
+ create mode 100644 tests/test_qwen36_moe_check.py
+
+diff --git a/src/tensorfold/cuda/moe.py b/src/tensorfold/cuda/moe.py
+index 9f0ae90..c30200f 100644
+--- a/src/tensorfold/cuda/moe.py
++++ b/src/tensorfold/cuda/moe.py
+@@ -9,6 +9,7 @@ import triton
+ import triton.language as tl
+ 
+ from . import experts as grouped
++from .nvfp4 import experts as nvx
+ 
+ 
+ def _tile(m: int) -> int:
+@@ -116,12 +117,21 @@ def select(logits: torch.Tensor, buf: MoEBuffers, top_k: int, experts: int,
+     grouped.route(buf.pick[:logits.shape[0]], buf.plan, tile)
+ 
+ 
+-def moe(x: torch.Tensor, router_rows: torch.Tensor, ex: grouped.Experts, buf: MoEBuffers, top_k: int,
++def moe(x: torch.Tensor, router_rows: torch.Tensor, ex, buf: MoEBuffers, top_k: int,
+         experts: int) -> MoEBuffers:
+-    """Route x [R, D] and run its experts into buf.y [R, k + 1, D] (bf16 in prefill); slot k is the shared expert."""
++    """Route x [R, D] and run its experts into buf.y [R, k + 1, D] (bf16 in prefill); slot k is the shared expert.
++
++    ``ex`` is MLX affine experts (``grouped.Experts``) or NVFP4 ones (``nvx.Experts4``), which use their own tile
++    and kernels.
++    """
+ 
+     rows = x.shape[0]
+     router(x, router_rows, buf.logits[:rows])
++    if isinstance(ex, nvx.Experts4):
++        select(buf.logits[:rows], buf, top_k, experts, nvx.PREFILL_TILE)
++        nvx.gate_up(x, ex, buf.plan, buf.act.view(-1, ex.width), rows)
++        nvx.down(buf.act.view(-1, ex.width), ex, buf.plan, buf.y.view(-1, ex.dims), rows)
++        return buf
+     select(buf.logits[:rows], buf, top_k, experts)
+     grouped.gate_up(x, ex, buf.plan, buf.act.view(-1, ex.width), rows)
+     grouped.down(buf.act.view(-1, ex.width), ex, buf.plan, buf.y.view(-1, ex.dims), rows)
+@@ -156,7 +166,7 @@ class Routed:
+     """A layer's router rows [E + 1, D] bf16 (the shared expert's gate row last) and its E + 1 experts."""
+ 
+     router: torch.Tensor
+-    experts: grouped.Experts
++    experts: object
+     top_k: int
+ 
+     @property
+diff --git a/src/tensorfold/families/qwen3_5/cuda/nvfp4_load.py b/src/tensorfold/families/qwen3_5/cuda/nvfp4_load.py
+index a24779c..d3d27ba 100644
+--- a/src/tensorfold/families/qwen3_5/cuda/nvfp4_load.py
++++ b/src/tensorfold/families/qwen3_5/cuda/nvfp4_load.py
+@@ -70,7 +70,9 @@ def admission(geometry):
+     from tensorfold.cuda.geometry import with_fixed
+ 
+     def with_staging(text):
+-        d, i = int(text["hidden_size"]), int(text["intermediate_size"])
++        d = int(text["hidden_size"])
++        i = int(text.get("intermediate_size") or text.get("shared_expert_intermediate_size")
++                or text.get("moe_intermediate_size"))
+         return with_fixed(geometry(text), d * i + d * i // 32 + (4 << 20)) if prompt_precision.fp8() else geometry(text)
+ 
+     return with_staging, weight_bytes
+@@ -98,8 +100,12 @@ def maths() -> tuple[dict[str, bool], str]:
+     return own, f"full ({gpu} has neither the block-scaled FP4 nor the FP8 mma): bf16 activations, the stored weights"
+ 
+ 
+-def load_nvfp4(model_dir: str | Path, device: str = "cuda"):
+-    """NVFP4 and FP8 projections at full precision or in the checkpoint's own math, bf16 ones as stored."""
++def load_nvfp4(model_dir: str | Path, device: str = "cuda", *, mlp=None):
++    """NVFP4 and FP8 projections at full precision or in the checkpoint's own math, bf16 ones as stored.
++
++    ``mlp`` (the MoE families) builds a layer's feed-forward from the checkpoint's raw tensors instead of the three
++    dense projections: called as ``mlp(prefix, tensors, config)`` with ``prefix`` the layer's ``mlp.`` path.
++    """
+ 
+     from tensorfold.cuda.capacity import headers
+     from tensorfold.cuda.nvfp4 import format as fmt
+@@ -180,10 +186,14 @@ def load_nvfp4(model_dir: str | Path, device: str = "cuda"):
+             attn = Attention(q=linear(q + "self_attn.q_proj"), k=linear(q + "self_attn.k_proj"),
+                              v=linear(q + "self_attn.v_proj"), o=linear(q + "self_attn.o_proj"),
+                              q_norm=norm(p + "self_attn.q_norm.weight"), k_norm=norm(p + "self_attn.k_norm.weight"))
++        if mlp is not None:
++            fields = mlp(q + "mlp.", t, cfg)
++        else:
++            fields = {"gate": linear(q + "mlp.gate_proj"), "up": linear(q + "mlp.up_proj"),
++                      "down": linear(q + "mlp.down_proj")}
+         layers.append(Layer(linear=cfg.is_linear(i), input_norm=norm(p + "input_layernorm.weight"),
+                             post_norm=norm(p + "post_attention_layernorm.weight"), gdn=gdn, attn=attn,
+-                            gate=linear(q + "mlp.gate_proj"), up=linear(q + "mlp.up_proj"),
+-                            down=linear(q + "mlp.down_proj")))
++                            **{"gate": None, "up": None, "down": None, **fields}))
+     if not any(n.startswith("lm_head.") for n in info):
+         raise ValueError("this checkpoint ties its head to the embedding; the CUDA engine reads a separate lm_head")
+     w = Weights(config=cfg, embed=Plain(get("embed_tokens.weight").to(torch.bfloat16)), layers=layers,
+diff --git a/src/tensorfold/families/qwen3_5/cuda/weights.py b/src/tensorfold/families/qwen3_5/cuda/weights.py
+index 199964f..7f8d09d 100644
+--- a/src/tensorfold/families/qwen3_5/cuda/weights.py
++++ b/src/tensorfold/families/qwen3_5/cuda/weights.py
+@@ -267,8 +267,9 @@ class _Tensors:
+         self.files.close()                    # the reader's pinned staging goes back to the system
+ 
+ 
+-def load(model_dir: str | Path, device: str = "cuda", *, tiled: bool = False, mlp=None) -> Weights:
+-    """MLX affine 4-bit (``tiled``: projections packed as read; ``mlp(prefix, get, qlinear, cfg)``: a layer's MLP fields), an EXL3 pack, or NVFP4."""
++def load(model_dir: str | Path, device: str = "cuda", *, tiled: bool = False, mlp=None,
++         nvfp4_mlp=None) -> Weights:
++    """MLX affine 4-bit (``tiled``: projections packed as read; ``mlp(prefix, get, qlinear, cfg)``: a layer's MLP fields), an EXL3 pack, or NVFP4 (``nvfp4_mlp(prefix, tensors, cfg)``: a layer's MLP fields)."""
+ 
+     from .exl3_load import load_exl3, quant_config
+     from .nvfp4_load import load_nvfp4, quantized
+@@ -277,7 +278,7 @@ def load(model_dir: str | Path, device: str = "cuda", *, tiled: bool = False, ml
+     if quant_config(model_dir) is not None:
+         return load_exl3(model_dir, device)
+     if quantized(model_dir):
+-        return load_nvfp4(model_dir, device)
++        return load_nvfp4(model_dir, device, mlp=nvfp4_mlp)
+     cfg = Config.read(model_dir)
+     raw = json.loads((model_dir / "config.json").read_text())
+     t = _Tensors(model_dir, device)
+diff --git a/src/tensorfold/families/qwen3_5_moe/__init__.py b/src/tensorfold/families/qwen3_5_moe/__init__.py
+index ac27e85..5389214 100644
+--- a/src/tensorfold/families/qwen3_5_moe/__init__.py
++++ b/src/tensorfold/families/qwen3_5_moe/__init__.py
+@@ -16,19 +16,23 @@ DRAFTER = ""                  # Macs and CUDA draft with the checkpoint's MTP la
+ DFLASH = "z-lab/Qwen3.6-35B-A3B-DFlash"       # Macs, --drafter: chains of each position's own argmax
+ KERNEL_PACKAGE = "tensorfold.kernels.qwen.dense.v1"
+ KERNEL_VERSION = "v1"
+-# the CUDA engine's kernels read MLX affine weights of this (bits, group size)
++# the CUDA engine's kernels read MLX affine weights of this (bits, group size), or an NVFP4 / FP8 export
++QUANT_METHODS = {"cuda": ("mlx", "modelopt", "compressed-tensors")}
+ CUDA_QUANTIZATION = (4, 64)
+ CUDA_PREFILL_FP8 = True            # --prefill-fp8: the attention and DeltaNet projections' FP8 prompt kernel
+ 
+ 
+ def check(model_dir: str | Path) -> None:
+-    """One GPU, MLX 4-bit weights in groups of 64."""
++    """One GPU: MLX 4-bit weights in groups of 64, or a ModelOpt/compressed-tensors NVFP4 (W4A16-packed) export."""
+ 
+-    from tensorfold.families import OWN_MODEL_HELP, describe_quantization, quantization, read_config
++    from tensorfold.families import OWN_MODEL_HELP, describe_quantization, quant_method, quantization, read_config
+ 
+-    if quantization(read_config(model_dir)) != CUDA_QUANTIZATION:
+-        raise ValueError(f"{TITLE}'s CUDA engine reads MLX 4-bit weights in groups of 64 ({MODELS[0]}); this "
+-                         f"checkpoint has {describe_quantization(read_config(model_dir))}. {OWN_MODEL_HELP}")
++    config = read_config(model_dir)
++    if quant_method(config) in ("modelopt", "compressed-tensors"):
++        return
++    if quantization(config) != CUDA_QUANTIZATION:
++        raise ValueError(f"{TITLE}'s CUDA engine reads MLX 4-bit weights in groups of 64 ({MODELS[0]}) or an NVFP4 "
++                         f"export; this checkpoint has {describe_quantization(read_config(model_dir))}. {OWN_MODEL_HELP}")
+ 
+ 
+ def mtp_file(model_dir: Path) -> Path | None:
+diff --git a/src/tensorfold/families/qwen3_5_moe/cuda/engine.py b/src/tensorfold/families/qwen3_5_moe/cuda/engine.py
+index ce898d9..4164201 100644
+--- a/src/tensorfold/families/qwen3_5_moe/cuda/engine.py
++++ b/src/tensorfold/families/qwen3_5_moe/cuda/engine.py
+@@ -52,23 +52,26 @@ class Qwen36Engine:
+         from tensorfold.cuda.geometry import gdn_geometry, linear_weights
+         from tensorfold.cuda.markers import resume_points
+         from tensorfold.cuda.streams import PrefixCache
++        from tensorfold.families.qwen3_5.cuda.nvfp4_load import admission, quantized
+ 
+         from .mtp import Head
+-        from .weights import MTP_FILE, load, load_mtp
++        from .weights import MTP_FILES, load, load_mtp
+ 
+         torch.cuda.set_device(0)
+         self.depth, self.confidence = int(depth), float(confidence)
+         many = streams > 1
+         if many:             # streams' caches of many sizes come and go: growable segments, less slack
+             torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+-        extra = (Path(model_dir) / MTP_FILE,) if self.depth and (Path(model_dir) / MTP_FILE).is_file() else ()
++        extra = (tuple(Path(model_dir) / name for name in MTP_FILES if (Path(model_dir) / name).is_file())
++                 if self.depth else ())
+         # one admission for one stream or many (every stream's states and caches, kept prompt ends), before any load
+         geometry = ((lambda text: stream_geometry(text, streams, KEEP_MANY, self.depth)) if many else
+                     (lambda text: gdn_geometry(text, 1, self.depth + 1, mtp=self.depth > 0)))
+-        self.capacity_plan = admit(model_dir, context, context_explicit, torch, geometry,
+-                                   lambda name, info: (mtp_weights(name, info) if ".mtp." in name
+-                                                       else linear_weights(name, info)),
+-                                   extra_files=extra)
++        weights = (lambda name, info: (mtp_weights(name, info) if (".mtp." in name or name.startswith("mtp."))
++                                       else linear_weights(name, info)))
++        if quantized(model_dir):       # ModelOpt / compressed-tensors: staging buffers and their tensor bytes
++            geometry, weights = admission(geometry)
++        self.capacity_plan = admit(model_dir, context, context_explicit, torch, geometry, weights, extra_files=extra)
+         self.context_window = self.capacity_plan["context_window"]
+         self.w = load(model_dir)
+         self.head = self.graphs = None
+diff --git a/src/tensorfold/families/qwen3_5_moe/cuda/mtp.py b/src/tensorfold/families/qwen3_5_moe/cuda/mtp.py
+index c004fab..7c3fa04 100644
+--- a/src/tensorfold/families/qwen3_5_moe/cuda/mtp.py
++++ b/src/tensorfold/families/qwen3_5_moe/cuda/mtp.py
+@@ -11,7 +11,8 @@ from tensorfold.cuda import moe
+ from tensorfold.cuda.kernels import attention as tree_attention
+ from tensorfold.cuda.kernels.prefill_attention import attention as prefill_attention
+ from tensorfold.families.qwen3_5.cuda import glue
+-from tensorfold.families.qwen3_5.cuda.qmm_fast import matmul, tile, untile
++from tensorfold.families.qwen3_5.cuda.forward import _mm as matmul
++from tensorfold.families.qwen3_5.cuda.qmm_fast import tile, untile
+ from tensorfold.families.qwen3_5.cuda.weights import QLinear, Weights
+ 
+ from .weights import MTP
+@@ -73,7 +74,9 @@ class Head:
+     def __init__(self, w: Weights, m: MTP, ids: np.ndarray | None = None) -> None:
+         self.w, self.m = w, m
+         self.ids, self.head = None, w.head
+-        if ids is not None:                           # score only these token ids when drafting
++        if getattr(m, "head", None) is not None:      # NVFP4: the checkpoint's own head, scored over the full vocab
++            self.head = m.head
++        elif ids is not None:                         # score only these token ids when drafting
+             full = untile(w.head)
+             self.ids = torch.as_tensor(ids, dtype=torch.int64, device=w.norm.device)
+             self.head = tile(QLinear(full.weight[self.ids].contiguous(), full.scales[self.ids].contiguous(),
+@@ -148,7 +151,7 @@ class Head:
+ 
+         w, m, c = self.w, self.m, self.w.config
+         n = states.shape[0]
+-        e = glue.embed(ids, w.embed.weight, w.embed.scales, w.embed.biases, c.hidden)
++        e = glue.embedding(ids, w.embed)
+         _, en, exs = glue.add_rmsnorm(e, None, m.norm_e, c.eps)
+         _, hn, hxs = glue.add_rmsnorm(states.contiguous(), None, m.norm_h, c.eps)
+         x = (matmul(en, m.fc_e, exs).float() + matmul(hn, m.fc_h, hxs).float()).to(torch.bfloat16)
+diff --git a/src/tensorfold/families/qwen3_5_moe/cuda/weights.py b/src/tensorfold/families/qwen3_5_moe/cuda/weights.py
+index 98e020e..bc20519 100644
+--- a/src/tensorfold/families/qwen3_5_moe/cuda/weights.py
++++ b/src/tensorfold/families/qwen3_5_moe/cuda/weights.py
+@@ -14,6 +14,7 @@ from tensorfold.cuda.moe import Routed
+ from tensorfold.families.qwen3_5.cuda.weights import Attention, QLinear, Weights, load as load_dense
+ 
+ MTP_FILE = "mtp-4bit.safetensors"      # the MTP layer beside a checkpoint whose conversion dropped it
++MTP_FILES = ("mtp-4bit.safetensors", "model-mtp.safetensors")   # the MLX side file, or an NVFP4 export's own
+ GS = 64
+ 
+ 
+@@ -51,11 +52,49 @@ def routed(prefix: str, get: Callable, top_k: int) -> Routed:
+     return Routed(router.to(torch.bfloat16).contiguous(), experts, int(top_k))
+ 
+ 
++def routed4(prefix: str, t, cfg) -> dict:
++    """A layer's NVFP4 (ModelOpt or compressed-tensors) routed experts for the grouped kernel.
++
++    The routed experts are stored one tensor a projection; the shared expert, quantized in the same scheme, becomes
++    the last row (index ``num_experts``) exactly as the MLX path stacks ``switch_mlp`` with ``shared_expert``.
++    """
++
++    from tensorfold.cuda.nvfp4 import experts as nvx
++
++    def read(name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        """One projection's packed words, e4m3 scales and the per-expert global scale (compressed-tensors stores its
++        reciprocal)."""
++
++        if name + ".weight_global_scale" in t:
++            g = 1.0 / t.pop(name + ".weight_global_scale").float().reshape(-1)[0]
++        elif name + ".weight_scale_2" in t:
++            g = t.pop(name + ".weight_scale_2").float().reshape(-1)[0]
++        else:
++            g = torch.ones((), dtype=torch.float32, device=t.device)
++        w = t.pop(name + ".weight_packed") if name + ".weight_packed" in t else t.pop(name + ".weight")
++        s = t.pop(name + ".weight_scale")
++        for extra in ("input_global_scale", "input_scale"):
++            if name + "." + extra in t:
++                t.pop(name + "." + extra)
++        return w.view(torch.uint8).contiguous(), s.contiguous(), g.to(torch.float32)
++
++    def table(proj: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        rows = [read(f"{prefix}experts.{e}.{proj}") for e in range(int(cfg.experts))]
++        rows.append(read(f"{prefix}shared_expert.{proj}"))
++        return (torch.stack([r[0] for r in rows]), torch.stack([r[1] for r in rows]),
++                torch.stack([r[2] for r in rows]))
++
++    router = torch.cat([t.pop(prefix + "gate.weight"), t.pop(prefix + "shared_expert_gate.weight")])
++    experts = nvx.make(table("gate_proj"), table("up_proj"), table("down_proj"))
++    return {"moe": Routed(router.to(torch.bfloat16).contiguous(), experts, int(cfg.top_k))}
++
++
+ def load(model_dir: str | Path) -> Weights:
+     """The checkpoint on the GPU, projections packed for the shared matmul and experts for the grouped kernels."""
+ 
+     return load_dense(model_dir, tiled=True,
+-                      mlp=lambda prefix, get, qlinear, cfg: {"moe": routed(prefix, get, cfg.top_k)})
++                      mlp=lambda prefix, get, qlinear, cfg: {"moe": routed(prefix, get, cfg.top_k)},
++                      nvfp4_mlp=routed4)
+ 
+ 
+ @dataclass
+@@ -71,6 +110,7 @@ class MTP:
+     attn: Attention
+     moe: Routed
+     norm: torch.Tensor
++    head: object = None       # an NVFP4 checkpoint's own head (its bf16 lm_head is not the MLX 4-bit one)
+ 
+ 
+ def mtp_tensors(model_dir: str | Path) -> dict[str, torch.Tensor] | None:
+@@ -79,7 +119,7 @@ def mtp_tensors(model_dir: str | Path) -> dict[str, torch.Tensor] | None:
+     from tensorfold.cuda.direct_read import SafeTensors
+ 
+     model_dir = Path(model_dir)
+-    files = [model_dir / MTP_FILE] if (model_dir / MTP_FILE).is_file() else []
++    files = [model_dir / name for name in MTP_FILES if (model_dir / name).is_file()]
+     index = model_dir / "model.safetensors.index.json"
+     if not files and index.is_file():
+         names = json.loads(index.read_text())["weight_map"]
+@@ -93,9 +133,12 @@ def mtp_tensors(model_dir: str | Path) -> dict[str, torch.Tensor] | None:
+     return out or None
+ 
+ 
+-def load_mtp(model_dir: str | Path, w: Weights, device: str = "cuda") -> MTP | None:
++def load_mtp(model_dir: str | Path, w: Weights, device: str = "cuda", ids=None) -> MTP | None:
+     """The MTP layer on the GPU, packed like the model's own layers, or None if the checkpoint has none."""
+ 
++    if getattr(w, "quant", None) == "nvfp4":
++        return load_mtp_nvfp4(model_dir, w, device, ids)
++
+     from tensorfold.families.qwen3_5.cuda.qmm_fast import tile
+ 
+     raw = mtp_tensors(model_dir)
+@@ -129,3 +172,60 @@ def load_mtp(model_dir: str | Path, w: Weights, device: str = "cuda") -> MTP | N
+     if raw:
+         raise ValueError(f"unused MTP tensors: {sorted(raw)[:5]}")
+     return m
++
++
++def load_mtp_nvfp4(model_dir: str | Path, w: Weights, device: str = "cuda", ids=None) -> MTP | None:
++    """An NVFP4 export's bf16 MTP layer (``model-mtp.safetensors``) with its experts quantized on load.
++
++    The side file keeps fc, the one attention layer and every norm in bf16; its routed experts arrive fused
++    (``experts.gate_up_proj`` and ``experts.down_proj``), so they are NVFP4-quantized here and the shared expert joins
++    as the last row, matching ``routed4`` and the model's own layers.
++    """
++
++    from tensorfold.cuda.nvfp4 import experts as nvx
++
++    raw = mtp_tensors(model_dir)
++    if raw is None:
++        return None
++
++    def get(name: str) -> torch.Tensor:
++        return raw.pop("mtp." + name).to(device)
++
++    def plain(name: str) -> QLinear:
++        return QLinear(get(name + ".weight").to(torch.bfloat16).contiguous(), None, None, layout="dense", bits=0, gs=0)
++
++    def norm(name: str) -> torch.Tensor:
++        v = get(name)
++        return (v.float() + 1.0).to(v.dtype).contiguous()      # the export writes gamma - 1, as the text model does
++
++    d = w.config.hidden
++    fc = get("fc.weight").to(torch.bfloat16)
++    p = "layers.0."
++    attn = Attention(q=plain(p + "self_attn.q_proj"), k=plain(p + "self_attn.k_proj"),
++                     v=plain(p + "self_attn.v_proj"), o=plain(p + "self_attn.o_proj"),
++                     q_norm=norm(p + "self_attn.q_norm.weight"), k_norm=norm(p + "self_attn.k_norm.weight"))
++    m = MTP(norm_e=norm("pre_fc_norm_embedding.weight"), norm_h=norm("pre_fc_norm_hidden.weight"),
++            fc_e=QLinear(fc[:, :d].contiguous(), None, None, layout="dense", bits=0, gs=0),
++            fc_h=QLinear(fc[:, d:].contiguous(), None, None, layout="dense", bits=0, gs=0),
++            input_norm=norm(p + "input_layernorm.weight"), post_norm=norm(p + "post_attention_layernorm.weight"),
++            attn=attn, moe=_mtp_moe(get, w.config), norm=norm("norm.weight"), head=w.head)
++    if raw:
++        raise ValueError(f"unused MTP tensors: {sorted(raw)[:5]}")
++    return m
++
++
++def _mtp_moe(get: Callable, cfg) -> Routed:
++    """The MTP layer's routed experts (fused bf16) plus its shared expert, NVFP4-quantized into one table."""
++
++    from tensorfold.cuda.nvfp4 import experts as nvx
++
++    gu = get("layers.0.mlp.experts.gate_up_proj").to(torch.bfloat16)
++    dn = get("layers.0.mlp.experts.down_proj").to(torch.bfloat16)
++    half = gu.shape[1] // 2
++    parts = [nvx.quantize(gu[:, :half].contiguous()), nvx.quantize(gu[:, half:].contiguous()), nvx.quantize(dn)]
++    sh = [nvx.quantize(get(f"layers.0.mlp.shared_expert.{proj}_proj.weight").to(torch.bfloat16)[None])
++          for proj in ("gate", "up", "down")]
++    tables = [tuple(torch.cat([a, b]) for a, b in zip(part, shared)) for part, shared in zip(parts, sh)]
++    router = torch.cat([get("layers.0.mlp.gate.weight").to(torch.bfloat16),
++                        get("layers.0.mlp.shared_expert_gate.weight").to(torch.bfloat16)])
++    return Routed(router.contiguous(), nvx.make(*tables), int(cfg.top_k))
+diff --git a/tests/test_qwen36_moe_check.py b/tests/test_qwen36_moe_check.py
+new file mode 100644
+index 0000000..fe119ba
+--- /dev/null
++++ b/tests/test_qwen36_moe_check.py
+@@ -0,0 +1,69 @@
++"""Qwen3.6 MoE on CUDA: NVFP4 checkpoints (ModelOpt, compressed-tensors) are read; Macs keep the MLX rule."""
++
++import json
++
++import pytest
++
++from tensorfold import families
++from tensorfold.families import qwen3_5_moe
++
++UNIFORM = {"model_type": "qwen3_5_moe", "quantization": {"bits": 4, "group_size": 64, "mode": "affine"},
++           "text_config": {"model_type": "qwen3_5_moe_text"}}
++MIXED = {"model_type": "qwen3_5_moe", "quantization": {"bits": 8, "group_size": 64, "mode": "affine"},
++         "text_config": {"model_type": "qwen3_5_moe_text"}}
++UNQUANTIZED = {"model_type": "qwen3_5_moe", "text_config": {"model_type": "qwen3_5_moe_text"}}
++MODELOPT = {"model_type": "qwen3_5_moe", "text_config": {
++    "model_type": "qwen3_5_moe_text",
++    "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4",
++                            "config_groups": {"group_0": {"weights": {"num_bits": 4, "type": "float"}}}}}}
++COMPRESSED = {"model_type": "qwen3_5_moe", "text_config": {
++    "model_type": "qwen3_5_moe_text",
++    "quantization_config": {"quant_method": "compressed-tensors", "format": "nvfp4-pack-quantized",
++                            "config_groups": {"group_0": {"weights": {"num_bits": 4, "type": "float"}}}}}}
++FP8 = {"model_type": "qwen3_5_moe", "text_config": {
++    "model_type": "qwen3_5_moe_text",
++    "quantization_config": {"quant_method": "compressed-tensors", "format": "float-quantized",
++                            "config_groups": {"group_0": {"weights": {"num_bits": 8, "type": "float"}}}}}}
++INT4 = {"model_type": "qwen3_5_moe", "text_config": {
++    "model_type": "qwen3_5_moe_text",
++    "quantization_config": {"quant_method": "compressed-tensors", "format": "nvfp4-pack-quantized",
++                            "config_groups": {"group_0": {"weights": {"num_bits": 4, "type": "int"}}}}}}    # int, not float
++
++
++def _config(tmp_path, config):
++    (tmp_path / "config.json").write_text(json.dumps(config))
++    return tmp_path
++
++
++@pytest.mark.parametrize("config", [MODELOPT, COMPRESSED, FP8])
++def test_the_cuda_engine_reads_nvfp4_and_fp8(tmp_path, config):
++    families.require_readable(families.detect(_config(tmp_path, config)), config, "cuda")
++    qwen3_5_moe.check(_config(tmp_path, config))
++
++
++def test_the_mlx_rule_still_holds_on_cuda(tmp_path):
++    qwen3_5_moe.check(_config(tmp_path, UNIFORM))
++    with pytest.raises(ValueError, match="groups of 64"):
++        qwen3_5_moe.check(_config(tmp_path, MIXED))
++
++
++def test_macs_keep_the_mlx_rule_and_refuse_nvfp4(tmp_path):
++    families.require_readable(families.detect(_config(tmp_path, UNIFORM)), UNIFORM, "mlx")
++    with pytest.raises(ValueError, match="does not read"):
++        families.require_readable(families.detect(_config(tmp_path, COMPRESSED)), COMPRESSED, "mlx")
++
++
++def test_cuda_refuses_unreadable_weights(tmp_path):
++    with pytest.raises(ValueError, match="does not read"):
++        families.require_readable(families.detect(_config(tmp_path, UNQUANTIZED)), UNQUANTIZED, "cuda")
++    with pytest.raises(ValueError, match="int weights"):
++        families.require_readable(families.detect(_config(tmp_path, INT4)), INT4, "cuda")
++
++
++def test_the_engine_takes_nvfp4_directories(tmp_path, monkeypatch):
++    from tensorfold.families.qwen3_5_moe.cuda import engine
++
++    made = {}
++    monkeypatch.setattr(engine, "Qwen36Engine", lambda path, **kw: made.update(kw) or "engine")
++    assert qwen3_5_moe.cuda_engine(_config(tmp_path, COMPRESSED)) == "engine"
++    assert made["depth"] == 3
+-- 
+2.53.0.windows.2
+

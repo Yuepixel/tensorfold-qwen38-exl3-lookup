@@ -4,7 +4,7 @@
 > link to this file and asked you to "install it", follow the steps below end to end,
 > report what you ran, and stop and ask if a step cannot be completed.
 
-Goal: build **TensorFold `v0.6.5` + 15 patches** and serve **Qwen3.8-Flash-Next
+Goal: build **TensorFold `v0.6.5` + 17 patches** and serve **Qwen3.8-Flash-Next
 (EXL3 3.05 bpw)** on a single **DGX Spark (GB10)**, giving **~2.4× EXL3 prefill**
 (≈1700 t/s vs ~700), the **prompt-lookup drafter** on top, plus **native image/video**
 input and an **image-history prefix cache** for multi-turn image chats, with byte-exact
@@ -46,7 +46,7 @@ git -C TensorFold am /path/to/tensorfold-qwen38-exl3-lookup/patches/*.patch
 # fallback if `am` complains: for p in .../patches/*.patch; do git -C TensorFold apply "$p"; done
 ```
 
-Fifteen patches, in order: `0001`–`0004` are the EXL3 prompt-GEMM work (the prefill
+Seventeen patches, in order: `0001`–`0004` are the EXL3 prompt-GEMM work (the prefill
 lift), `0005`/`0006` add the prompt-lookup drafter, `0007` adds the width-gated
 two-chunk ring (another +13–15 % prefill; port of PR #283). `0008`–`0011` add native
 **image + video + multi-image** input (the vision tower rides a FP16 sidecar next to the
@@ -55,7 +55,10 @@ of PR #263, fixes #414); `0013` (ours, not a port) keeps the solo graph slot hot
 cold prefix miss, removing the cold lone-stream decode graph-recapture penalty; `0014`
 (port of `grearjake-star`'s `sys-checkpoint` branch) keeps a system-block checkpoint so
 long shared prefixes stop re-prefilling; `0015` (ours) spills a kept prefix to disk so it
-survives a server restart (`--parallel`; off by default, see §5). No conflicts expected.
+survives a server restart (`--parallel`; off by default, see §5). `0016` (ours) adds a
+**Qwen3.6-35B-A3B NVFP4 (compressed-tensors)** MoE read path and `0017` (ours) adds a
+generic **GGUF reader with CUDA on-the-fly dequant** (dense `qwen3_5` + grouped MoE
+experts `qwen3_5_moe`) — both are off-theme additions to this EXL3 fork. No conflicts expected.
 
 ## 3. Build the CUDA extension
 

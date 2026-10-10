@@ -69,7 +69,7 @@ P18 的客户端方案（opencode 插件 `freezeInjection`）冻结注入块，�
 ## 7. 复现：间歇冷 miss 的根因 = 检查点与 message-start 状态共用 kept 计数（2026-10-10 `[手动]`）
 
 - 背景：P20 长跑采集端到端自测时，4 个「同大 system 块、尾不同」请求命中呈间歇（`0/8192/0/8192`），非 A/B 里的干净 12/12，遂单独复现。
-- 探针 `tools/p20_repro.py`（SMB `/home/yueyue/p20_repro.py`）：同 system 块（`"lorem ipsum…elit "*950` ≈ 51300 字符）+ 各自不同尾；`temperature=0 max_tokens=16 return_token_ids`；模式 `seq`（顺序）/`conc`（多线程并发），参数 n。命中读响应顶层 `tensorfold.cached`，检查点落点本机 = **7644**（system 块约 7900 tok）。
+- 探针 `tools/p20_repro.py`（SMB `/home/user/p20_repro.py`）：同 system 块（`"lorem ipsum…elit "*950` ≈ 51300 字符）+ 各自不同尾；`temperature=0 max_tokens=16 return_token_ids`；模式 `seq`（顺序）/`conc`（多线程并发），参数 n。命中读响应顶层 `tensorfold.cached`，检查点落点本机 = **7644**（system 块约 7900 tok）。
 - 冷重启后实测 `(tag:cached)`：
   - **并发 6（冷）**：`0:0, 1:7644, 2:7644, 3:0, 4:0, 5:7644` → 3 冷 3 中。
   - **并发 6（热，紧接着再跑）**：`0:7644, 1:0, 2:0, 3:7644, 4:7644, 5:7644` → 4 中 2 冷。
