@@ -495,6 +495,12 @@ Copyright 2026 Yuepixel).
   [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 - Receipts are data; reuse freely.
 
+## 9. 致谢 / Acknowledgments
+
+谨向 TensorFold 的原作者 **ashhart** 致以最诚挚的谢意：是他开辟了这条路，没有他卓越的贡献，就没有我们后来的一切工作。感谢 **米亚（MiaAI-Lab）** 的指引——她在 X 上的内容推广与配方分享，让我们得以一次次继续向前。也感谢每一位补丁作者，我们已在他们的作品处一一署名：正是在他们工作的基础上，我们才能在 TensorFold v0.6.5 之上做出这一系列改进。由衷感谢你们。
+
+We owe a most sincere thank-you to **ashhart**, the original author of TensorFold: he blazed this trail, and without his outstanding contribution none of the work that followed would exist. Our gratitude to **Mia (MiaAI-Lab)** for the guidance — her promotion on X and the recipes she shared are what let us keep moving forward. And our thanks to every patch author, each credited where their work appears: it is on their shoulders that we built this series of improvements on top of TensorFold v0.6.5. Thank you, sincerely.
+
 ---
 
 *This article was completed with the assistance of DeepSeek AI.*
