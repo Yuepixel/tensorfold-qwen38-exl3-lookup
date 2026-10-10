@@ -1,0 +1,26 @@
+TensorFold
+Copyright 2026 TensorFold contributors
+https://github.com/ashhart/TensorFold
+
+TensorFold is licensed under the Apache License, Version 2.0 (LICENSE) from 0.6.0.
+Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
+MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
+THIRD_PARTY_NOTICES.md.
+
+--------------------------------------------------------------------------------
+
+This repository, tensorfold-qwen38-exl3-lookup, is an independent, unofficial
+distribution maintained by Yuepixel. It is NOT affiliated with or endorsed by
+the TensorFold project.
+
+It ships patch files (patches/0001-*.patch ... patches/0013-*.patch) that MODIFY
+TensorFold v0.6.5 source files, plus supporting tools, test fixtures, receipts,
+and documentation. TensorFold's Apache-2.0 license text is reproduced in
+LICENSES/Apache-2.0.txt; the third-party attribution notices TensorFold carries
+are reproduced in THIRD_PARTY_NOTICES.md.
+
+This project's own material (tools, receipt scripts, and documentation) is
+released under the MIT License (LICENSE, Copyright 2026 Yuepixel). The patch
+contents that port or cherry-pick upstream TensorFold work remain under the
+upstream TensorFold license. This product includes software developed by the
+TensorFold project and its contributors.

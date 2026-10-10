@@ -1,6 +1,7 @@
 # TensorFold #444 — Qwen3.8-Flash-Next EXL3 + prompt-lookup (CUDA)
 
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![upstream patches: Apache-2.0](https://img.shields.io/badge/upstream%20patches-Apache--2.0-blue)](LICENSES/Apache-2.0.txt)
 [![TensorFold](https://img.shields.io/badge/TensorFold-0.6.5-orange)](https://github.com/ashhart/TensorFold)
 [![GPU](https://img.shields.io/badge/NVIDIA-DGX%20Spark%20(GB10)-76B900)](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
 [![patches](https://img.shields.io/badge/patches-13-informational)](patches)
@@ -450,10 +451,18 @@ Each command writes `receipt_<cmd>_<label>.json` next to itself.
 
 ## 8. License
 
-This project's own material — the tools, receipt scripts, and documentation — is
-released under the [MIT License](LICENSE). Patch/tool/receipt contents that port or
-cherry-pick upstream TensorFold work (`0001`–`0004`, `0007`, `0008`, `0012`) remain
-under the upstream TensorFold license; `0013` is our own and MIT like the rest. Receipts are data; reuse freely.
+This is an **independent, unofficial distribution** of patches against TensorFold
+`v0.6.5`; it is not affiliated with or endorsed by the TensorFold project.
+
+- **This project's own material** — the tools, receipt scripts, and documentation —
+  is released under the [MIT License](LICENSE) (Copyright 2026 Yuepixel).
+- **Patch/tool/receipt contents that port or cherry-pick upstream TensorFold work**
+  (`0001`–`0004`, `0007`, `0008`, `0012`) remain under the **upstream TensorFold
+  license (Apache-2.0)**; `0013` is our own and MIT like the rest.
+- Upstream TensorFold's Apache-2.0 license text is reproduced in
+  [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt); its attribution notices are
+  reproduced in [`NOTICE`](NOTICE) and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+- Receipts are data; reuse freely.
 
 ---
 
