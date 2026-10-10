@@ -90,6 +90,13 @@ everything needed to build and serve the stack on a DGX Spark:
 [`RECIPE.md`](RECIPE.md) is self-contained: prerequisites, exact commits, the patch
 apply, the CUDA build, the weight fetch, the serve command, and the acceptance check.
 
+> **~80 GiB pack, lazily mapped.** The weights are the seven numbered EXL3 shards
+> (~49 GiB) **plus** a separate **31 GiB `ngram_embedding.safetensors`** (the PLE n-gram
+> table), which the engine **memory-maps and faults in on demand** — so a freshly started
+> server can read as using only **~50 GiB** until the table warms. That is expected, not
+> a missing table (the reference box reaches ~74 GiB used after real prompts). See
+> `RECIPE.md` §0/§5.
+
 ---
 
 ## 1. Patches

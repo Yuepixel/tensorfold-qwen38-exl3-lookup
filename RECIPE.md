@@ -25,6 +25,16 @@ output. Full numbers and receipts: [`README.md`](README.md).
 If the card is not a GB10, this still builds, but the performance targets in §5 are
 the GB10 ones.
 
+> **Memory footprint (~80 GiB; read this before judging `free`).** The pack is not just
+> the numbered weight shards: it is **seven `model-0000N-of-00007.safetensors` shards
+> (~49 GiB)** *plus* a separate **`ngram_embedding.safetensors` (~31 GiB — the PLE
+> n-gram table)** and `mtp_hyper_connection_mixer_patch.safetensors`. The engine
+> **memory-maps** the n-gram table and faults its pages in **lazily**, so immediately
+> after startup `free`/`nvidia-smi` may show only **~50 GiB** in use. **That is expected
+> — the table is not "missing".** It becomes resident as real requests warm the pages
+> (the reference box reaches ~74 GiB used). Do not report a 31 GiB table "not in memory"
+> as a fault.
+
 ---
 
 ## 1. Engine at the exact base commit
@@ -94,6 +104,13 @@ HF_ENDPOINT=https://hf-mirror.com huggingface-cli download turboderp/Qwen3.8-Fla
   --local-dir /models/Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5
 ```
 
+The directory must total **~79–80 GiB** and contain **nine `safetensors`**: the seven
+numbered `model-0000N-of-00007.safetensors` (~49 GiB), the **`ngram_embedding.safetensors`
+(~31 GiB, the PLE n-gram table)** and `mtp_hyper_connection_mixer_patch.safetensors`.
+Verify with `ls -lh /models/Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5/` before serving. A
+**missing or truncated `ngram_embedding.safetensors` is a hard load error** (the engine
+builds its n-gram table from it at startup).
+
 ## 5. Serve
 
 ```sh
@@ -122,6 +139,11 @@ Notes:
   `TF_SPILL_GIB=8 TF_SPILL_MIN_TOKENS=2048` (dir: `TF_SPILL_DIR`, default
   `~/.cache/tensorfold/prefix-spill`). It only affects a *cold restart* (the hot path is
   unchanged); see README §5.8 and `receipts/P21-prefix-spill-notes.md`.
+- **Memory & the PLE n-gram table.** The engine memory-maps `ngram_embedding.safetensors`
+  (~31 GiB) and touches its pages **lazily**; right after startup the box can read as
+  using only **~50 GiB**, which is **normal** — the n-gram pages warm in as requests run
+  and the resident footprint climbs toward the full ~80 GiB. `TF_NGRAM_HOST` is an MLX
+  knob and is a **no-op on this CUDA path** (the table is always host-mapped here).
 
 ## 6. Acceptance (do not skip)
 
@@ -165,6 +187,7 @@ rerun §3 and confirm `pytest tests/cuda/test_exl3_prompt_experts.py` passes.
 | `git am` rejects a patch | confirm you are on `v0.6.5` (`609ca41`); otherwise fall back to `git apply` |
 | import fails after build | rebuild with `--no-build-isolation`; check `TORCH_CUDA_ARCH_LIST=12.1` |
 | load error on the pack | verify the revision is `3.05bpw_h5_ng5` and all shards downloaded |
+| `free` shows only ~50 GiB used / "the 31 GiB table didn't load" | expected — `ngram_embedding.safetensors` is **memory-mapped** and faults in lazily; it is resident once real prompts warm it (see §0) |
 | prefill still ~700 | the prompt-GEMM patches are not in the build (see §6) |
 
 ---
