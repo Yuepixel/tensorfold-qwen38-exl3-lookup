@@ -288,6 +288,22 @@ every fixture. Receipt: `receipt_f6b_lookup-l7-2.json`; reproduce with
 
 ## 5. Results
 
+### 5.0 The journey, worst → best
+
+Every result, ordered from the stock baseline to the best number we reached. (The
+stage-by-stage walk is the climb table at the top of this README; the subsections
+below carry the raw runs and receipts.)
+
+| metric | before (stock / earlier) | best (now) | Δ | detail |
+|---|---|---|---|---|
+| Cold prefill, 2k–64k tok | ~670–800 t/s (stock `v0.6.5`) | 1696–1777 t/s | **≈ 2.4×** | §5.1 |
+| Decode — lookup drafter, edit/pattern | MTP-only 105–123 t/s | 151–160 t/s | **+31 % … +44 %** | §5.2 |
+| Image multi-turn prefill | 1.53 s (cached 0) | 0.24 s (cached 2514) | **≈ 6×** | §5.5 |
+| Cold lone-stream decode (4.05 bpw) | 21–50 t/s | 33.5–123 t/s | **≈ 2–3×** | §5.6 |
+| Shared-prefix prefill, 6 sessions | 41.6 s | 3.22 s | **12.9×** | §5.7 |
+
+`token_sha` is identical at every stage: this is speed, not a different model.
+
 ### 5.1 Prefill — the big one
 
 The CUDA prompt-GEMM work (`0001`–`0004`, a rebase of
