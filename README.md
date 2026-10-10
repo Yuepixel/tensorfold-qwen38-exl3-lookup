@@ -5,6 +5,25 @@
 [![GPU](https://img.shields.io/badge/NVIDIA-DGX%20Spark%20(GB10)-76B900)](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
 [![patches](https://img.shields.io/badge/patches-14-informational)](patches)
 
+> **One DGX Spark (GB10) · TensorFold v0.6.5 (Python) + 14 patches · every number byte-exact.**
+
+### 📈 The climb — from stock to best
+
+Cold `temperature 0`, one GB10, oldest/worst first:
+
+| stage | what it added | headline |
+|---|---|---|
+| `v0.6.5` stock (the #258 level) | — | prefill **~670–800 t/s** |
+| + `0001`–`0004` | EXL3 prompt-GEMM (rebase of #212) | prefill **1385 → 1549 t/s** |
+| + `0005` / `0006` | prompt-lookup (suffix) drafter | decode **+10 % … +44 %** on edit/pattern |
+| + `0007` | width-gated two-chunk ring (#283) | prefill **1696 → 1777 t/s (≈2.4×)** |
+| + `0008`–`0011` | native vision + video + multi-image | image/video input, OCR-verified |
+| + `0012` | image-history prefix cache (#263) | turn-2 `cached_tokens` **0 → 2514**; 1.53 s → 0.24 s |
+| + `0013` | cold solo graph slot (ours) | recapture rounds **191/888 → 0**; cold decode **21 → 123 t/s** |
+| + `0014` | system-block checkpoint (sys-checkpoint) | shared-prefix prefill **4.57 s → 0.38 s**; 6-session **41.6 s → 3.22 s (12.9×)** |
+
+`token_sha` identical at every stage — serial = MTP-only = lookup = auto, single & parallel. Full numbers: [§5](#5-results).
+
 An **unofficial fork/branch of [TensorFold](https://github.com/ashhart/TensorFold) `v0.6.5`**:
 an EXL3 3.05 bpw stack plus a **prompt-lookup (suffix) draft arm** for
 **Qwen3.8-Flash-Next** on the CUDA path — 14 patches, the benchmark fixtures, and
@@ -31,16 +50,7 @@ cancellation leaves the next request unchanged.
 
 ---
 
-## Results at a glance
-
-| | |
-|---|---|
-| **Prefill** (cold, patched vs `v0.6.5`) | **~670–800 → 1696–1777 t/s (≈2.4×)**, bit-identical |
-| **Decode** (prompt-lookup drafter, verbatim loads) | **+10 % … +44 %** (neutral on free chat/code) |
-| **Vision / video** | native image + video input (PyAV), multi-image, OCR-verified |
-| **Image multi-turn cache** | turn-2 `cached_tokens` **0 → 2514 / 2550**, byte-identical to a cold re-prefill |
-| **Determinism** | `token_sha` identical serial / MTP-only / lookup / auto, single & parallel |
-| **Cold lone-stream decode (0013)** | graph-recapture rounds **191/888 → 0**; cold decode **21–44 → 33–123 t/s** (4.05 bpw uncensored) / **37.7–131.9 t/s** (current 3.05 bpw) |
+### Which patch does what
 
 The prefill lift is patches `0001–0004` (a rebase of
 [#212](https://github.com/ashhart/TensorFold/pull/212) onto `v0.6.5`) plus `0007`
