@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 400" width="900" height="400" role="img" aria-label="Speedups vs stock on one DGX Spark">
+  <rect width="900" height="400" fill="#ffffff"/>
+  <text x="28" y="40" font-family="Segoe UI, Arial, sans-serif" font-size="22" font-weight="700" fill="#0d1117">Speedups on the same box — × faster than stock</text>
+  <text x="28" y="64" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#57606a">each row measured against its own baseline (§5) · every result byte-exact</text>
+
+  <g font-family="Segoe UI, Arial, sans-serif">
+    <text x="320" y="112" font-size="14" fill="#0d1117" text-anchor="end">Shared-prefix prefill, 6 sessions</text>
+    <rect x="330" y="95" width="500" height="34" rx="4" fill="#76b900"/>
+    <text x="842" y="118" font-size="15" font-weight="700" fill="#4e7f00">12.9×</text>
+
+    <text x="320" y="166" font-size="14" fill="#0d1117" text-anchor="end">Image multi-turn prefill</text>
+    <rect x="330" y="149" width="232.6" height="34" rx="4" fill="#8bc34a"/>
+    <text x="574.6" y="172" font-size="15" font-weight="700" fill="#4e7f00">6×</text>
+
+    <text x="320" y="220" font-size="14" fill="#0d1117" text-anchor="end">Cold lone-stream decode</text>
+    <rect x="330" y="203" width="96.9" height="34" rx="4" fill="#9ccc65"/>
+    <text x="438.9" y="226" font-size="15" font-weight="700" fill="#4e7f00">2.5×</text>
+
+    <text x="320" y="274" font-size="14" fill="#0d1117" text-anchor="end">EXL3 prefill (0001–0007)</text>
+    <rect x="330" y="257" width="93" height="34" rx="4" fill="#a5d66a"/>
+    <text x="435" y="280" font-size="15" font-weight="700" fill="#4e7f00">2.4×</text>
+
+    <text x="320" y="328" font-size="14" fill="#0d1117" text-anchor="end">Decode — lookup drafter, edit/pattern</text>
+    <rect x="330" y="311" width="55.8" height="34" rx="4" fill="#b6dd7f"/>
+    <text x="397.8" y="334" font-size="15" font-weight="700" fill="#4e7f00">1.44×</text>
+  </g>
+</svg>

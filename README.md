@@ -7,6 +7,8 @@
 
 > **One DGX Spark (GB10) · TensorFold v0.6.5 (Python) + 14 patches · every number byte-exact.**
 
+![EXL3 prefill on one DGX Spark: about 670–800 t/s stock, 1,549 after the prompt-GEMM work, 1,777 after ring-by-width — roughly 2.4×](https://raw.githubusercontent.com/Yuepixel/tensorfold-qwen38-exl3-lookup/main/assets/prefill-climb.svg)
+
 ### 📈 The climb — from stock to best
 
 Cold `temperature 0`, one GB10, oldest/worst first:
@@ -293,6 +295,8 @@ every fixture. Receipt: `receipt_f6b_lookup-l7-2.json`; reproduce with
 Every result, ordered from the stock baseline to the best number we reached. (The
 stage-by-stage walk is the climb table at the top of this README; the subsections
 below carry the raw runs and receipts.)
+
+![Speedups on one DGX Spark vs stock: shared-prefix 12.9×, image multi-turn 6×, cold lone-stream decode 2.5×, EXL3 prefill 2.4×, decode lookup 1.44×](https://raw.githubusercontent.com/Yuepixel/tensorfold-qwen38-exl3-lookup/main/assets/speedups.svg)
 
 | metric | before (stock / earlier) | best (now) | Δ | detail |
 |---|---|---|---|---|
