@@ -1,4 +1,4 @@
-# TensorFold #444 — Qwen3.8-Flash-Next EXL3 + prompt-lookup (CUDA)
+# Qwen3.8-Flash-Next on TensorFold v0.6.5 — EXL3 3.05 bpw + prompt-lookup (CUDA)
 
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![upstream patches: Apache-2.0](https://img.shields.io/badge/upstream%20patches-Apache--2.0-blue)](LICENSES/Apache-2.0.txt)
@@ -6,11 +6,16 @@
 [![GPU](https://img.shields.io/badge/NVIDIA-DGX%20Spark%20(GB10)-76B900)](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
 [![patches](https://img.shields.io/badge/patches-13-informational)](patches)
 
-Support material for [TensorFold issue #444](https://github.com/ashhart/TensorFold/issues/444):
-a diff, the benchmark fixtures, and byte-exact `token_sha` receipts for the
-**EXL3 prompt-GEMM prefill work**, the **prompt-lookup (suffix) draft arm**, and the
-**vision / video / image-history prefix-cache** additions, all on the Flash-Next CUDA
-path.
+An **unofficial fork/branch of [TensorFold](https://github.com/ashhart/TensorFold) `v0.6.5`**:
+an EXL3 3.05 bpw stack plus a **prompt-lookup (suffix) draft arm** for
+**Qwen3.8-Flash-Next** on the CUDA path — 13 patches, the benchmark fixtures, and
+byte-exact `token_sha` receipts covering the **EXL3 prompt-GEMM prefill work**, the
+**prompt-lookup drafter**, and the **vision / video / image-history prefix-cache**
+additions.
+
+It began as the reference material for [TensorFold issue #444](https://github.com/ashhart/TensorFold/issues/444)
+(now closed; that thread links back here) and is kept as an independent, runnable
+branch of the Python/EXL3 line.
 
 - **Engine:** TensorFold `0.6.5` (`v0.6.5` tag) + 13 patches below
 - **Model:** `Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5` (EXL3 3.05 bpw, group-32, `h5_ng5` pack — the current weights)
