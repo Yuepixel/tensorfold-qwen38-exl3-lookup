@@ -1,6 +1,6 @@
 Update — vision, video, multi-image, and an image-history prefix cache: the last of the stack.
 
-Since the `0001`–`0007` update, the same EXL3/CUDA build also does native **image + video** input and, the one that matters for multi-turn, stops **image chats from re-prefilling every turn**. New patches are `0008`–`0012` in this repo (github.com/Yuepixel/tensorfold-qwen38-exl3-lookup), all `git am`-able on top of `0007` (`v0.6.5` + the seven you already have). Full numbers: `README.md` §5.4–5.5.
+Since the `0001`–`0007` update, the same EXL3/CUDA build also does native **image + video** input and, the one that matters for multi-turn, stops **image chats from re-prefilling every turn**. New patches are `0008`–`0012` in this repo (github.com/Yuepixel/tensorfold-qwen38-exl3-lookup), all `git am`-able on top of `0007` (`v0.6.5` + the seven you already have). Full numbers: `README.md` §5.4–5.5. The repo is now an unofficial, license-compliant fork — upstream `NOTICE` / `THIRD_PARTY_NOTICES.md` / Apache-2.0 ship alongside (§4 kept), no endorsement implied.
 
 ### 1. Vision — native image input (`0008`–`0010`)
 
