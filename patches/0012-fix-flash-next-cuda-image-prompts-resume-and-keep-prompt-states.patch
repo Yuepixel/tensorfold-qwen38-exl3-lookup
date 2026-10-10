@@ -1,7 +1,7 @@
 From e980c7382e53dab8dbda521df79261cc33e17707 Mon Sep 17 00:00:00 2001
 From: Oleksandr Leushchenko <olexa.le@gmail.com>
 Date: Fri, 2 Oct 2026 19:59:04 +0300
-Subject: [PATCH 5/5] fix(flash next cuda): image prompts resume and keep
+Subject: [PATCH 1/3] fix(flash next cuda): image prompts resume and keep
  prompt states, matched on their images' pixels
 
 With --vision, a request that held an image never resumed from a kept prompt state and kept none, so one
@@ -504,5 +504,108 @@ index 0000000..6bba986
 +    assert ids[5] < 0 and len({ids[5], ids[6], ids[9], ids[10]}) == 1 and ids[1] != ids[5]
 +    assert keyed("w")[:5] == ids[:5] and keyed("w")[5] != ids[5]
 -- 
-2.43.0
+2.53.0.windows.2
+
+From 3b9142c3ea6d065af5682c193e1348fffa46d8b8 Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 18:19:17 +0800
+Subject: [PATCH 2/3] run_serve: lock MTP draft depth at 9; add optional
+ confidence sidecar knob
+
+---
+ run_serve.sh | 37 ++++++++++++++++++++++++++++---------
+ 1 file changed, 28 insertions(+), 9 deletions(-)
+
+diff --git a/run_serve.sh b/run_serve.sh
+index 3983da4..3ae7938 100644
+--- a/run_serve.sh
++++ b/run_serve.sh
+@@ -5,16 +5,35 @@ set -e
+ # elsewhere, byte-exact vs serial either way. Set TF_EXL3_LOOKUP="" to revert to MTP-only (A6), or to
+ # another lN[:M] / "auto" (auto is experimental; its gate cost model is not yet calibrated).
+ export TF_EXL3_LOOKUP="${TF_EXL3_LOOKUP-l7:2}"
+-# P9.2 native vision: the EXL3 quantized visual tower is converted once, offline, to an FP16 sidecar
+-# (docs/recipes/flash-next-vision.md). The sidecar lives OUTSIDE the model snapshot; override with
+-# TENSORFOLD_VISION_WEIGHTS. Set TF_EXL3_VISION=0 to serve text-only (one-line revert).
+-export TENSORFOLD_VISION_WEIGHTS="${TENSORFOLD_VISION_WEIGHTS-/models/vision-f16-Qwen3.8-Flash-Next-exl3-3.05bpw.safetensors}"
+-# P10.2 multi-image knobs (upstream defaults: max-images 4 across full history, image-tokens 4096
+-# shared per request with <=4096 per image). Override with env to tune without editing this file.
+-export TENSORFOLD_VISION_MAX_IMAGES="${TENSORFOLD_VISION_MAX_IMAGES-4}"
+-export TENSORFOLD_VISION_IMAGE_TOKENS="${TENSORFOLD_VISION_IMAGE_TOKENS-4096}"
++# P14 native vision: the Lygodactylus 4bpw package stores the visual tower unquantized (16-bit) INLINE
++# in the model snapshot (model.visual.* in the index -> shard9), so no external FP16 sidecar is needed.
++# Leaving TENSORFOLD_VISION_WEIGHTS empty makes qwen_cuda.py read the tower from the model dir.
++# To fall back to the old external FP16 sidecar, export TENSORFOLD_VISION_WEIGHTS=/models/vision-f16-Qwen3.8-Flash-Next-exl3-3.05bpw.safetensors
++# Set TF_EXL3_VISION=0 to serve text-only (one-line revert).
++export TENSORFOLD_VISION_WEIGHTS="${TENSORFOLD_VISION_WEIGHTS-}"
++# P13 (2026-10-08) multi-image knobs, raised for 12 full-quality images:
++#  - max-images: the request gate (it counts images across the FULL history at parse time; pure
++#    check, no memory cost). 4 -> 12 so a 12-image request is accepted without dilution.
++#  - image-tokens: per-request SHARED visual-token budget; 12 x 4096 = 49152 (each image still gets
++#    its full 4096; per-image hard cap is 4096, request hard cap is 16 x 4096 = 65536).
++# Override with env to tune without editing this file. (Upstream defaults were 4 / 4096.)
++export TENSORFOLD_VISION_MAX_IMAGES="${TENSORFOLD_VISION_MAX_IMAGES-12}"
++export TENSORFOLD_VISION_IMAGE_TOKENS="${TENSORFOLD_VISION_IMAGE_TOKENS-49152}"
++# 2026-10-08 (post-P14): raise the reply cap from the upstream 4096 default. Long answers were cut at
++# 4096 and needed a manual "continue"; --max-tokens also counts reasoning_content, so thinking ate the
++# budget. 16384 covers long turns while staying under the client-side output limits. A request that
++# sends its own max_tokens still overrides this. Override here with TENSORFOLD_MAX_TOKENS.
++export TENSORFOLD_MAX_TOKENS="${TENSORFOLD_MAX_TOKENS-16384}"
++MTP_ARG="--mtp-drafts 9"
++if [ -s /src/TensorFold/.mtp_drafts ]; then
++  MTP_ARG="--mtp-drafts $(cat /src/TensorFold/.mtp_drafts)"
++fi
++CONF_ARG=""
++if [ -s /src/TensorFold/.mtp_confidence ]; then
++  CONF_ARG="--mtp-confidence $(cat /src/TensorFold/.mtp_confidence)"
++fi
+ VISION_ARG=""
+ if [ "${TF_EXL3_VISION:-1}" != "0" ]; then
+   VISION_ARG="--vision --vision-max-images ${TENSORFOLD_VISION_MAX_IMAGES} --vision-image-tokens ${TENSORFOLD_VISION_IMAGE_TOKENS}"
+ fi
+-exec /usr/local/bin/tensorfold serve /models/Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5 --host 127.0.0.1 --port 8080 --parallel 2 $VISION_ARG > /tmp/serve.log 2>&1
++exec /usr/local/bin/tensorfold serve /models/Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5 --host 127.0.0.1 --port 8080 --parallel 2 --max-tokens ${TENSORFOLD_MAX_TOKENS} $MTP_ARG $CONF_ARG $VISION_ARG > /tmp/serve.log 2>&1
+-- 
+2.53.0.windows.2
+
+From b18b2e68eaaf8b5d93803b67e74709ec2bae40f6 Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 18:20:14 +0800
+Subject: [PATCH 3/3] run_serve: document the MTP depth and confidence knobs
+
+---
+ run_serve.sh | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/run_serve.sh b/run_serve.sh
+index 3ae7938..ef8ff73 100644
+--- a/run_serve.sh
++++ b/run_serve.sh
+@@ -24,10 +24,24 @@ export TENSORFOLD_VISION_IMAGE_TOKENS="${TENSORFOLD_VISION_IMAGE_TOKENS-49152}"
+ # budget. 16384 covers long turns while staying under the client-side output limits. A request that
+ # sends its own max_tokens still overrides this. Override here with TENSORFOLD_MAX_TOKENS.
+ export TENSORFOLD_MAX_TOKENS="${TENSORFOLD_MAX_TOKENS-16384}"
++# --- MTP draft depth (tuned 2026-10-08; upstream default was 6) --------------------------------
++# --mtp-drafts N = how many tokens the MTP head drafts per round before the target verifies them.
++# Range 0..15 (MAX_DEPTH, cuda/engine.py:14); 0 = MTP off. Tuned on the 4.05bpw pack (bench_openai,
++# greedy): throughput rises with depth and plateaus at 9..12 -> decode ~+5.6% code vs default 6,
++# chat flat. Deeper is NOT faster: the MTP head drafts SEQUENTIALLY (cost grows ~linearly) while
++# accepted-tokens-per-round grows sub-linearly, and the acceptance RATE actually FALLS with depth
++# (78%@3 -> 70%@15). Speed is set by accepted tokens per round (per weight read), not the rate.
++# 9 = balanced pick. Override without editing this file:  echo N > /src/TensorFold/.mtp_drafts
+ MTP_ARG="--mtp-drafts 9"
+ if [ -s /src/TensorFold/.mtp_drafts ]; then
+   MTP_ARG="--mtp-drafts $(cat /src/TensorFold/.mtp_drafts)"
+ fi
++# --- MTP confidence gate (default 0.7; upstream default 0.7) -----------------------------------
++# --mtp-confidence F (0.0..1.0) = a draft chain stops early once the MTP head's per-draft
++# confidence drops below F. Swept at depth 9 (greedy): 0.7 is optimal. Higher (0.8/0.9) raises
++# acceptance (72%->81%) but yields FEWER drafts/round => lower throughput (0.9: code -5.7%,
++# chat -2.4%); lower (0.4/0.5) is clearly worse. Left at default; knob kept for future packs.
++# Override without editing this file:  echo 0.7 > /src/TensorFold/.mtp_confidence
+ CONF_ARG=""
+ if [ -s /src/TensorFold/.mtp_confidence ]; then
+   CONF_ARG="--mtp-confidence $(cat /src/TensorFold/.mtp_confidence)"
+-- 
+2.53.0.windows.2
 
