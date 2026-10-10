@@ -114,7 +114,44 @@ python3 receipts/p21_meta.py   # inspect the spill dir
   the `gin'iro`/MiaAI-Lab GLM recipe patch `0088-glm-spill-tier`, adapted to the
   Flash-Next CUDA `qwen4_exp` kept-prefix path.
 - Upstream references: [`ashhart/TensorFold#373`](https://github.com/ashhart/TensorFold/issues/373),
-  [`#423`](https://github.com/ashhart/TensorFold/pull/423), [`#427`](https://github.com/ashhart/TensorFold/pull/427).
+  [`#423`](https://github.com/ashhart/TensorFold/pull/423),
+  [`#427`](https://github.com/ashhart/TensorFold/pull/427).
+
+## 9. Fix (`0018`) — the eviction hot path no longer spikes TTFT
+
+`0015` shipped with a latent hot-path cost: when a kept prefix was **evicted**, `_collect`
+copied the rows to host with a **pageable** `.to("cpu")`, which blocks as the prefix grows.
+On a monotonic ~16k→94k growth load the per-eviction `gap = ttft − prefill` rose to
+**7–16 s** (non-eviction requests stayed at 0.05 s). The spike is **not** disk I/O (writes
+are on the background thread) nor D2H bandwidth (a pinned copy of 2 GiB is ≈0.036 s): it is
+a fresh `cudaHostAlloc` on every eviction.
+
+`0018` (ours, P21c/P21d):
+
+- **P21c** stages the copies through **pinned** host buffers (`non_blocking` D2H + one
+  `synchronize`), pooled by size, so an eviction reuses a buffer instead of re-paying the
+  cold allocation. Per-eviction gap drops **7–16 s → ≤1 s** (rest 0.05 s).
+- **P21d** stops writing the `pooled` / `mtp.pooled` blocks for **text** prefixes: they are a
+  deterministic function of the index cache `ikc` (the pool kernel preserves a block's bits
+  when recomputed), so `restore` re-runs `qsa_pool` through a `MultiDecoder.repool` hook.
+  Image prefixes keep their pooled rows (image rotary). The file shrinks by the pooled bytes.
+
+Fix A/B (`receipts/P21c-d-fix-20261011.json`), same growth load, `gap` in seconds:
+
+| load | base (`0015`) | fixed (`0018`) |
+|---|---|---|
+| turn 8 (~78k prompt) | 7.35 | 0.28 |
+| turn 9 (~86k) | 7.69 | 0.22 |
+| turn 10 (~94k) | 15.79 | 0.98 |
+| non-eviction turns | 0.05–0.06 | 0.05 |
+
+Payload (text prefix, `insp`): ≈31.4k tokens **1084.2 → 1056.4 MB**, ≈47.1k tokens
+**1566.7 → 1526.8 MB** (−2.5%). Cold resume stays **bit-identical** (`token_sha`): stress
+burn 10 → cold restart → resend 10 resumed **4/10** from disk. Unit tests
+`test_flashnext_spill.py` (bf16 + int8 round-trip) pass.
+
+The served container keeps spill **on** (`TF_SPILL_GIB=8`); after `0018` the eviction cost is
+bounded (~1 s worst case on a monotonic 94k load) instead of growing without bound.
 
 ---
 

@@ -1,0 +1,272 @@
+From 99afd200607a6a0c98365728547d78f55e642181 Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 18:32:00 +0000
+Subject: [PATCH 1/2] fix(flash next cuda): stage spill copies through pooled
+ pinned host buffers (P21c)
+
+The eviction hot path copied cache rows with a pageable .to(cpu) that blocks as the prefix grows; stage through pinned buffers (non_blocking D2H + one synchronize) and pool them by size so an eviction reuses a buffer instead of re-paying the cold cudaHostAlloc. Cuts the per-eviction gap from 7-16 s to <=1 s on a monotonic growth load (rest still 0.05 s).
+---
+ .../families/qwen4_exp/cuda/spill.py          | 82 ++++++++++++++++---
+ 1 file changed, 72 insertions(+), 10 deletions(-)
+
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/spill.py b/src/tensorfold/families/qwen4_exp/cuda/spill.py
+index 4adb235..19ea558 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/spill.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/spill.py
+@@ -70,6 +70,10 @@ class SpillStore:
+         self._queue: queue.Queue | None = None
+         self._worker: threading.Thread | None = None
+         self._lock = threading.Lock()
++        self._pool: dict[torch.dtype, list[torch.Tensor]] = {}
++        self._pool_bytes = 0
++        self._pool_lock = threading.Lock()
++        self._pool_cap = 2 * GIB
+ 
+     # -- naming -----------------------------------------------------------------------------------------
+     def name(self, ids) -> str:
+@@ -92,14 +96,17 @@ class SpillStore:
+         pos = int(snap["pos"])
+         if pos < self.min_tokens:
+             return None
+-        tensors, meta = self._collect(ids, st, snap, pos, tail)
++        tensors, meta, borrowed = self._collect(ids, st, snap, pos, tail)
+         self.root.mkdir(parents=True, exist_ok=True)
+         path, sidecar = self._tensors(ids), self._meta(ids)
+         if background:
+-            self._enqueue((tensors, meta, path, sidecar))
++            self._enqueue((tensors, meta, path, sidecar, borrowed))
+         else:
+-            self._write(tensors, meta, path, sidecar)
+-            self.trim()
++            try:
++                self._write(tensors, meta, path, sidecar)
++                self.trim()
++            finally:
++                self._release(borrowed)
+         return path
+ 
+     def _write(self, tensors: dict, meta: dict, path: Path, sidecar: Path) -> None:
+@@ -131,8 +138,12 @@ class SpillStore:
+             try:
+                 if item is None:
+                     return
+-                self._write(*item)
+-                self.trim()
++                tensors, meta, path, sidecar, borrowed = item
++                try:
++                    self._write(tensors, meta, path, sidecar)
++                    self.trim()
++                finally:
++                    self._release(borrowed)
+             except Exception:
+                 pass                       # a spill failure must never take a decode round down
+             finally:
+@@ -146,12 +157,62 @@ class SpillStore:
+         if q is not None:
+             q.join()
+ 
+-    def _collect(self, ids, st, snap: dict, pos: int, tail) -> tuple[dict, dict]:
++    # -- staging pool -----------------------------------------------------------------------------------
++    def _borrow(self, n: int, dtype: torch.dtype) -> torch.Tensor:
++        """A flat pinned host buffer of at least ``n`` elements, reusing the smallest pooled one that fits.
++
++        The cold ``cudaHostAlloc`` dominates an eviction's GPU-to-CPU staging (its cost grows with the bytes,
++        ~0.2 s/GiB here); the cache rows' shape changes with the prefix, so re-allocating every eviction would
++        pay it again and again. Pooling a buffer and reusing it keeps the copy itself (~0.01 s/GiB on this
++        Grace-Blackwell part's coherent link) as the only cost."""
++
++        with self._pool_lock:
++            pool = self._pool.get(dtype)
++            if pool:
++                best = min((i for i, b in enumerate(pool) if b.numel() >= n),
++                           key=lambda i: pool[i].numel(), default=None)
++                if best is not None:
++                    return pool.pop(best)
++        return torch.empty(n, dtype=dtype, pin_memory=True)
++
++    def _release(self, buffers) -> None:
++        """Return staging buffers to the pool, dropping the smallest once the retained bytes exceed the cap."""
++
++        with self._pool_lock:
++            for b in buffers:
++                self._pool.setdefault(b.dtype, []).append(b)
++                self._pool_bytes += b.numel() * b.element_size()
++            while self._pool_bytes > self._pool_cap:
++                drop = None
++                for dtype, pool in self._pool.items():
++                    for i, b in enumerate(pool):
++                        nb = b.numel() * b.element_size()
++                        if drop is None or nb < drop[0]:
++                            drop = (nb, dtype, i)
++                if drop is None:
++                    break
++                nb, dtype, i = drop
++                self._pool[dtype].pop(i)
++                self._pool_bytes -= nb
++
++    def _collect(self, ids, st, snap: dict, pos: int, tail) -> tuple[dict, dict, list]:
+         """The CPU tensors and metadata of one kept point: the snapshot's state, the cache rows ``[0:pos]``, the
+-        MTP head's ``[0:mtp_len]`` and its tail. Copied off the GPU here, before the caller may shrink the slot."""
++        MTP head's ``[0:mtp_len]`` and its tail. Copied off the GPU here, before the caller may shrink the slot.
++
++        The copy stages through pinned host buffers drawn from the store's pool: a ``non_blocking`` D2H into a
++        reused pinned buffer, then a single synchronize. A pageable ``.to("cpu")`` blocked the eviction hot path,
++        and a fresh pinned buffer per eviction re-paid the cold allocation every time; both costs grow with the
++        prefix (measured ~4.8 s for a cold 0.6 GiB pageable copy vs ~0.22 s pinned, ~0.01 s pooled and reused).
++        The borrowed buffers ride along so ``_release`` returns them once the write has read them."""
++
++        borrowed: list[torch.Tensor] = []
+ 
+         def cpu(t):
+-            return t.detach().to("cpu").contiguous()
++            flat = self._borrow(t.numel(), t.dtype)
++            borrowed.append(flat)
++            out = flat[:t.numel()].view(t.shape)
++            out.copy_(t.detach(), non_blocking=True)
++            return out
+ 
+         mtp_len = int(snap["mtp_len"])
+         t: dict[str, torch.Tensor] = {
+@@ -180,7 +241,8 @@ class SpillStore:
+                 t["mtp.vs"] = cpu(st.mtp_kc.vs[:mtp_len])
+             t["mtp.ikc"] = cpu(st.mtp_ikc[:mtp_len])
+             t["mtp.pooled"] = cpu(st.mtp_pooled[:mtp_len // st.ratio])
+-        return t, meta
++        torch.cuda.synchronize()                     # the staged copies are done before the slot may be reused
++        return t, meta, borrowed
+ 
+     # -- reading ----------------------------------------------------------------------------------------
+     def lookup(self, prompt) -> tuple[list[int], dict] | None:
+-- 
+2.43.0
+
+
+From 1f82c0c1cf24b19282c3b2f9f6df837444087345 Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 18:51:14 +0000
+Subject: [PATCH 2/2] perf(flash next cuda): store only raw indexer keys on
+ disk spill, re-pool on restore (P21d)
+
+pooled/mtp.pooled blocks are a deterministic function of ikc (the pool kernel preserves a block bits when recomputed), so a text prefix no longer writes them; SpillStore.restore re-runs qsa_pool via a MultiDecoder.repool hook. Image prefixes keep their pooled blocks (image rotary). Cold resume is bit-identical; file shrinks by the pooled bytes (~2.4% at 31k tokens, ~39.9MB at 47k).
+---
+ .../families/qwen4_exp/cuda/multi.py          | 24 ++++++++++++++++++-
+ .../families/qwen4_exp/cuda/spill.py          | 19 +++++++++++----
+ 2 files changed, 38 insertions(+), 5 deletions(-)
+
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/multi.py b/src/tensorfold/families/qwen4_exp/cuda/multi.py
+index ef93b9e..0970731 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/multi.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/multi.py
+@@ -19,7 +19,7 @@ from tensorfold.engine.grammar import GrammarError
+ 
+ from .decode import (PREFILL_ROWS, WARM_TAIL, Engine, _gathered_fits, choose_gathered_streams,
+                      entry_end, prefill_begin, tp_sample_rows)
+-from . import attn_multi, gdn_multi, image_rows, prefixes
++from . import attention as attn_mod, attn_multi, gdn_multi, image_rows, prefixes
+ from .forward import commit, compute, compute_mixed, converges, stage
+ from .lookup import build_lookup, env_spec
+ from .mtp import mtp_compute, mtp_stage
+@@ -96,6 +96,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+         self.kept: list[tuple[list[int], State, dict, torch.Tensor | None]] = []   # (ids, slot, snapshot, tail)
+         self.keep = keep
+         self.spill = spill                           # a disk store for kept prefix ends (P21), or None
++        if spill is not None:
++            spill.repool = self._repool              # the store re-pools a restored text prefix's indexer blocks
+ 
+     def _busy(self) -> set[int]:
+         return {id(s.st) for s in [*self.streams.values(), *self.filling]}
+@@ -122,6 +124,26 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+             self._spill_entry(entry)
+         self._drop_kept(st)
+ 
++    def _repool(self, st: State, pos: int, mtp_len: int) -> None:
++        """Rebuild a restored prefix's pooled indexer blocks from its raw keys (P21d).
++
++        ``pooled`` is a deterministic function of ``ikc`` (the pool kernel preserves a block's bits when it is
++        recomputed), so a text prefix stores only the raw keys and re-pools here; a dense window keeps no blocks."""
++
++        attn = self.pbuf.attn
++        if not attn.qsa or pos <= 0:
++            return
++        w, c = self.w, self.w.cfg
++        sections = getattr(c, "mrope_section", (11, 11, 10))
++        zero = torch.zeros((1,), dtype=torch.int32, device=st.ikc[0].device)
++        for i, layer in enumerate([l for l in w.layers if not l.linear]):
++            attn_mod.qsa_pool(st.ikc[i], st.pooled[i], zero, layer.attn.ik_scale, w.inv_freq, c.eps, attn, pos,
++                              sections=sections)
++        if mtp_len and getattr(st, "mtp_kc", None) is not None:
++            layer = w.mtp.layer
++            attn_mod.qsa_pool(st.mtp_ikc, st.mtp_pooled, zero, layer.attn.ik_scale, w.inv_freq, c.eps, attn, mtp_len,
++                              sections=sections)
++
+     def _grow(self, st: State, rows: int, *, alone: bool = False, protect: State | None = None) -> bool:
+         """Grow caches while the gate has room; one stream may use its startup allowance within an explicit cap."""
+ 
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/spill.py b/src/tensorfold/families/qwen4_exp/cuda/spill.py
+index 19ea558..2ca9ec7 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/spill.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/spill.py
+@@ -74,6 +74,7 @@ class SpillStore:
+         self._pool_bytes = 0
+         self._pool_lock = threading.Lock()
+         self._pool_cap = 2 * GIB
++        self.repool = None       # a MultiDecoder's (state, pos, mtp_len) hook: rebuild a text prefix's pooled blocks
+ 
+     # -- naming -----------------------------------------------------------------------------------------
+     def name(self, ids) -> str:
+@@ -222,6 +223,10 @@ class SpillStore:
+             t["ple_history"] = torch.from_numpy(np.ascontiguousarray(snap["ple_history"]))
+         if tail is not None:
+             t["tail"] = cpu(tail)
++        # the indexer's pooled blocks are a deterministic function of its raw keys (the pool kernel preserves a
++        # block's bits when it is recomputed), so a text prefix stores only ``ikc`` and re-pools on restore; an
++        # image prefix's pooled blocks carry the image rotary, which the restore path does not reconstruct.
++        pool = getattr(st, "image_positions", None) is not None
+         for i, kc in enumerate(st.kc):
+             t[f"kc.{i}.k"] = cpu(kc.k[:pos])
+             t[f"kc.{i}.v"] = cpu(kc.v[:pos])
+@@ -229,7 +234,8 @@ class SpillStore:
+                 t[f"kc.{i}.ks"] = cpu(kc.ks[:pos])
+                 t[f"kc.{i}.vs"] = cpu(kc.vs[:pos])
+             t[f"ikc.{i}"] = cpu(st.ikc[i][:pos])
+-            t[f"pooled.{i}"] = cpu(st.pooled[i][:pos // st.ratio])
++            if pool:
++                t[f"pooled.{i}"] = cpu(st.pooled[i][:pos // st.ratio])
+         meta = {"ids": ids, "pos": pos, "mtp_len": mtp_len, "kv_dtype": st.kv_dtype, "ratio": st.ratio,
+                 "layers": len(st.kc), "quantized": bool(st.kc and st.kc[0].quantized), "mtp": hasattr(st, "mtp_kc"),
+                 "ple": snap["ple_history"] is not None, "tail": tail is not None, "saved": time.time()}
+@@ -240,7 +246,8 @@ class SpillStore:
+                 t["mtp.ks"] = cpu(st.mtp_kc.ks[:mtp_len])
+                 t["mtp.vs"] = cpu(st.mtp_kc.vs[:mtp_len])
+             t["mtp.ikc"] = cpu(st.mtp_ikc[:mtp_len])
+-            t["mtp.pooled"] = cpu(st.mtp_pooled[:mtp_len // st.ratio])
++            if pool:
++                t["mtp.pooled"] = cpu(st.mtp_pooled[:mtp_len // st.ratio])
+         torch.cuda.synchronize()                     # the staged copies are done before the slot may be reused
+         return t, meta, borrowed
+ 
+@@ -292,7 +299,8 @@ class SpillStore:
+                 into(dst.kc[i].ks[:pos], f"kc.{i}.ks")
+                 into(dst.kc[i].vs[:pos], f"kc.{i}.vs")
+             dst.ikc[i][:pos].copy_(t[f"ikc.{i}"].to(dst.ikc[i].device))
+-            dst.pooled[i][:pos // dst.ratio].copy_(t[f"pooled.{i}"].to(dst.pooled[i].device))
++            if f"pooled.{i}" in t:
++                dst.pooled[i][:pos // dst.ratio].copy_(t[f"pooled.{i}"].to(dst.pooled[i].device))
+         if mtp_len and hasattr(dst, "mtp_kc"):
+             into(dst.mtp_kc.k[:mtp_len], "mtp.k")
+             into(dst.mtp_kc.v[:mtp_len], "mtp.v")
+@@ -300,7 +308,10 @@ class SpillStore:
+                 into(dst.mtp_kc.ks[:mtp_len], "mtp.ks")
+                 into(dst.mtp_kc.vs[:mtp_len], "mtp.vs")
+             dst.mtp_ikc[:mtp_len].copy_(t["mtp.ikc"].to(dst.mtp_ikc.device))
+-            dst.mtp_pooled[:mtp_len // dst.ratio].copy_(t["mtp.pooled"].to(dst.mtp_pooled.device))
++            if "mtp.pooled" in t:
++                dst.mtp_pooled[:mtp_len // dst.ratio].copy_(t["mtp.pooled"].to(dst.mtp_pooled.device))
++        if "pooled.0" not in t and self.repool is not None:
++            self.repool(dst, pos, mtp_len)     # a text prefix's pooled blocks, recomputed from the restored keys
+         tail = t["tail"].to(dst.conv.device) if meta.get("tail") else None
+         return snap, tail
+ 
+-- 
+2.43.0
+

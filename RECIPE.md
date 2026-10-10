@@ -4,7 +4,7 @@
 > link to this file and asked you to "install it", follow the steps below end to end,
 > report what you ran, and stop and ask if a step cannot be completed.
 
-Goal: build **TensorFold `v0.6.5` + 17 patches** and serve **Qwen3.8-Flash-Next
+Goal: build **TensorFold `v0.6.5` + 18 patches** and serve **Qwen3.8-Flash-Next
 (EXL3 3.05 bpw)** on a single **DGX Spark (GB10)**, giving **~2.4× EXL3 prefill**
 (≈1700 t/s vs ~700), the **prompt-lookup drafter** on top, plus **native image/video**
 input and an **image-history prefix cache** for multi-turn image chats, with byte-exact
@@ -46,7 +46,7 @@ git -C TensorFold am /path/to/tensorfold-qwen38-exl3-lookup/patches/*.patch
 # fallback if `am` complains: for p in .../patches/*.patch; do git -C TensorFold apply "$p"; done
 ```
 
-Seventeen patches, in order: `0001`–`0004` are the EXL3 prompt-GEMM work (the prefill
+Eighteen patches, in order: `0001`–`0004` are the EXL3 prompt-GEMM work (the prefill
 lift), `0005`/`0006` add the prompt-lookup drafter, `0007` adds the width-gated
 two-chunk ring (another +13–15 % prefill; port of PR #283). `0008`–`0011` add native
 **image + video + multi-image** input (the vision tower rides a FP16 sidecar next to the
@@ -58,7 +58,9 @@ long shared prefixes stop re-prefilling; `0015` (ours) spills a kept prefix to d
 survives a server restart (`--parallel`; off by default, see §5). `0016` (ours) adds a
 **Qwen3.6-35B-A3B NVFP4 (compressed-tensors)** MoE read path and `0017` (ours) adds a
 generic **GGUF reader with CUDA on-the-fly dequant** (dense `qwen3_5` + grouped MoE
-experts `qwen3_5_moe`) — both are off-theme additions to this EXL3 fork. No conflicts expected.
+experts `qwen3_5_moe`) — both are off-theme additions to this EXL3 fork. `0018` (ours)
+then stages the disk spill's eviction copies through pinned host buffers and re-pools on
+restore, bounding the eviction cost. No conflicts expected.
 
 ## 3. Build the CUDA extension
 
@@ -115,7 +117,7 @@ Notes:
   reaches the lookup arm; with `--parallel` a *single* in-flight request is served
   MTP-only (see README §2).
 - The EXL3 pack rejects `--tp 2`; this recipe is single-GPU.
-- **Disk prefix spill (`0015`, off by default).** To keep a kept prefix across a server
+- **Disk prefix spill (`0015` + fix `0018`, off by default).** To keep a kept prefix across a server
   restart, export a byte cap and a threshold before serving, e.g.
   `TF_SPILL_GIB=8 TF_SPILL_MIN_TOKENS=2048` (dir: `TF_SPILL_DIR`, default
   `~/.cache/tensorfold/prefix-spill`). It only affects a *cold restart* (the hot path is

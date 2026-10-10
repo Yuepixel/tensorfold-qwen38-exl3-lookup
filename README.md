@@ -3,9 +3,9 @@
 [![license: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![TensorFold](https://img.shields.io/badge/TensorFold-0.6.5-orange)](https://github.com/ashhart/TensorFold)
 [![GPU](https://img.shields.io/badge/NVIDIA-DGX%20Spark%20(GB10)-76B900)](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
-[![patches](https://img.shields.io/badge/patches-17-informational)](patches)
+[![patches](https://img.shields.io/badge/patches-18-informational)](patches)
 
-> **One DGX Spark (GB10) · TensorFold v0.6.5 (Python) + 17 patches · every number byte-exact.**
+> **One DGX Spark (GB10) · TensorFold v0.6.5 (Python) + 18 patches · every number byte-exact.**
 
 ![One DGX Spark, stock → best. Cold prefill ~670→1,777 t/s (≈2.4×); image multi-turn 2.87→0.24 s (≈12×); 6-session shared prefix 41.6→3.22 s (12.9×); cold decode 21→123 t/s (≈6×). Red = stock, amber = on the way, green = now.](https://raw.githubusercontent.com/Yuepixel/tensorfold-qwen38-exl3-lookup/main/assets/climb.svg)
 
@@ -26,12 +26,13 @@ Cold `temperature 0`, one GB10, oldest/worst first:
 | + `0015` | disk prefix spill (ours) | kept prefixes survive a restart: cold-resume `cached_tokens` **0 → 4096**; **4/10** resume after a cold restart |
 | + `0016` (off-theme) | Qwen3.6-35B-A3B NVFP4 routed experts (compressed-tensors) | MoE NVFP4 read path; 35B-A3B served on CUDA |
 | + `0017` (off-theme) | GGUF reader + CUDA on-the-fly dequant (dense + grouped MoE experts) | Qwen3.5 dense + Qwen3.6-35B-A3B GGUF served on CUDA |
+| + `0018` | disk-spill eviction fix (ours) | per-eviction `gap` **7–16 s → ≤1 s**; payload **−2.5 %** |
 
 `token_sha` identical at every stage — serial = MTP-only = lookup = auto, single & parallel. Full numbers: [§5](#5-results).
 
 An **unofficial fork/branch of [TensorFold](https://github.com/ashhart/TensorFold) `v0.6.5`**:
 an EXL3 3.05 bpw stack plus a **prompt-lookup (suffix) draft arm** for
-**Qwen3.8-Flash-Next** on the CUDA path — 17 patches, the benchmark fixtures, and
+**Qwen3.8-Flash-Next** on the CUDA path — 18 patches, the benchmark fixtures, and
 byte-exact `token_sha` receipts covering the **EXL3 prompt-GEMM prefill work**, the
 **prompt-lookup drafter**, and the **vision / video / image-history prefix-cache**
 additions.
@@ -46,7 +47,7 @@ It began as the reference material for [TensorFold issue #444](https://github.co
 (now closed; that thread links back here) and is kept as an independent, runnable
 branch of the Python/EXL3 line.
 
-- **Engine:** TensorFold `0.6.5` (`v0.6.5` tag) + 17 patches below
+- **Engine:** TensorFold `0.6.5` (`v0.6.5` tag) + 18 patches below
 - **Model:** `Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5` (EXL3 3.05 bpw, group-32, `h5_ng5` pack — the current weights)
 - **Weight packs:** tuned on the 3.05 bpw pack above; the `0013` (F6b) decode receipt was captured while a `Lygodactylus` 4.05 bpw uncensored pack was served (2026-10-08 → 2026-10-10). §5.6 reports both packs side by side.
 - **Hardware:** NVIDIA DGX Spark (GB10), CPU/GPU unified 128 GB
@@ -73,7 +74,9 @@ and the **image-history prefix cache** for multi-turn image chats — see §5.4�
 `0013` — our own fix, not a port — removes the cold-decode graph-recapture penalty on a
 lone stream (§5.6), `0014` keeps a system-block checkpoint so long shared prefixes
 stop re-prefilling (§5.7), and `0015` — also ours — spills a kept prefix to disk so it
-survives a server restart (§5.8).
+survives a server restart (§5.8); `0018` — ours too — fixes that spill's eviction hot path
+(pinned staging) and trims its payload (re-pool on restore), so the eviction cost is bounded
+(§5.8).
 
 ### 🤖 Deploy it with one link (for AI agents)
 
@@ -82,7 +85,7 @@ everything needed to build and serve the stack on a DGX Spark:
 
 > Fetch **https://raw.githubusercontent.com/Yuepixel/tensorfold-qwen38-exl3-lookup/main/RECIPE.md**
 > and follow it to install and run Qwen3.8-Flash-Next (EXL3 3.05 bpw) on a DGX Spark
-> (GB10) — TensorFold v0.6.5 (Python engine line) + 17 patches.
+> (GB10) — TensorFold v0.6.5 (Python engine line) + 18 patches.
 
 [`RECIPE.md`](RECIPE.md) is self-contained: prerequisites, exact commits, the patch
 apply, the CUDA build, the weight fetch, the serve command, and the acceptance check.
@@ -91,7 +94,7 @@ apply, the CUDA build, the weight fetch, the serve command, and the acceptance c
 
 ## 1. Patches
 
-Applied in order on top of `v0.6.5` (tag `p7.1-batch-lookup-v1` = `0001`–`0006`; tag `p8-ring-v1` = `0001`–`0007`; tags `p9-vision-v1` / `p10-vision-v1` = through `0011`; tag `p11-image-prefix-v1` = `0001`–`0012`; `0013`, `0014` and `0015` sit on top of that (no tag); `0016` (Qwen3.6-35B-A3B NVFP4) and `0017` (GGUF reader + CUDA dequant) sit on top as well (no tag, off-theme additions)):
+Applied in order on top of `v0.6.5` (tag `p7.1-batch-lookup-v1` = `0001`–`0006`; tag `p8-ring-v1` = `0001`–`0007`; tags `p9-vision-v1` / `p10-vision-v1` = through `0011`; tag `p11-image-prefix-v1` = `0001`–`0012`; `0013`, `0014` and `0015` sit on top of that (no tag); `0016` (Qwen3.6-35B-A3B NVFP4) and `0017` (GGUF reader + CUDA dequant) sit on top as well (no tag, off-theme additions); `0018` (disk-spill eviction-path fix, ours) sits on top too (no tag)):
 
 | # | Patch | Area |
 |---|-------|------|
@@ -112,13 +115,14 @@ Applied in order on top of `v0.6.5` (tag `p7.1-batch-lookup-v1` = `0001`–`0006
 | 0015 | `feat(flash next cuda): spill a kept prefix end to disk and resume from it` (ours) | disk prefix spill |
 | 0016 | `qwen3_5_moe: read compressed-tensors NVFP4 routed experts + MTP` | MoE NVFP4 |
 | 0017 | `GGUF reader and CUDA on-the-fly dequant (dense + grouped MoE experts)` | GGUF |
+| 0018 | `fix(flash next cuda): stage spill copies through pooled pinned host buffers` + `store only raw indexer keys on disk spill, re-pool on restore` (ours) | disk prefix spill fix |
 
 ```sh
 git checkout v0.6.5
 git am patches/*.patch        # or: git apply patches/*.patch
 ```
 
-Combined diffstat (`v0.6.5..p11-image-prefix`): **53 files, +2625 / −104**. `0013` adds one file, +8 / −6 (`multi_solo.py`); `0014` touches 4 files, +190 / −6 (`markers.py`, `engine.py`, two tests); `0015` adds one file and touches 5, +427 / −12 (`spill.py`, new test, `multi.py`, `prefixes.py`, `engine.py`, `run_serve.sh`). `0016` touches 8 files, +229 / −29 (`moe.py`, `nvfp4_load.py`, `qwen3_5/cuda/weights.py`, `qwen3_5_moe/__init__.py`, `qwen3_5_moe/cuda/{engine,mtp,weights}.py`, `tests/test_qwen36_moe_check.py`); `0017` touches 27 files, +1562 / −23 (new `gguf/{__init__,dequant,hf,reader,tokenizer}.py`, `cuda/gguf_experts.py`, `cuda/kernels/{affine,affine_kernels}.py`, both families' CUDA weights, `quantization.py`, `pyproject.toml`, `cli.py`, 7 new GGUF tests).
+Combined diffstat (`v0.6.5..p11-image-prefix`): **53 files, +2625 / −104**. `0013` adds one file, +8 / −6 (`multi_solo.py`); `0014` touches 4 files, +190 / −6 (`markers.py`, `engine.py`, two tests); `0015` adds one file and touches 5, +427 / −12 (`spill.py`, new test, `multi.py`, `prefixes.py`, `engine.py`, `run_serve.sh`). `0016` touches 8 files, +229 / −29 (`moe.py`, `nvfp4_load.py`, `qwen3_5/cuda/weights.py`, `qwen3_5_moe/__init__.py`, `qwen3_5_moe/cuda/{engine,mtp,weights}.py`, `tests/test_qwen36_moe_check.py`); `0017` touches 27 files, +1562 / −23 (new `gguf/{__init__,dequant,hf,reader,tokenizer}.py`, `cuda/gguf_experts.py`, `cuda/kernels/{affine,affine_kernels}.py`, both families' CUDA weights, `quantization.py`, `pyproject.toml`, `cli.py`, 7 new GGUF tests). `0018` touches 2 files, +110 / −15 (`spill.py`, `multi.py`).
 (`0001`–`0007` alone are 34 files, +2019 / −40.) A squashed view of the first seven is in
 `receipts/all-changes.diff`.
 
@@ -481,7 +485,7 @@ eviction it can be evicted before use — an intermittent cold miss (~1/6 serial
 concurrent). Enlarging the keep (`TENSORFOLD_KEEP` 8/16/64) measured **no** change; a
 GLM-style disk spill was the proposed next step — now delivered by `0015` (§5.8).
 
-### 5.8 Disk prefix spill — kept prefixes survive a restart (`0015`)
+### 5.8 Disk prefix spill — kept prefixes survive a restart (`0015` + fix `0018`)
 
 An evicted kept prefix is written to disk, and a later request that shares it resumes
 the **longest** stored prefix instead of re-prefilling. `0015` (ours) stores each kept
@@ -512,9 +516,18 @@ exact. Env knobs: `TF_SPILL_GIB` (disk cap in GiB, default `0` = off), `TF_SPILL
 (default `~/.cache/tensorfold/prefix-spill`), `TF_SPILL_MIN_TOKENS` (default `8192`).
 Default off; `--parallel` only.
 
+**Eviction-path fix (`0018`).** `0015` first copied the evicted rows with a pageable
+`.to("cpu")`, which blocks as the prefix grows: on a monotonic ~16k→94k growth load the
+per-eviction `gap = ttft − prefill` rose to **7–16 s** (non-eviction requests stayed
+0.05 s). `0018` stages those copies through **pinned** host buffers (pooled by size) and
+stops writing the pooled index rows for **text** prefixes (they are recomputed on restore).
+Per-eviction `gap` drops **7–16 s → ≤1 s**, the file shrinks **~2.5 %**, and a cold resume
+stays bit-identical. The served container keeps spill **on** (`TF_SPILL_GIB=8`).
+
 Receipts: `receipts/P21-ab-warm-20261010.json`, `receipts/P21-ab-cold-20261010.json`,
 `receipts/P21-stress-burn-20261010.json`, `receipts/P21-stress-resend-20261010.json`,
-notes in `receipts/P21-prefix-spill-notes.md`.
+`receipts/P21c-d-fix-20261011.json` (the `0018` A/B), and notes in
+`receipts/P21-prefix-spill-notes.md`.
 
 ---
 
@@ -559,6 +572,7 @@ Each command writes `receipt_<cmd>_<label>.json` next to itself.
 - The system-block checkpoint (`0014`) ports `grearjake-star`'s TensorFold branch
   `sys-checkpoint` (commit `b4a9993450f636b314485a07969600cc2be831a4`).
 - The disk prefix spill (`0015`) is this project's own work — not a port or cherry-pick.
+- The disk-spill eviction fix (`0018`, P21c/P21d) is this project's own work too.
 - Built on **TensorFold** by ashhart and contributors; EXL3 kernel work follows
   the existing Flash-Next CUDA/EXL3 path.
 - Hardware/quant recipe: Qwen3.8-Flash-Next EXL3 3.05 bpw `h5_ng5` on a single

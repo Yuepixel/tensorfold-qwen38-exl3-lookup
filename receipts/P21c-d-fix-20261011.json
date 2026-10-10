@@ -1,0 +1,22 @@
+{
+  "description": "0018 fix (P21c/P21d) for the disk prefix spill (0015): eviction-path TTFT gap and payload trim",
+  "env": "one GB10, temperature 0, spill ON (TF_SPILL_GIB=8); gap = ttft - prefill (s)",
+  "load": "16k system + 12 x 8k appended turns, single stream, monotonic prefix growth (16k -> 94k)",
+  "gap_s": {
+    "turn8_prompt_78486": { "base_0015": 7.35, "fixed_0018": 0.28 },
+    "turn9_prompt_86283": { "base_0015": 7.69, "fixed_0018": 0.22 },
+    "turn10_prompt_94085": { "base_0015": 15.79, "fixed_0018": 0.98 },
+    "non_eviction_turns": { "base_0015": 0.05, "fixed_0018": 0.05 }
+  },
+  "file_mb_text_prefix": {
+    "pos_31400": { "before_0015": 1084.2, "after_0018": 1056.4, "delta_pct": -2.5 },
+    "pos_47100": { "before_0015": 1566.7, "after_0018": 1526.8 }
+  },
+  "cold_resume": {
+    "burn_spilled": 4,
+    "resend_hits": 4,
+    "of": 10,
+    "resumed_cached_tokens": 4096,
+    "token_sha_identical": true
+  }
+}

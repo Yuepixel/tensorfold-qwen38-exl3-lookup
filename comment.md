@@ -1,4 +1,4 @@
-Update — vision, video, multi-image, an image-history prefix cache, and a disk prefix spill.
+Update — vision, video, multi-image, an image-history prefix cache, and a disk prefix spill (and its eviction fix).
 
 Since the `0001`–`0007` update, the same EXL3/CUDA build also does native **image + video** input and, the one that matters for multi-turn, stops **image chats from re-prefilling every turn**. New patches are `0008`–`0012` in this repo (github.com/Yuepixel/tensorfold-qwen38-exl3-lookup), all `git am`-able on top of `0007` (`v0.6.5` + the seven you already have). Full numbers: `README.md` §5.4–5.5. The repo is now an unofficial, license-compliant fork — upstream `NOTICE` / `THIRD_PARTY_NOTICES.md` / Apache-2.0 ship alongside (§4 kept), no endorsement implied.
 
@@ -40,9 +40,9 @@ recapture rounds **191/888 → 0**, TTFT/prefill unchanged, and serial-vs-parall
 output stays byte-exact. Numbers: `README.md` §5.6; patch `0013`; receipt
 `receipt_f6b_lookup-l7-2.json`.
 
-### 5. Disk prefix spill (`0015`) — kept prefixes survive a restart
+### 5. Disk prefix spill (`0015` + fix `0018`) — kept prefixes survive a restart
 
-`0015` (ours) writes an evicted kept prefix to disk and resumes the **longest** stored prefix on a later miss, so a **cold restart** stops re-prefilling repeated prompts. It is *not* a hot-path speedup — the kept prefix already lives in VRAM; the value is surviving a restart. Honest scope: **off by default** (`TF_SPILL_GIB`), `--parallel` only, text only. A/B (one GB10, `temperature 0`): a re-sent ~6k prefix after a cold restart came back `cached_tokens` **0 → 4096** with an **identical `token_sha`** (wall 3.43 → 2.12 s); under a 10-session stress, **4/10** prefixes resumed from disk after a cold restart, with no regression on the misses. Numbers: `README.md` §5.8; notes `receipts/P21-prefix-spill-notes.md`.
+`0015` (ours) writes an evicted kept prefix to disk and resumes the **longest** stored prefix on a later miss, so a **cold restart** stops re-prefilling repeated prompts. It is *not* a hot-path speedup — the kept prefix already lives in VRAM; the value is surviving a restart. Honest scope: **off by default** (`TF_SPILL_GIB`), `--parallel` only, text only. A/B (one GB10, `temperature 0`): a re-sent ~6k prefix after a cold restart came back `cached_tokens` **0 → 4096** with an **identical `token_sha`** (wall 3.43 → 2.12 s); under a 10-session stress, **4/10** prefixes resumed from disk after a cold restart, with no regression on the misses. Numbers: `README.md` §5.8; notes `receipts/P21-prefix-spill-notes.md`. The follow-up `0018` (ours) fixes the spill's **eviction hot path**: it stages the copies through pooled **pinned** host buffers and stops writing the pooled index rows for text prefixes (recomputed on restore), taking the per-eviction `gap = ttft − prefill` from **7–16 s → ≤1 s** and shrinking the file ~2.5%, with the same byte-exact resume (`receipts/P21c-d-fix-20261011.json`).
 
 ### 6. Off-theme additions (`0016`–`0017`)
 

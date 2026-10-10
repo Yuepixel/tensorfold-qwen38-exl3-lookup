@@ -13,7 +13,7 @@ This repository, tensorfold-qwen38-exl3-lookup, is an independent, unofficial
 distribution maintained by Yuepixel. It is NOT affiliated with or endorsed by
 the TensorFold project.
 
-It ships patch files (patches/0001-*.patch ... patches/0017-*.patch) that MODIFY
+It ships patch files (patches/0001-*.patch ... patches/0018-*.patch) that MODIFY
 TensorFold v0.6.5 source files, plus supporting tools, test fixtures, receipts,
 and documentation. TensorFold's Apache-2.0 license text is reproduced in
 LICENSES/Apache-2.0.txt; the third-party attribution notices TensorFold carries
