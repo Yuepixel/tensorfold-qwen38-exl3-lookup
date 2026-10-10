@@ -1,4 +1,4 @@
-# Qwen3.8-Flash-Next on TensorFold v0.6.5 — EXL3 3.05 bpw + prompt-lookup (CUDA)
+# Qwen3.8-Flash-Next on TensorFold v0.6.5 (Python) — EXL3 3.05 bpw + prompt-lookup (CUDA)
 
 [![license: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![TensorFold](https://img.shields.io/badge/TensorFold-0.6.5-orange)](https://github.com/ashhart/TensorFold)
