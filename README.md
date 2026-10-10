@@ -26,6 +26,8 @@ Cold `temperature 0`, one GB10, oldest/worst first:
 
 `token_sha` identical at every stage — serial = MTP-only = lookup = auto, single & parallel. Full numbers: [§5](#5-results).
 
+![Speedups on one DGX Spark vs stock: shared-prefix 12.9×, image multi-turn 6×, cold lone-stream decode 2.5×, EXL3 prefill 2.4×, decode lookup 1.44×](https://raw.githubusercontent.com/Yuepixel/tensorfold-qwen38-exl3-lookup/main/assets/speedups.svg)
+
 An **unofficial fork/branch of [TensorFold](https://github.com/ashhart/TensorFold) `v0.6.5`**:
 an EXL3 3.05 bpw stack plus a **prompt-lookup (suffix) draft arm** for
 **Qwen3.8-Flash-Next** on the CUDA path — 14 patches, the benchmark fixtures, and
@@ -295,8 +297,6 @@ every fixture. Receipt: `receipt_f6b_lookup-l7-2.json`; reproduce with
 Every result, ordered from the stock baseline to the best number we reached. (The
 stage-by-stage walk is the climb table at the top of this README; the subsections
 below carry the raw runs and receipts.)
-
-![Speedups on one DGX Spark vs stock: shared-prefix 12.9×, image multi-turn 6×, cold lone-stream decode 2.5×, EXL3 prefill 2.4×, decode lookup 1.44×](https://raw.githubusercontent.com/Yuepixel/tensorfold-qwen38-exl3-lookup/main/assets/speedups.svg)
 
 | metric | before (stock / earlier) | best (now) | Δ | detail |
 |---|---|---|---|---|
