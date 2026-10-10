@@ -3,9 +3,9 @@
 [![license: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![TensorFold](https://img.shields.io/badge/TensorFold-0.6.5-orange)](https://github.com/ashhart/TensorFold)
 [![GPU](https://img.shields.io/badge/NVIDIA-DGX%20Spark%20(GB10)-76B900)](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
-[![patches](https://img.shields.io/badge/patches-14-informational)](patches)
+[![patches](https://img.shields.io/badge/patches-15-informational)](patches)
 
-> **One DGX Spark (GB10) · TensorFold v0.6.5 (Python) + 14 patches · every number byte-exact.**
+> **One DGX Spark (GB10) · TensorFold v0.6.5 (Python) + 15 patches · every number byte-exact.**
 
 ![One DGX Spark, stock → best. Cold prefill ~670→1,777 t/s (≈2.4×); image multi-turn 2.87→0.24 s (≈12×); 6-session shared prefix 41.6→3.22 s (12.9×); cold decode 21→123 t/s (≈6×). Red = stock, amber = on the way, green = now.](https://raw.githubusercontent.com/Yuepixel/tensorfold-qwen38-exl3-lookup/main/assets/climb.svg)
 
@@ -23,12 +23,13 @@ Cold `temperature 0`, one GB10, oldest/worst first:
 | + `0012` | image-history prefix cache (#263) | turn-2 `cached_tokens` **0 → 2514**; 1.53 s → 0.24 s |
 | + `0013` | cold solo graph slot (ours) | recapture rounds **191/888 → 0**; cold decode **21 → 123 t/s** |
 | + `0014` | system-block checkpoint (sys-checkpoint) | shared-prefix prefill **4.57 s → 0.38 s**; 6-session **41.6 s → 3.22 s (12.9×)** |
+| + `0015` | disk prefix spill (ours) | kept prefixes survive a restart: cold-resume `cached_tokens` **0 → 4096**; **4/10** resume after a cold restart |
 
 `token_sha` identical at every stage — serial = MTP-only = lookup = auto, single & parallel. Full numbers: [§5](#5-results).
 
 An **unofficial fork/branch of [TensorFold](https://github.com/ashhart/TensorFold) `v0.6.5`**:
 an EXL3 3.05 bpw stack plus a **prompt-lookup (suffix) draft arm** for
-**Qwen3.8-Flash-Next** on the CUDA path — 14 patches, the benchmark fixtures, and
+**Qwen3.8-Flash-Next** on the CUDA path — 15 patches, the benchmark fixtures, and
 byte-exact `token_sha` receipts covering the **EXL3 prompt-GEMM prefill work**, the
 **prompt-lookup drafter**, and the **vision / video / image-history prefix-cache**
 additions.
@@ -37,7 +38,7 @@ It began as the reference material for [TensorFold issue #444](https://github.co
 (now closed; that thread links back here) and is kept as an independent, runnable
 branch of the Python/EXL3 line.
 
-- **Engine:** TensorFold `0.6.5` (`v0.6.5` tag) + 14 patches below
+- **Engine:** TensorFold `0.6.5` (`v0.6.5` tag) + 15 patches below
 - **Model:** `Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5` (EXL3 3.05 bpw, group-32, `h5_ng5` pack — the current weights)
 - **Weight packs:** tuned on the 3.05 bpw pack above; the `0013` (F6b) decode receipt was captured while a `Lygodactylus` 4.05 bpw uncensored pack was served (2026-10-08 → 2026-10-10). §5.6 reports both packs side by side.
 - **Hardware:** NVIDIA DGX Spark (GB10), CPU/GPU unified 128 GB
@@ -62,8 +63,9 @@ broadly useful part of this stack and is orthogonal to the drafter — full numb
 [§5](#5-results). Patches `0008`–`0012` add native **vision**, **video + multi-image**,
 and the **image-history prefix cache** for multi-turn image chats — see §5.4–§5.5.
 `0013` — our own fix, not a port — removes the cold-decode graph-recapture penalty on a
-lone stream (§5.6), and `0014` keeps a system-block checkpoint so long shared prefixes
-stop re-prefilling (§5.7).
+lone stream (§5.6), `0014` keeps a system-block checkpoint so long shared prefixes
+stop re-prefilling (§5.7), and `0015` — also ours — spills a kept prefix to disk so it
+survives a server restart (§5.8).
 
 ### 🤖 Deploy it with one link (for AI agents)
 
@@ -72,7 +74,7 @@ everything needed to build and serve the stack on a DGX Spark:
 
 > Fetch **https://raw.githubusercontent.com/Yuepixel/tensorfold-qwen38-exl3-lookup/main/RECIPE.md**
 > and follow it to install and run Qwen3.8-Flash-Next (EXL3 3.05 bpw) on a DGX Spark
-> (GB10) — TensorFold v0.6.5 (Python engine line) + 14 patches.
+> (GB10) — TensorFold v0.6.5 (Python engine line) + 15 patches.
 
 [`RECIPE.md`](RECIPE.md) is self-contained: prerequisites, exact commits, the patch
 apply, the CUDA build, the weight fetch, the serve command, and the acceptance check.
@@ -81,7 +83,7 @@ apply, the CUDA build, the weight fetch, the serve command, and the acceptance c
 
 ## 1. Patches
 
-Applied in order on top of `v0.6.5` (tag `p7.1-batch-lookup-v1` = `0001`–`0006`; tag `p8-ring-v1` = `0001`–`0007`; tags `p9-vision-v1` / `p10-vision-v1` = through `0011`; tag `p11-image-prefix-v1` = `0001`–`0012`; `0013` and `0014` sit on top of that (no tag)):
+Applied in order on top of `v0.6.5` (tag `p7.1-batch-lookup-v1` = `0001`–`0006`; tag `p8-ring-v1` = `0001`–`0007`; tags `p9-vision-v1` / `p10-vision-v1` = through `0011`; tag `p11-image-prefix-v1` = `0001`–`0012`; `0013`, `0014` and `0015` sit on top of that (no tag)):
 
 | # | Patch | Area |
 |---|-------|------|
@@ -99,13 +101,14 @@ Applied in order on top of `v0.6.5` (tag `p7.1-batch-lookup-v1` = `0001`–`0006
 | 0012 | `fix(flash next cuda): image prompts resume and keep prompt states, matched on the images' pixels` (cherry-pick of #263) | image prefix cache |
 | 0013 | `fix(flash next cuda): keep the solo graph slot hot on a cold prefix miss (F6b)` (ours) | decode / solo graph slot |
 | 0014 | `feat(flash next cuda): keep a state at the last 2048-row boundary before a system block's end` (port of `grearjake-star`'s `sys-checkpoint` @ `b4a9993`) | long-context prefix reuse |
+| 0015 | `feat(flash next cuda): spill a kept prefix end to disk and resume from it` (ours) | disk prefix spill |
 
 ```sh
 git checkout v0.6.5
 git am patches/*.patch        # or: git apply patches/*.patch
 ```
 
-Combined diffstat (`v0.6.5..p11-image-prefix`): **53 files, +2625 / −104**. `0013` adds one file, +8 / −6 (`multi_solo.py`); `0014` touches 4 files, +190 / −6 (`markers.py`, `engine.py`, two tests).
+Combined diffstat (`v0.6.5..p11-image-prefix`): **53 files, +2625 / −104**. `0013` adds one file, +8 / −6 (`multi_solo.py`); `0014` touches 4 files, +190 / −6 (`markers.py`, `engine.py`, two tests); `0015` adds one file and touches 5, +427 / −12 (`spill.py`, new test, `multi.py`, `prefixes.py`, `engine.py`, `run_serve.sh`).
 (`0001`–`0007` alone are 34 files, +2019 / −40.) A squashed view of the first seven is in
 `receipts/all-changes.diff`.
 
@@ -114,10 +117,10 @@ Touched areas:
 ```
 src/tensorfold/cuda/exl3/{experts.cpp,experts.cu,experts.py,experts_cb0.cu,experts_cb1.cu,experts_cb2.cu,experts_prompt.cuh,prefill.py}
 src/tensorfold/cuda/{health.py,streams.py}
-src/tensorfold/families/qwen4_exp/cuda/{decode.py,engine.py,exl3_mm.py,exl3_pack.py,forward.py,lookup.py,multi.py,multi_fill.py,multi_solo.py,image_rows.py,state.py}
+src/tensorfold/families/qwen4_exp/cuda/{decode.py,engine.py,exl3_mm.py,exl3_pack.py,forward.py,lookup.py,multi.py,multi_fill.py,multi_solo.py,image_rows.py,state.py,prefixes.py,spill.py}
 src/tensorfold/vision/{exl3_convert.py,qwen_checkpoint.py}
 src/tensorfold/server/metrics.py
-tests/cuda/{test_exl3_prompt_experts.py,test_qwen4_exp_lookup.py,test_flashnext_vision.py}
+tests/cuda/{test_exl3_prompt_experts.py,test_qwen4_exp_lookup.py,test_flashnext_vision.py,test_flashnext_spill.py}
 tests/{test_flashnext_image_keys.py,test_flashnext_absolute_grow_host.py,test_vision_exl3_convert.py}
 tools/p7_conc_bench.py, tools/p7_conc_edit.py, tools/p7_cost_fit.py, tools/p7_edit_bench.py,
 tools/p7_probe.py, tools/p7_profile.py, tools/prefill_cold.py
@@ -303,6 +306,7 @@ below carry the raw runs and receipts.)
 | Image multi-turn prefill | 1.53 s (cached 0) | 0.24 s (cached 2514) | **≈ 6×** | §5.5 |
 | Cold lone-stream decode (4.05 bpw) | 21–50 t/s | 33.5–123 t/s | **≈ 2–3×** | §5.6 |
 | Shared-prefix prefill, 6 sessions | 41.6 s | 3.22 s | **12.9×** | §5.7 |
+| Prefix after a cold restart (spill) | re-prefill (cached 0) | resume from disk (cached 4096) | 3.43 → 2.12 s | §5.8 |
 
 `token_sha` is identical at every stage: this is speed, not a different model.
 
@@ -465,7 +469,42 @@ Receipts: `receipts/P20-bench-result-20261010.json` (A/B), `receipts/P20-tok-con
 Known limitation: the checkpoint shares the same kept-state count, so under bounded
 eviction it can be evicted before use — an intermittent cold miss (~1/6 serial, ~2–3/6
 concurrent). Enlarging the keep (`TENSORFOLD_KEEP` 8/16/64) measured **no** change; a
-GLM-style disk spill is the proposed next step.
+GLM-style disk spill was the proposed next step — now delivered by `0015` (§5.8).
+
+### 5.8 Disk prefix spill — kept prefixes survive a restart (`0015`)
+
+An evicted kept prefix is written to disk, and a later request that shares it resumes
+the **longest** stored prefix instead of re-prefilling. `0015` (ours) stores each kept
+entry as a per-prefix `safetensors` (the tensors past `pos`: `rec`/`conv`/`ple` tail,
+and every layer's `k`/`v`, index cache and pooled rows) plus a small `json` sidecar,
+named by the SHA-256 of the token ids, under `$TF_SPILL_DIR`. On eviction the GPU rows
+are copied to host memory synchronously (before the slot is shrunk), then written by a
+background thread (atomic tmp + `os.replace`); `trim()` drops the oldest files past the
+byte cap; `close()` flushes. Resume copies the stored rows into the fresh slot — the
+same path as an in-memory kept prefix, so the reply is a fresh prefill's, token for
+token. Text only; the CUDA/`--parallel` path.
+
+Honest scope: on the **hot path it changes nothing** — the kept prefix is already in
+VRAM, so an in-process hit is identical to `0014`. Its value is a **cold restart**: after
+the server is restarted (RAM cache gone), a repeated prefix resumes from disk.
+
+A/B (one GB10, `temperature 0`, `TF_SPILL_GIB=8`, `TF_SPILL_MIN_TOKENS=2048`):
+
+| scenario | `cached_tokens` | wall |
+|---|---|---|
+| fresh ~6k prefix (miss) | 0 | 3.43 s |
+| same prefix after a cold restart | **4096** | 2.12 s |
+| 10 distinct ~6k prefixes, then cold restart | **4/10 resume @ 4096** | 36.7 s (vs 41.1 s all-miss) |
+
+With `TF_SPILL_MIN_TOKENS=2048` the whole ~6k prefix is stored (`pos ≈ 5954`), so a cold
+restart skips nearly the entire prefill. `token_sha` is identical warm vs cold — byte
+exact. Env knobs: `TF_SPILL_GIB` (disk cap in GiB, default `0` = off), `TF_SPILL_DIR`
+(default `~/.cache/tensorfold/prefix-spill`), `TF_SPILL_MIN_TOKENS` (default `8192`).
+Default off; `--parallel` only.
+
+Receipts: `receipts/P21-ab-warm-20261010.json`, `receipts/P21-ab-cold-20261010.json`,
+`receipts/P21-stress-burn-20261010.json`, `receipts/P21-stress-resend-20261010.json`,
+notes in `receipts/P21-prefix-spill-notes.md`.
 
 ---
 
@@ -481,6 +520,12 @@ python3 receipts/collect.py parallel lookup-l7-2 2
 python3 receipts/collect.py parallel mtponly     2
 python3 receipts/collect.py cancel   lookup-l7-2
 python3 receipts/f6b_before_after.sh
+# disk prefix spill A/B (0015): warm populates + spills; cold (after a restart,
+# spill dir kept) must resume from disk with an identical token_sha
+python3 receipts/p21_spill_ab.py warm  receipts/P21-ab-warm-20261010.json
+python3 receipts/p21_spill_ab.py cold  receipts/P21-ab-cold-20261010.json
+python3 receipts/p21_stress.py  burn  receipts/P21-stress-burn-20261010.json 10
+python3 receipts/p21_stress.py  resend receipts/P21-stress-resend-20261010.json 10
 ```
 
 Each command writes `receipt_<cmd>_<label>.json` next to itself.
@@ -503,6 +548,7 @@ Each command writes `receipt_<cmd>_<label>.json` next to itself.
   or cherry-pick.
 - The system-block checkpoint (`0014`) ports `grearjake-star`'s TensorFold branch
   `sys-checkpoint` (commit `b4a9993450f636b314485a07969600cc2be831a4`).
+- The disk prefix spill (`0015`) is this project's own work — not a port or cherry-pick.
 - Built on **TensorFold** by ashhart and contributors; EXL3 kernel work follows
   the existing Flash-Next CUDA/EXL3 path.
 - Hardware/quant recipe: Qwen3.8-Flash-Next EXL3 3.05 bpw `h5_ng5` on a single

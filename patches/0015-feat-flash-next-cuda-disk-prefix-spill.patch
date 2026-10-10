@@ -1,0 +1,661 @@
+From 38e2cade7d502011aa9b6daddc0877ec93f792a4 Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 11:21:17 +0000
+Subject: [PATCH 1/3] feat(flash next cuda): spill a kept prefix end to disk
+ and resume from it (P21a)
+
+---
+ .../families/qwen4_exp/cuda/spill.py          | 226 ++++++++++++++++++
+ tests/cuda/test_flashnext_spill.py            |  77 ++++++
+ 2 files changed, 303 insertions(+)
+ create mode 100644 src/tensorfold/families/qwen4_exp/cuda/spill.py
+ create mode 100644 tests/cuda/test_flashnext_spill.py
+
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/spill.py b/src/tensorfold/families/qwen4_exp/cuda/spill.py
+new file mode 100644
+index 0000000..e49b727
+--- /dev/null
++++ b/src/tensorfold/families/qwen4_exp/cuda/spill.py
+@@ -0,0 +1,226 @@
++"""Disk spill for Flash Next (CUDA) kept prompt ends: an evicted kept state writes its KV rows and its recurrent
++snapshot to a per-prompt file, so a later request that extends the same prefix resumes from disk instead of a cold
++prefill. The format is model-agnostic; the ``MultiDecoder`` calls it on eviction and on shutdown.
++
++A prompt's file is two objects: ``<name>.safetensors`` holds the tensors (the snapshot's small state and the cache
++rows below the kept point), ``<name>.json`` the metadata the resume reads before any tensor loads (the token ids, the
++kept length, the KV geometry). The engine off by default (``TF_SPILL_GIB`` unset or 0); ``TF_SPILL_MIN_TOKENS``
++(default 8192) skips prefixes cheap to recompute.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import time
++from pathlib import Path
++
++import numpy as np
++import torch
++
++DIR_ENV = "TF_SPILL_DIR"
++GIB_ENV = "TF_SPILL_GIB"
++MIN_TOKENS_ENV = "TF_SPILL_MIN_TOKENS"
++DEFAULT_DIR = Path("~/.cache/tensorfold/prefix-spill")
++DEFAULT_MIN_TOKENS = 8192
++GIB = 1024**3
++
++
++def fingerprint(model_dir) -> str:
++    """A short, stable name for a checkpoint, so two models' spilled prefixes never share a directory."""
++
++    path = Path(model_dir).resolve()
++    return f"{path.name}-{hashlib.sha256(str(path).encode()).hexdigest()[:12]}"
++
++
++def from_env(model_dir=None) -> "SpillStore | None":
++    """The store ``TF_SPILL_GIB`` asks for, or None when the engine is off (its default)."""
++
++    raw = os.environ.get(GIB_ENV, "").strip()
++    try:
++        gib = float(raw) if raw else 0.0
++    except ValueError:
++        raise ValueError(f"{GIB_ENV}: GiB (0: off), not {raw!r}") from None
++    if gib <= 0:
++        return None
++    root = os.environ.get(DIR_ENV, "").strip() or DEFAULT_DIR
++    root = Path(root).expanduser()
++    if model_dir is not None:
++        root = root / fingerprint(model_dir)
++    raw = os.environ.get(MIN_TOKENS_ENV, "").strip()
++    try:
++        min_tokens = int(raw) if raw else DEFAULT_MIN_TOKENS
++    except ValueError:
++        raise ValueError(f"{MIN_TOKENS_ENV}: rows, not {raw!r}") from None
++    if min_tokens < 0:
++        raise ValueError(f"{MIN_TOKENS_ENV}: 0 or more, not {min_tokens}")
++    return SpillStore(root, min_tokens=min_tokens, max_bytes=int(gib * GIB))
++
++
++class SpillStore:
++    """One directory of spilled kept prefixes; every write is atomic and the directory is trimmed to ``max_bytes``."""
++
++    def __init__(self, root, *, min_tokens: int = DEFAULT_MIN_TOKENS, max_bytes: int | None = None) -> None:
++        self.root = Path(root).expanduser()
++        self.min_tokens = int(min_tokens)
++        self.max_bytes = None if max_bytes is None else int(max_bytes)
++
++    # -- naming -----------------------------------------------------------------------------------------
++    def name(self, ids) -> str:
++        return hashlib.sha256(",".join(str(int(t)) for t in ids).encode()).hexdigest()[:32]
++
++    def _tensors(self, ids) -> Path:
++        return self.root / f"{self.name(ids)}.safetensors"
++
++    def _meta(self, ids) -> Path:
++        return self.root / f"{self.name(ids)}.json"
++
++    # -- writing ----------------------------------------------------------------------------------------
++    def record(self, ids, st, snap: dict, tail) -> Path | None:
++        """Write a kept prompt end (its cache rows and snapshot); None when it is below ``min_tokens``."""
++
++        ids = [int(t) for t in ids]
++        pos = int(snap["pos"])
++        if pos < self.min_tokens:
++            return None
++        from safetensors.torch import save_file
++
++        tensors, meta = self._collect(ids, st, snap, pos, tail)
++        self.root.mkdir(parents=True, exist_ok=True)
++        path, sidecar = self._tensors(ids), self._meta(ids)
++        tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
++        try:
++            save_file(tensors, str(tmp), metadata={"format": "tensorfold-spill"})
++            os.replace(tmp, path)
++            meta_tmp = sidecar.with_name(f"{sidecar.name}.tmp-{os.getpid()}-{time.time_ns()}")
++            meta_tmp.write_text(json.dumps(meta))
++            os.replace(meta_tmp, sidecar)
++        finally:
++            tmp.unlink(missing_ok=True)
++        self.trim()
++        return path
++
++    def _collect(self, ids, st, snap: dict, pos: int, tail) -> tuple[dict, dict]:
++        """The CPU tensors and metadata of one kept point: the snapshot's state, the cache rows ``[0:pos]``, the
++        MTP head's ``[0:mtp_len]`` and its tail. Copied off the GPU here, before the caller may shrink the slot."""
++
++        def cpu(t):
++            return t.detach().to("cpu").contiguous()
++
++        mtp_len = int(snap["mtp_len"])
++        t: dict[str, torch.Tensor] = {
++            "rec": cpu(snap["rec"]), "conv": cpu(snap["conv"]), "ple_tail": cpu(snap["ple_tail"]),
++        }
++        if snap["ple_history"] is not None:
++            t["ple_history"] = torch.from_numpy(np.ascontiguousarray(snap["ple_history"]))
++        if tail is not None:
++            t["tail"] = cpu(tail)
++        for i, kc in enumerate(st.kc):
++            t[f"kc.{i}.k"] = cpu(kc.k[:pos])
++            t[f"kc.{i}.v"] = cpu(kc.v[:pos])
++            if kc.quantized:
++                t[f"kc.{i}.ks"] = cpu(kc.ks[:pos])
++                t[f"kc.{i}.vs"] = cpu(kc.vs[:pos])
++            t[f"ikc.{i}"] = cpu(st.ikc[i][:pos])
++            t[f"pooled.{i}"] = cpu(st.pooled[i][:pos // st.ratio])
++        meta = {"ids": ids, "pos": pos, "mtp_len": mtp_len, "kv_dtype": st.kv_dtype, "ratio": st.ratio,
++                "layers": len(st.kc), "quantized": bool(st.kc and st.kc[0].quantized), "mtp": hasattr(st, "mtp_kc"),
++                "ple": snap["ple_history"] is not None, "tail": tail is not None, "saved": time.time()}
++        if mtp_len and hasattr(st, "mtp_kc"):
++            t["mtp.k"] = cpu(st.mtp_kc.k[:mtp_len])
++            t["mtp.v"] = cpu(st.mtp_kc.v[:mtp_len])
++            if st.mtp_kc.quantized:
++                t["mtp.ks"] = cpu(st.mtp_kc.ks[:mtp_len])
++                t["mtp.vs"] = cpu(st.mtp_kc.vs[:mtp_len])
++            t["mtp.ikc"] = cpu(st.mtp_ikc[:mtp_len])
++            t["mtp.pooled"] = cpu(st.mtp_pooled[:mtp_len // st.ratio])
++        return t, meta
++
++    # -- reading ----------------------------------------------------------------------------------------
++    def lookup(self, prompt) -> tuple[list[int], dict] | None:
++        """The longest strict prefix of ``prompt`` on disk (its metadata), or None."""
++
++        if not self.root.is_dir():
++            return None
++        prompt = [int(t) for t in prompt]
++        best: tuple[list[int], dict] | None = None
++        for sidecar in self.root.glob("*.json"):
++            if not sidecar.with_suffix(".safetensors").is_file():
++                continue
++            try:
++                meta = json.loads(sidecar.read_text())
++            except (OSError, ValueError):
++                continue
++            ids = meta.get("ids")
++            n = len(ids) if isinstance(ids, list) else 0
++            if n and n < len(prompt) and prompt[:n] == ids and (best is None or n > len(best[0])):
++                best = (ids, meta)
++        return best
++
++    def restore(self, ids, dst) -> tuple[dict, object]:
++        """Load the spilled rows into the destination slot and rebuild the resume (snapshot, tail)."""
++
++        from safetensors.torch import load_file
++
++        ids = [int(t) for t in ids]
++        meta = json.loads(self._meta(ids).read_text())
++        pos, mtp_len = int(meta["pos"]), int(meta["mtp_len"])
++        if pos > dst.capacity:
++            raise ValueError(f"a {pos}-row spilled prefix does not fit a {dst.capacity}-row slot")
++        if meta.get("kv_dtype") != dst.kv_dtype or int(meta.get("ratio", dst.ratio)) != dst.ratio:
++            raise ValueError("a spilled prefix needs a slot with matching cache geometry")
++        t = load_file(str(self._tensors(ids)))
++
++        def into(mine, name):
++            mine.copy_(t[name].to(mine.device))
++
++        snap = {"pos": pos, "rec": t["rec"].to(dst.rec.device), "conv": t["conv"].to(dst.conv.device),
++                "ple_tail": t["ple_tail"].to(dst.ple_tail.device),
++                "ple_history": t["ple_history"].numpy() if "ple_history" in t else None, "mtp_len": mtp_len}
++        for i in range(int(meta["layers"])):
++            into(dst.kc[i].k[:pos], f"kc.{i}.k")
++            into(dst.kc[i].v[:pos], f"kc.{i}.v")
++            if dst.kc[i].quantized:
++                into(dst.kc[i].ks[:pos], f"kc.{i}.ks")
++                into(dst.kc[i].vs[:pos], f"kc.{i}.vs")
++            dst.ikc[i][:pos].copy_(t[f"ikc.{i}"].to(dst.ikc[i].device))
++            dst.pooled[i][:pos // dst.ratio].copy_(t[f"pooled.{i}"].to(dst.pooled[i].device))
++        if mtp_len and hasattr(dst, "mtp_kc"):
++            into(dst.mtp_kc.k[:mtp_len], "mtp.k")
++            into(dst.mtp_kc.v[:mtp_len], "mtp.v")
++            if dst.mtp_kc.quantized:
++                into(dst.mtp_kc.ks[:mtp_len], "mtp.ks")
++                into(dst.mtp_kc.vs[:mtp_len], "mtp.vs")
++            dst.mtp_ikc[:mtp_len].copy_(t["mtp.ikc"].to(dst.mtp_ikc.device))
++            dst.mtp_pooled[:mtp_len // dst.ratio].copy_(t["mtp.pooled"].to(dst.mtp_pooled.device))
++        tail = t["tail"].to(dst.conv.device) if meta.get("tail") else None
++        return snap, tail
++
++    # -- housekeeping -----------------------------------------------------------------------------------
++    def trim(self) -> None:
++        """Remove the oldest spilled prefixes until the directory holds ``max_bytes`` or less."""
++
++        if self.max_bytes is None or not self.root.is_dir():
++            return
++        files = sorted(self.root.glob("*.safetensors"), key=lambda p: p.stat().st_mtime)
++        total = sum(self.total_of(p) for p in files)
++        for path in files:
++            if total <= self.max_bytes:
++                break
++            total -= self.total_of(path)
++            self._remove(path)
++
++    def total_of(self, tensors_path: Path) -> int:
++        sidecar = tensors_path.with_suffix(".json")
++        return tensors_path.stat().st_size + (sidecar.stat().st_size if sidecar.is_file() else 0)
++
++    def _remove(self, tensors_path: Path) -> None:
++        for path in (tensors_path, tensors_path.with_suffix(".json")):
++            try:
++                path.unlink()
++            except OSError:
++                pass
++
++    def bytes_on_disk(self) -> int:
++        return sum(self.total_of(p) for p in self.root.glob("*.safetensors")) if self.root.is_dir() else 0
+diff --git a/tests/cuda/test_flashnext_spill.py b/tests/cuda/test_flashnext_spill.py
+new file mode 100644
+index 0000000..3c13e8e
+--- /dev/null
++++ b/tests/cuda/test_flashnext_spill.py
+@@ -0,0 +1,77 @@
++"""Disk spill on the GPU (P21a): a kept prompt end written to disk and restored into a fresh slot resumes at the
++kept point, and its reply is token-for-token a fresh prefill's (bf16 and int8 caches)."""
++
++import pytest
++import torch
++
++if not torch.cuda.is_available():
++    pytest.skip("CUDA only", allow_module_level=True)
++
++from test_flashnext_forward import V, _model  # noqa: E402
++
++from tensorfold.cuda.markers import snapshot_points  # noqa: E402
++from tensorfold.cuda.streams import Stream  # noqa: E402
++from tensorfold.engine.exact_sampling import Sampling  # noqa: E402
++from tensorfold.families.qwen4_exp.cuda.decode import Engine, prefill, serial_decode  # noqa: E402
++from tensorfold.families.qwen4_exp.cuda.multi import MultiDecoder, _slot  # noqa: E402
++from tensorfold.families.qwen4_exp.cuda.spill import SpillStore  # noqa: E402
++from tensorfold.families.qwen4_exp.cuda.state import State  # noqa: E402
++
++OPEN, ASSISTANT = V - 2, V - 1
++SAMPLING = Sampling(seed=31, top_k=20, top_p=0.95)
++
++
++@pytest.fixture(scope="module")
++def w():
++    return _model()
++
++
++def _fresh(w, prompt, count, kv_dtype):
++    e = Engine(w, capacity=1024, max_rows=8, prefill_rows=16, kv_dtype=kv_dtype)
++    return serial_decode(e, prefill(e, prompt, SAMPLING), count, SAMPLING, stop_eos=False).tokens
++
++
++def _run(dec, prompt, count):
++    s = Stream(list(prompt), count, SAMPLING, stop_eos=False)
++    dec.admit(s)
++    while dec.live():
++        dec.finish(dec.round())
++    return s
++
++
++@pytest.mark.parametrize("kv_dtype", ["bf16", "int8"])
++def test_a_spilled_prefix_resumes_token_for_token(w, kv_dtype, tmp_path):
++    g = torch.Generator().manual_seed(7)
++    block = torch.randint(1, V - 2, (320,), generator=g).tolist()
++    user = torch.randint(1, V - 2, (16,), generator=g).tolist()
++    prompt = [OPEN] + block + [OPEN] + user + [OPEN, ASSISTANT]
++    points = snapshot_points((OPEN,), (OPEN, ASSISTANT))
++
++    dec = MultiDecoder(w, slots=3, capacity=1024, depth=3, confidence=0.3, kv_dtype=kv_dtype, points=points)
++    _run(dec, prompt, 8)
++    entries = [k for k in dec.kept if len(k[0]) < len(prompt)]
++    assert entries, "the run kept no resumable prefix"
++    ids, st, snap, tail = max(entries, key=lambda k: len(k[0]))
++
++    store = SpillStore(tmp_path, min_tokens=1)
++    assert store.record(ids, st, snap, tail) is not None
++    assert store.bytes_on_disk() > 0
++
++    hit = store.lookup(prompt)
++    assert hit is not None and hit[0] == ids
++
++    dst = State(w, capacity=1024, max_rows=4, kv_dtype=kv_dtype)
++    snap2, tail2 = store.restore(ids, dst)
++    assert snap2["pos"] == snap["pos"]
++    assert torch.equal(snap2["rec"].to(snap["rec"].device), snap["rec"])
++    assert torch.equal(snap2["conv"].to(snap["conv"].device), snap["conv"])
++
++    e2 = _slot(w, dst, dec.buf, dec.mbuf, dec.pbuf, 1024, dec.prefill_rows)
++    first = prefill(e2, prompt, SAMPLING, resume={"state": snap2, "tail": tail2})
++    assert serial_decode(e2, first, 8, SAMPLING, stop_eos=False).tokens == _fresh(w, prompt, 8, kv_dtype)
++    assert e2.st.pos >= snap["pos"]
++
++
++def test_off_when_small_or_disabled(tmp_path):
++    store = SpillStore(tmp_path, min_tokens=100)
++    assert store.lookup([1, 2, 3]) is None
+-- 
+2.43.0
+
+
+From 0fc96e0e372df2de488d0075f4540a49a5993ece Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 11:23:31 +0000
+Subject: [PATCH 2/3] feat(flash next cuda): spill kept prefix ends on eviction
+ and resume them from disk (P21b)
+
+---
+ .../families/qwen4_exp/cuda/engine.py         | 14 ++++-
+ .../families/qwen4_exp/cuda/multi.py          | 40 +++++++++++--
+ .../families/qwen4_exp/cuda/prefixes.py       |  3 +-
+ .../families/qwen4_exp/cuda/spill.py          | 57 +++++++++++++++++--
+ tests/cuda/test_flashnext_spill.py            | 22 +++++++
+ 5 files changed, 123 insertions(+), 13 deletions(-)
+
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/engine.py b/src/tensorfold/families/qwen4_exp/cuda/engine.py
+index a4b2c89..f9cdd4b 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/engine.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/engine.py
+@@ -182,15 +182,23 @@ class FlashNextEngine:
+             "send text without response_format or guided output, or start without --parallel"
+             if self.concurrent and tp == 2 else None)
+         self.multi = self.scheduler = None
++        self.spill = None
+         if self.concurrent:
+             from tensorfold.cuda.scheduler import Scheduler
+ 
+             from .multi import MultiDecoder
+-
++            from .spill import from_env as spill_from_env
++
++            self.spill = spill_from_env(model_dir)
++            if self.spill is not None:
++                print(f"[tensorfold] spill: kept prefix ends to {self.spill.root} "
++                      f"(min {self.spill.min_tokens} tokens"
++                      f"{'' if self.spill.max_bytes is None else f', {self.spill.max_bytes / 2**30:.1f} GiB cap'})",
++                      flush=True)
+             self.e = None
+             self.multi = MultiDecoder(w, slots=streams, capacity=self.max_len, depth=self.depth,
+                                       confidence=self.confidence, keep=KEEP, points=self.points,
+-                                      kv_dtype=self.kv_dtype, share=share, vision=self.vision,
++                                      kv_dtype=self.kv_dtype, share=share, vision=self.vision, spill=self.spill,
+                                       prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace, graphs=graphs)
+             self.scheduler = Scheduler(self.multi, max_streams=streams)
+         else:
+@@ -446,6 +454,8 @@ class FlashNextEngine:
+         if self.scheduler is not None:
+             self.scheduler.close()
+             self.scheduler = None
++        if self.spill is not None:
++            self.spill.flush()
+ 
+     def generate(self, prompt: list[int], max_tokens: int, sampling,
+                  on_tokens: Callable[[list[int]], bool | None], draft: bool = True, constraint=None,
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/multi.py b/src/tensorfold/families/qwen4_exp/cuda/multi.py
+index d1967f2..ef93b9e 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/multi.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/multi.py
+@@ -50,7 +50,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+ 
+     def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
+                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
+-                 share: float = SHARE, points=None, graphs: bool = True, vision=None, workspace_bytes: int = 0) -> None:
++                 share: float = SHARE, points=None, graphs: bool = True, vision=None, spill=None,
++                 workspace_bytes: int = 0) -> None:
+         self.link = self.follower = None
+         self.planning, self.pass_plan, self.mixed_plan = False, None, None
+         self.pass_index, self.pass_width = 0, prefill_rows
+@@ -94,6 +95,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+         self.draft_host = w.draft_ids.cpu().numpy() if w.draft_ids is not None else None
+         self.kept: list[tuple[list[int], State, dict, torch.Tensor | None]] = []   # (ids, slot, snapshot, tail)
+         self.keep = keep
++        self.spill = spill                           # a disk store for kept prefix ends (P21), or None
+ 
+     def _busy(self) -> set[int]:
+         return {id(s.st) for s in [*self.streams.values(), *self.filling]}
+@@ -101,6 +103,25 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+     def _drop_kept(self, st: State) -> None:
+         self.kept = [k for k in self.kept if k[1] is not st]
+ 
++    def _spill_entry(self, entry) -> None:
++        """Write one kept prefix end to disk before its slot is reused; a failure never takes a decode round down."""
++
++        if self.spill is None:
++            return
++        ids, st, snap, tail = entry
++        try:
++            self.spill.record(ids, st, snap, tail, background=True)
++        except Exception:
++            pass
++
++    def _retire(self, st: State) -> None:
++        """Spill then forget the kept prefix end in ``st`` (before its slot's memory is reused)."""
++
++        entry = next((k for k in self.kept if k[1] is st), None)
++        if entry is not None:
++            self._spill_entry(entry)
++        self._drop_kept(st)
++
+     def _grow(self, st: State, rows: int, *, alone: bool = False, protect: State | None = None) -> bool:
+         """Grow caches while the gate has room; one stream may use its startup allowance within an explicit cap."""
+ 
+@@ -161,7 +182,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+         busy = self._busy()
+         for ids, st, _, _ in self.kept:
+             if st is not keep and st is not protect and id(st) not in busy:
+-                self._drop_kept(st)
++                self._retire(st)
+                 self._shrink(st, release=True)
+                 if all(f is not st for f in self.free):
+                     self.free.append(st)
+@@ -211,11 +232,22 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+         return ended
+ 
+     def _slot_for(self, prompt: list[int], reuse: bool):
+-        """Reuse kept prefixes, preferring the graph slot among otherwise free destinations."""
++        """Reuse kept prefixes, preferring the graph slot among otherwise free destinations; a cold miss falls back
++        to the longest prefix on disk (P21) before prefilling from scratch."""
+ 
+         if self.solo is not None and any(st is self.solo.st for st in self.free):
+             self.free = [st for st in self.free if st is not self.solo.st] + [self.solo.st]
+-        return prefixes.slot_for(self, prompt, reuse)
++        slot, resume, cached = prefixes.slot_for(self, prompt, reuse)
++        if resume is None and cached == 0 and self.spill is not None:
++            hit = self.spill.lookup(prompt)
++            if hit is not None:
++                try:
++                    self._grow(slot, len(prompt) + self.depth + 2)
++                    snap, tail = self.spill.restore(hit[0], slot)
++                    return slot, {"state": snap, "tail": tail}, len(hit[0])
++                except Exception:
++                    pass                     # a corrupt or too-small spilled prefix: prefill from scratch
++        return slot, resume, cached
+ 
+     def _remember(self, ids: list[int], st: State, snap: dict, tail) -> None:
+         prefixes.remember(self, ids, st, snap, tail)
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/prefixes.py b/src/tensorfold/families/qwen4_exp/cuda/prefixes.py
+index ea8fd04..6af3448 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/prefixes.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/prefixes.py
+@@ -40,7 +40,7 @@ def slot_for(owner, prompt: list[int], reuse: bool):
+         idle = next((k[1] for k in owner.kept if id(k[1]) not in busy), None)
+         if idle is None:
+             raise RuntimeError("no free stream slot")
+-        owner._drop_kept(idle)
++        owner._retire(idle)
+         owner.free.append(idle)
+     return owner.free.pop(), None, 0
+ 
+@@ -51,6 +51,7 @@ def remember(owner, ids, st, snap, tail) -> None:
+     gone = [k[1] for k in owner.kept if k[0] == ids]
+     owner.kept = [k for k in owner.kept if k[0] != ids] + [(ids, st, snap, tail)]
+     while len(owner.kept) > owner.keep:
++        owner._spill_entry(owner.kept[0])
+         gone.append(owner.kept.pop(0)[1])
+     busy = owner._busy()
+     for old in gone:
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/spill.py b/src/tensorfold/families/qwen4_exp/cuda/spill.py
+index e49b727..4adb235 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/spill.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/spill.py
+@@ -13,6 +13,8 @@ from __future__ import annotations
+ import hashlib
+ import json
+ import os
++import queue
++import threading
+ import time
+ from pathlib import Path
+ 
+@@ -65,6 +67,9 @@ class SpillStore:
+         self.root = Path(root).expanduser()
+         self.min_tokens = int(min_tokens)
+         self.max_bytes = None if max_bytes is None else int(max_bytes)
++        self._queue: queue.Queue | None = None
++        self._worker: threading.Thread | None = None
++        self._lock = threading.Lock()
+ 
+     # -- naming -----------------------------------------------------------------------------------------
+     def name(self, ids) -> str:
+@@ -77,18 +82,31 @@ class SpillStore:
+         return self.root / f"{self.name(ids)}.json"
+ 
+     # -- writing ----------------------------------------------------------------------------------------
+-    def record(self, ids, st, snap: dict, tail) -> Path | None:
+-        """Write a kept prompt end (its cache rows and snapshot); None when it is below ``min_tokens``."""
++    def record(self, ids, st, snap: dict, tail, *, background: bool = False) -> Path | None:
++        """Write a kept prompt end (its cache rows and snapshot); None when it is below ``min_tokens``.
++
++        The GPU-to-CPU copy is always synchronous (the caller may shrink the slot right after); ``background`` hands
++        only the disk write to the writer thread, so an eviction mid-decode never waits on the filesystem."""
+ 
+         ids = [int(t) for t in ids]
+         pos = int(snap["pos"])
+         if pos < self.min_tokens:
+             return None
+-        from safetensors.torch import save_file
+-
+         tensors, meta = self._collect(ids, st, snap, pos, tail)
+         self.root.mkdir(parents=True, exist_ok=True)
+         path, sidecar = self._tensors(ids), self._meta(ids)
++        if background:
++            self._enqueue((tensors, meta, path, sidecar))
++        else:
++            self._write(tensors, meta, path, sidecar)
++            self.trim()
++        return path
++
++    def _write(self, tensors: dict, meta: dict, path: Path, sidecar: Path) -> None:
++        """Atomically write one prefix: the tensors first, then the metadata ``lookup`` reads."""
++
++        from safetensors.torch import save_file
++
+         tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+         try:
+             save_file(tensors, str(tmp), metadata={"format": "tensorfold-spill"})
+@@ -98,8 +116,35 @@ class SpillStore:
+             os.replace(meta_tmp, sidecar)
+         finally:
+             tmp.unlink(missing_ok=True)
+-        self.trim()
+-        return path
++
++    def _enqueue(self, item) -> None:
++        with self._lock:
++            if self._queue is None:
++                self._queue = queue.Queue()
++                self._worker = threading.Thread(target=self._drain, name="spill-writer", daemon=True)
++                self._worker.start()
++            self._queue.put(item)
++
++    def _drain(self) -> None:
++        while True:
++            item = self._queue.get()
++            try:
++                if item is None:
++                    return
++                self._write(*item)
++                self.trim()
++            except Exception:
++                pass                       # a spill failure must never take a decode round down
++            finally:
++                self._queue.task_done()
++
++    def flush(self) -> None:
++        """Wait for the writer thread's pending writes (a clean shutdown; the tests' synchronous writes)."""
++
++        with self._lock:
++            q = self._queue
++        if q is not None:
++            q.join()
+ 
+     def _collect(self, ids, st, snap: dict, pos: int, tail) -> tuple[dict, dict]:
+         """The CPU tensors and metadata of one kept point: the snapshot's state, the cache rows ``[0:pos]``, the
+diff --git a/tests/cuda/test_flashnext_spill.py b/tests/cuda/test_flashnext_spill.py
+index 3c13e8e..26b628e 100644
+--- a/tests/cuda/test_flashnext_spill.py
++++ b/tests/cuda/test_flashnext_spill.py
+@@ -75,3 +75,25 @@ def test_a_spilled_prefix_resumes_token_for_token(w, kv_dtype, tmp_path):
+ def test_off_when_small_or_disabled(tmp_path):
+     store = SpillStore(tmp_path, min_tokens=100)
+     assert store.lookup([1, 2, 3]) is None
++
++
++def test_eviction_spills_and_a_cold_decoder_resumes(w, tmp_path):
++    store = SpillStore(tmp_path, min_tokens=1)
++    points = snapshot_points((OPEN,), (OPEN, ASSISTANT))
++    g = torch.Generator().manual_seed(11)
++    base = torch.randint(1, V - 2, (300,), generator=g).tolist()
++    prompt = [OPEN] + base + [OPEN] + [OPEN, ASSISTANT]
++    other = [OPEN] + base + [OPEN] + torch.randint(1, V - 2, (8,), generator=g).tolist() + [OPEN, ASSISTANT]
++
++    dec = MultiDecoder(w, slots=3, capacity=1024, depth=3, confidence=0.3, kv_dtype="bf16", points=points,
++                       spill=store, keep=1)
++    _run(dec, prompt, 4)
++    _run(dec, other, 4)                       # keep=1: the first kept prefix is evicted and spilled here
++    store.flush()
++    assert store.bytes_on_disk() > 0
++
++    cold = MultiDecoder(w, slots=3, capacity=1024, depth=3, confidence=0.3, kv_dtype="bf16", points=points,
++                        spill=store)
++    s = Stream(list(prompt), 4, SAMPLING, stop_eos=False)
++    cold.admit(s)
++    assert s.cached > 0, "the cold decoder did not resume the spilled prefix"
+-- 
+2.43.0
+
+
+From 6bcb40806695602418f5659f59e00f019e96439d Mon Sep 17 00:00:00 2001
+From: Yuepixel <yuepixel@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 19:41:04 +0800
+Subject: [PATCH 3/3] serve: keep prefix spill on by default (TF_SPILL_GIB=8,
+ TF_SPILL_MIN_TOKENS=2048)
+
+---
+ run_serve.sh | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/run_serve.sh b/run_serve.sh
+index ef8ff73..b2d495d 100644
+--- a/run_serve.sh
++++ b/run_serve.sh
+@@ -5,12 +5,11 @@ set -e
+ # elsewhere, byte-exact vs serial either way. Set TF_EXL3_LOOKUP="" to revert to MTP-only (A6), or to
+ # another lN[:M] / "auto" (auto is experimental; its gate cost model is not yet calibrated).
+ export TF_EXL3_LOOKUP="${TF_EXL3_LOOKUP-l7:2}"
+-# P14 native vision: the Lygodactylus 4bpw package stores the visual tower unquantized (16-bit) INLINE
+-# in the model snapshot (model.visual.* in the index -> shard9), so no external FP16 sidecar is needed.
+-# Leaving TENSORFOLD_VISION_WEIGHTS empty makes qwen_cuda.py read the tower from the model dir.
+-# To fall back to the old external FP16 sidecar, export TENSORFOLD_VISION_WEIGHTS=/models/vision-f16-Qwen3.8-Flash-Next-exl3-3.05bpw.safetensors
++# P19 (2026-10-10) native vision: the turboderp 3.05bpw package stores the visual tower quantized
++# INLINE (model.visual.* in the index), so the CUDA vision path needs the external FP16 sidecar set
++# below. Point TENSORFOLD_VISION_WEIGHTS at the sidecar and qwen_cuda.py loads the tower from it.
+ # Set TF_EXL3_VISION=0 to serve text-only (one-line revert).
+-export TENSORFOLD_VISION_WEIGHTS="${TENSORFOLD_VISION_WEIGHTS-}"
++export TENSORFOLD_VISION_WEIGHTS="${TENSORFOLD_VISION_WEIGHTS-/models/vision-f16-Qwen3.8-Flash-Next-exl3-3.05bpw.safetensors}"
+ # P13 (2026-10-08) multi-image knobs, raised for 12 full-quality images:
+ #  - max-images: the request gate (it counts images across the FULL history at parse time; pure
+ #    check, no memory cost). 4 -> 12 so a 12-image request is accepted without dilution.
+@@ -50,4 +49,7 @@ VISION_ARG=""
+ if [ "${TF_EXL3_VISION:-1}" != "0" ]; then
+   VISION_ARG="--vision --vision-max-images ${TENSORFOLD_VISION_MAX_IMAGES} --vision-image-tokens ${TENSORFOLD_VISION_IMAGE_TOKENS}"
+ fi
++export TF_SPILL_GIB=${TF_SPILL_GIB-8}
++export TF_SPILL_DIR=${TF_SPILL_DIR-/models/prefix-spill}
++export TF_SPILL_MIN_TOKENS=${TF_SPILL_MIN_TOKENS-2048}
+ exec /usr/local/bin/tensorfold serve /models/Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5 --host 127.0.0.1 --port 8080 --parallel 2 --max-tokens ${TENSORFOLD_MAX_TOKENS} $MTP_ARG $CONF_ARG $VISION_ARG > /tmp/serve.log 2>&1
+-- 
+2.43.0
+

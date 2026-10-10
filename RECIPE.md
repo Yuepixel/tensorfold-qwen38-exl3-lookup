@@ -4,7 +4,7 @@
 > link to this file and asked you to "install it", follow the steps below end to end,
 > report what you ran, and stop and ask if a step cannot be completed.
 
-Goal: build **TensorFold `v0.6.5` + 14 patches** and serve **Qwen3.8-Flash-Next
+Goal: build **TensorFold `v0.6.5` + 15 patches** and serve **Qwen3.8-Flash-Next
 (EXL3 3.05 bpw)** on a single **DGX Spark (GB10)**, giving **~2.4× EXL3 prefill**
 (≈1700 t/s vs ~700), the **prompt-lookup drafter** on top, plus **native image/video**
 input and an **image-history prefix cache** for multi-turn image chats, with byte-exact
@@ -46,7 +46,7 @@ git -C TensorFold am /path/to/tensorfold-qwen38-exl3-lookup/patches/*.patch
 # fallback if `am` complains: for p in .../patches/*.patch; do git -C TensorFold apply "$p"; done
 ```
 
-Fourteen patches, in order: `0001`–`0004` are the EXL3 prompt-GEMM work (the prefill
+Fifteen patches, in order: `0001`–`0004` are the EXL3 prompt-GEMM work (the prefill
 lift), `0005`/`0006` add the prompt-lookup drafter, `0007` adds the width-gated
 two-chunk ring (another +13–15 % prefill; port of PR #283). `0008`–`0011` add native
 **image + video + multi-image** input (the vision tower rides a FP16 sidecar next to the
@@ -54,7 +54,8 @@ pack — port of PR #229), and `0012` adds the **image-history prefix cache** (c
 of PR #263, fixes #414); `0013` (ours, not a port) keeps the solo graph slot hot on a
 cold prefix miss, removing the cold lone-stream decode graph-recapture penalty; `0014`
 (port of `grearjake-star`'s `sys-checkpoint` branch) keeps a system-block checkpoint so
-long shared prefixes stop re-prefilling. No conflicts expected.
+long shared prefixes stop re-prefilling; `0015` (ours) spills a kept prefix to disk so it
+survives a server restart (`--parallel`; off by default, see §5). No conflicts expected.
 
 ## 3. Build the CUDA extension
 
@@ -111,6 +112,11 @@ Notes:
   reaches the lookup arm; with `--parallel` a *single* in-flight request is served
   MTP-only (see README §2).
 - The EXL3 pack rejects `--tp 2`; this recipe is single-GPU.
+- **Disk prefix spill (`0015`, off by default).** To keep a kept prefix across a server
+  restart, export a byte cap and a threshold before serving, e.g.
+  `TF_SPILL_GIB=8 TF_SPILL_MIN_TOKENS=2048` (dir: `TF_SPILL_DIR`, default
+  `~/.cache/tensorfold/prefix-spill`). It only affects a *cold restart* (the hot path is
+  unchanged); see README §5.8 and `receipts/P21-prefix-spill-notes.md`.
 
 ## 6. Acceptance (do not skip)
 
@@ -127,6 +133,12 @@ python3 tools/prefill_cold.py run  http://127.0.0.1:8080 Qwen3.8-Flash-Next-exl3
 python3 receipts/collect.py probe
 python3 receipts/collect.py single lookup-l7-2
 python3 receipts/collect.py single mtponly
+
+# (c) optional — disk prefix spill (0015): off by default; start the server with
+#     TF_SPILL_GIB=8 TF_SPILL_MIN_TOKENS=2048, then:
+python3 receipts/p21_spill_ab.py warm receipts/P21-ab-warm-20261010.json
+# restart the process (keep the spill dir), then:
+python3 receipts/p21_spill_ab.py cold receipts/P21-ab-cold-20261010.json
 ```
 
 **Pass criteria**
@@ -136,6 +148,7 @@ python3 receipts/collect.py single mtponly
 | Cold prefill (2048/8192/16384/32768/65536) | ≈ 1696 / 1771 / 1777 / 1758 / 1706 t/s (~2.4× the ~670–800 baseline) |
 | `token_sha` (7 fixtures) | identical to README §4.1: `f4cf4bac607d`, `2deda2799112`, `aef89122efe1`, `35ac773b2d02`, `98f603d270f7`, `fb7342c804b3`, `d4e923c62b39` |
 | `serial == MTP-only == lookup` | same hash for every fixture |
+| (optional) spill cold resume | cold `cached_tokens > 0`, same `token_sha` as warm |
 
 If prefill lands near ~700 rather than ~1500, patches `0001`–`0004` did not build —
 rerun §3 and confirm `pytest tests/cuda/test_exl3_prompt_experts.py` passes.

@@ -1,4 +1,4 @@
-Update — vision, video, multi-image, and an image-history prefix cache: the last of the stack.
+Update — vision, video, multi-image, an image-history prefix cache, and a disk prefix spill.
 
 Since the `0001`–`0007` update, the same EXL3/CUDA build also does native **image + video** input and, the one that matters for multi-turn, stops **image chats from re-prefilling every turn**. New patches are `0008`–`0012` in this repo (github.com/Yuepixel/tensorfold-qwen38-exl3-lookup), all `git am`-able on top of `0007` (`v0.6.5` + the seven you already have). Full numbers: `README.md` §5.4–5.5. The repo is now an unofficial, license-compliant fork — upstream `NOTICE` / `THIRD_PARTY_NOTICES.md` / Apache-2.0 ship alongside (§4 kept), no endorsement implied.
 
@@ -39,6 +39,10 @@ hot graph slot. Cold decode goes **21–44 → 33–123 t/s** (chat/code/edit/co
 recapture rounds **191/888 → 0**, TTFT/prefill unchanged, and serial-vs-parallel cold
 output stays byte-exact. Numbers: `README.md` §5.6; patch `0013`; receipt
 `receipt_f6b_lookup-l7-2.json`.
+
+### 5. Disk prefix spill (`0015`) — kept prefixes survive a restart
+
+`0015` (ours) writes an evicted kept prefix to disk and resumes the **longest** stored prefix on a later miss, so a **cold restart** stops re-prefilling repeated prompts. It is *not* a hot-path speedup — the kept prefix already lives in VRAM; the value is surviving a restart. Honest scope: **off by default** (`TF_SPILL_GIB`), `--parallel` only, text only. A/B (one GB10, `temperature 0`): a re-sent ~6k prefix after a cold restart came back `cached_tokens` **0 → 4096** with an **identical `token_sha`** (wall 3.43 → 2.12 s); under a 10-session stress, **4/10** prefixes resumed from disk after a cold restart, with no regression on the misses. Numbers: `README.md` §5.8; notes `receipts/P21-prefix-spill-notes.md`.
 
 ### Still to polish
 
