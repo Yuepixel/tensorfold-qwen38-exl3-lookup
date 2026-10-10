@@ -431,6 +431,8 @@ Micro A/B (single session, shared prefix): `cached_tokens` **0 → 8192**, prefi
 41.61 s r2 → 10.18 s (4.1×) / 3.22 s (12.9×)**. `token_sha` and `token_ids` are
 **identical** off vs on — the reply is a fresh prefill's, token for token.
 
+Receipts: `receipts/P20-bench-result-20261010.json` (A/B), `receipts/P20-tok-consistency-{on,off}.json` (token identity), the profiler trace `receipts/P20-profile-20261010.txt`, and notes in `receipts/P20-sys-checkpoint-notes.md`.
+
 Known limitation: the checkpoint shares the same kept-state count, so under bounded
 eviction it can be evicted before use — an intermittent cold miss (~1/6 serial, ~2–3/6
 concurrent). Enlarging the keep (`TENSORFOLD_KEEP` 8/16/64) measured **no** change; a
