@@ -1,7 +1,6 @@
 # Qwen3.8-Flash-Next on TensorFold v0.6.5 — EXL3 3.05 bpw + prompt-lookup (CUDA)
 
-[![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![upstream patches: Apache-2.0](https://img.shields.io/badge/upstream%20patches-Apache--2.0-blue)](LICENSES/Apache-2.0.txt)
+[![license: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![TensorFold](https://img.shields.io/badge/TensorFold-0.6.5-orange)](https://github.com/ashhart/TensorFold)
 [![GPU](https://img.shields.io/badge/NVIDIA-DGX%20Spark%20(GB10)-76B900)](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
 [![patches](https://img.shields.io/badge/patches-13-informational)](patches)
@@ -459,14 +458,17 @@ Each command writes `receipt_<cmd>_<label>.json` next to itself.
 This is an **independent, unofficial distribution** of patches against TensorFold
 `v0.6.5`; it is not affiliated with or endorsed by the TensorFold project.
 
-- **This project's own material** — the tools, receipt scripts, and documentation —
-  is released under the [MIT License](LICENSE) (Copyright 2026 Yuepixel).
-- **Patch/tool/receipt contents that port or cherry-pick upstream TensorFold work**
-  (`0001`–`0004`, `0007`, `0008`, `0012`) remain under the **upstream TensorFold
-  license (Apache-2.0)**; `0013` is our own and MIT like the rest.
+The repository as a whole — the patches, tools, receipt scripts, and documentation
+— is distributed under the **Apache License, Version 2.0** ([`LICENSE`](LICENSE),
+Copyright 2026 Yuepixel).
+
 - Upstream TensorFold's Apache-2.0 license text is reproduced in
-  [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt); its attribution notices are
-  reproduced in [`NOTICE`](NOTICE) and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+  [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt); its `NOTICE` and the
+  third-party attribution notices it carries are reproduced in [`NOTICE`](NOTICE)
+  and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+- Code written before TensorFold 0.6.0 keeps its MIT notice in
+  [`LICENSES/MIT.txt`](LICENSES/MIT.txt); third-party MIT components are listed in
+  [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 - Receipts are data; reuse freely.
 
 ---

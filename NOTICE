@@ -19,8 +19,7 @@ and documentation. TensorFold's Apache-2.0 license text is reproduced in
 LICENSES/Apache-2.0.txt; the third-party attribution notices TensorFold carries
 are reproduced in THIRD_PARTY_NOTICES.md.
 
-This project's own material (tools, receipt scripts, and documentation) is
-released under the MIT License (LICENSE, Copyright 2026 Yuepixel). The patch
-contents that port or cherry-pick upstream TensorFold work remain under the
-upstream TensorFold license. This product includes software developed by the
-TensorFold project and its contributors.
+Copyright 2026 Yuepixel. This repository is distributed under the Apache License,
+Version 2.0 (LICENSE); its patches modify TensorFold v0.6.5 and retain the
+upstream attribution reproduced above. This product includes software developed
+by the TensorFold project and its contributors.
