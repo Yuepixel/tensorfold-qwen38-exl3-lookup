@@ -1434,7 +1434,7 @@ index 0000000..b4d4ba5
 +from tensorfold.gguf.tokenizer import _as_list, build_tokenizer_config, build_tokenizer_json, ensure_sidecar
 +
 +# A small converted Qwen3.5 GGUF checked into local model storage; skipped when absent.
-+SAMPLE = Path(r"E:\Models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf")
++SAMPLE = Path(r"/models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf")
 +
 +pytestmark = pytest.mark.skipif(not SAMPLE.is_file(), reason="sample GGUF not present")
 +
