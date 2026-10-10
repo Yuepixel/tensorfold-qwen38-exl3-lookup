@@ -126,3 +126,10 @@ The prompt-lookup design in `patches/0005-*` and `patches/0006-*` is ported from
 The EXL3 prompt-GEMM work (`0001`–`0004`, `0007`) and the packs it runs on follow
 [ExLlamaV3](https://github.com/turboderp-org/exllamav3)'s EXL3 format and codebooks
 (MIT License, Copyright © 2025 Turboderp), as described in the upstream notices above.
+
+### System-block checkpoint (`0014`)
+
+`patches/0014-*` ports the `sys-checkpoint` branch of a TensorFold fork by
+[`grearjake-star`](https://github.com/grearjake-star) (commit
+`b4a9993450f636b314485a07969600cc2be831a4`). Attribution to that author; the same
+upstream TensorFold license applies.

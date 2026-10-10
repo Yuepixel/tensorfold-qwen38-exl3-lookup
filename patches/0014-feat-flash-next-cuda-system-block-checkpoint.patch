@@ -1,0 +1,290 @@
+From b4a9993450f636b314485a07969600cc2be831a4 Mon Sep 17 00:00:00 2001
+From: grearjake-star <228037169+grearjake-star@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 18:27:05 -0400
+Subject: [PATCH] feat(flash next cuda): keep a state at the last 2048-row
+ boundary before a system block's end
+
+A system block that changes only near its end (a date line, a memory section) prefilled whole again,
+because the shared block's state is kept only at the second message's start. Flash Next now keeps
+one more state there: the last multiple of TF_SYS_CHECKPOINT rows (default 2048, a prompt pass; 0
+off) at least MIN_GAP before that start, so a 13.1K block resumes at 12288. It is one more stop of
+snapshot_points, so it is kept, forked and evicted like the message-start state, within the same
+kept-state count. Other families pass no granule and keep their points as before.
+
+A resume restores a kept prefix, so the reply is a fresh prefill's, token for token.
+---
+ src/tensorfold/cuda/markers.py                | 40 ++++++++-
+ .../families/qwen4_exp/cuda/engine.py         |  5 +-
+ tests/cuda/test_flashnext_sys_checkpoint.py   | 67 +++++++++++++++
+ tests/test_cuda_sys_checkpoint.py             | 84 +++++++++++++++++++
+ 4 files changed, 190 insertions(+), 6 deletions(-)
+ create mode 100644 tests/cuda/test_flashnext_sys_checkpoint.py
+ create mode 100644 tests/test_cuda_sys_checkpoint.py
+
+diff --git a/src/tensorfold/cuda/markers.py b/src/tensorfold/cuda/markers.py
+index 645ab6182..3e0d75f69 100644
+--- a/src/tensorfold/cuda/markers.py
++++ b/src/tensorfold/cuda/markers.py
+@@ -2,12 +2,27 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from pathlib import Path
+ from typing import Any, Callable, Sequence
+ 
+ import numpy as np
+ 
+ MIN_GAP = 256            # a snapshot this close to the prompt start or to the previous snapshot saves too little
++CHECKPOINT = "TF_SYS_CHECKPOINT"
++
++
++def checkpoint_rows() -> int:
++    """TF_SYS_CHECKPOINT: the system-block checkpoint's granule in rows (default 2048, a prompt pass); 0: none."""
++
++    raw = os.environ.get(CHECKPOINT, "").strip()
++    try:
++        rows = int(raw) if raw else 2048
++    except ValueError:
++        raise ValueError(f"{CHECKPOINT}: rows (0: off), not {raw!r}") from None
++    if rows < 0 or 0 < rows < MIN_GAP:
++        raise ValueError(f"{CHECKPOINT}: 0 (off) or at least {MIN_GAP} rows, not {rows}")
++    return rows
+ 
+ 
+ class TemplateTokens:
+@@ -25,28 +40,45 @@ def apply_chat_template(self, messages: list[dict[str, Any]], tokenize: bool = T
+         return self.tok.encode(text, add_special_tokens=False).ids if tokenize else text
+ 
+ 
+-def snapshot_points(openers: Sequence[int], assistant: Sequence[int]) -> Callable[[Sequence[int]], list[int]]:
+-    """Where a prefill keeps states: the second message's start (a shared system block) and the last assistant start."""
++def snapshot_points(openers: Sequence[int], assistant: Sequence[int],
++                    checkpoint: int = 0) -> Callable[[Sequence[int]], list[int]]:
++    """Where a prefill keeps states: the second message's start (a shared system block) and the last assistant start.
++    ``checkpoint`` rows (0: none): also the system-block checkpoint, which ``points.checkpoint`` returns."""
+ 
+     from tensorfold.engine.prefill_plan import PrefillPlan
+ 
+     plan = PrefillPlan(openers=openers, assistant=assistant, min_chunk=max(MIN_GAP, len(assistant)))
+ 
++    def at_checkpoint(ids: Sequence[int]) -> int | None:
++        """The last multiple of ``checkpoint`` at least MIN_GAP before the second message's start, so a system block
++        that differs only near its end (a date line, a memory section) resumes there; None when there is none."""
++
++        if not checkpoint or not plan.openers:
++            return None
++        starts = np.flatnonzero(np.isin(np.asarray(ids, dtype=np.int64), plan.openers))
++        if len(starts) < 2:
++            return None
++        at = (int(starts[1]) - MIN_GAP) // checkpoint * checkpoint
++        return at if at >= checkpoint else None
++
+     def points(ids: Sequence[int]) -> list[int]:
+         arr = np.asarray(ids, dtype=np.int64)
+         found = plan.points(arr)
+         starts = np.flatnonzero(np.isin(arr, plan.openers)) if plan.openers else []
+         wanted = ([int(starts[1])] if len(starts) > 1 else []) + ([found[-1]] if found else [])
++        cp = at_checkpoint(ids)
++        wanted += [cp] if cp is not None else []
+         out: list[int] = []
+         for p in sorted(set(wanted)):
+             if MIN_GAP <= p < len(arr) and (not out or p - out[-1] >= MIN_GAP):
+                 out.append(p)
+         return out
+ 
++    points.checkpoint = at_checkpoint
+     return points
+ 
+ 
+-def resume_points(model_dir: str | Path) -> Callable[[Sequence[int]], list[int]] | None:
++def resume_points(model_dir: str | Path, checkpoint: int = 0) -> Callable[[Sequence[int]], list[int]] | None:
+     """``snapshot_points`` for this checkpoint's chat template, or None when it marks no message starts."""
+ 
+     from tokenizers import Tokenizer
+@@ -63,4 +95,4 @@ def resume_points(model_dir: str | Path) -> Callable[[Sequence[int]], list[int]]
+         openers, assistant = message_markers(tokens)
+     except (OSError, ValueError, KeyError):
+         return None
+-    return snapshot_points(openers, assistant) if openers or assistant else None
++    return snapshot_points(openers, assistant, checkpoint) if openers or assistant else None
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/engine.py b/src/tensorfold/families/qwen4_exp/cuda/engine.py
+index 002ff1fb6..e5bf767b9 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/engine.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/engine.py
+@@ -162,9 +162,10 @@ def __init__(self, model_dir: Path, *, depth: int = DEPTH, confidence: float = C
+             raise ValueError("this checkpoint has no MTP head, which Flash Next's CUDA engine drafts with: use one "
+                              "that has it, or --no-drafts for the serial reference (one token a round)")
+         self.w = w
+-        from tensorfold.cuda.markers import resume_points
++        from tensorfold.cuda.markers import checkpoint_rows, resume_points
+ 
+-        self.points = resume_points(model_dir)          # a prompt's message starts to keep states at, or None
++        # a prompt's message starts (and its system-block checkpoint) to keep states at, or None
++        self.points = resume_points(model_dir, checkpoint_rows())
+         if vision:
+             from tensorfold.vision.qwen_cuda import QwenCudaVision
+ 
+diff --git a/tests/cuda/test_flashnext_sys_checkpoint.py b/tests/cuda/test_flashnext_sys_checkpoint.py
+new file mode 100644
+index 000000000..0e1986e60
+--- /dev/null
++++ b/tests/cuda/test_flashnext_sys_checkpoint.py
+@@ -0,0 +1,67 @@
++"""System-block checkpoints on the GPU: a prompt whose system block differs from a kept one only after the checkpoint
++resumes there, and its reply is token-for-token a fresh prefill's (greedy and sampled, bf16 and int8 caches)."""
++
++import pytest
++import torch
++
++if not torch.cuda.is_available():
++    pytest.skip("CUDA only", allow_module_level=True)
++
++from test_flashnext_forward import V, _model  # noqa: E402
++
++from tensorfold.cuda.markers import snapshot_points  # noqa: E402
++from tensorfold.cuda.streams import Stream  # noqa: E402
++from tensorfold.engine.exact_sampling import Sampling  # noqa: E402
++from tensorfold.families.qwen4_exp.cuda.decode import Engine, prefill, serial_decode  # noqa: E402
++from tensorfold.families.qwen4_exp.cuda.multi import MultiDecoder  # noqa: E402
++
++OPEN, ASSISTANT = V - 2, V - 1
++
++
++def _chat(block, user):
++    return [OPEN] + block + [OPEN] + user + [OPEN, ASSISTANT]
++
++
++@pytest.fixture(scope="module")
++def w():
++    return _model()
++
++
++@pytest.mark.parametrize("kv_dtype", ["bf16", "int8"])
++@pytest.mark.parametrize("sampling", [None, Sampling(seed=31, top_k=20, top_p=0.95)])
++def test_a_block_with_a_new_tail_resumes_from_the_checkpoint_with_a_fresh_prefills_reply(w, sampling, kv_dtype):
++    g = torch.Generator().manual_seed(5)
++    fixed = torch.randint(1, V - 2, (800,), generator=g).tolist()
++    tail_a = torch.randint(1, V - 2, (60,), generator=g).tolist()
++    tail_b = torch.randint(1, V - 2, (75,), generator=g).tolist()            # a different "date line"
++    user = torch.randint(1, V - 2, (20,), generator=g).tolist()
++    a, b = _chat(fixed + tail_a, user), _chat(fixed + tail_b, user[:12])
++    points = snapshot_points((OPEN,), (OPEN, ASSISTANT), checkpoint=256)
++    cp = points.checkpoint(a)
++    assert cp == points.checkpoint(b) == 512 and a[:cp] == b[:cp]
++
++    def fresh(prompt, count):
++        e = Engine(w, capacity=1024, max_rows=8, prefill_rows=16, kv_dtype=kv_dtype)
++        return serial_decode(e, prefill(e, prompt, sampling), count, sampling, stop_eos=False).tokens
++
++    def run(dec, prompt, count):
++        s = Stream(list(prompt), count, sampling, stop_eos=False)
++        dec.admit(s)
++        while dec.live():
++            dec.finish(dec.round())
++        return s
++
++    dec = MultiDecoder(w, slots=3, capacity=1024, depth=3, confidence=0.3, kv_dtype=kv_dtype, points=points)
++    first = run(dec, a, 10)
++    assert first.cached == 0 and first.out == fresh(a, 10)
++    assert any(len(k[0]) == cp for k in dec.kept)
++    second = run(dec, b, 10)
++    assert second.cached == cp and second.out == fresh(b, 10)
++    again = run(dec, a, 10)                                    # the first block still resumes at its own end or later
++    assert again.cached >= len(fixed + tail_a) + 1 and again.out == first.out
++
++    off = MultiDecoder(w, slots=3, capacity=1024, depth=3, confidence=0.3, kv_dtype=kv_dtype,
++                       points=snapshot_points((OPEN,), (OPEN, ASSISTANT)))    # no granule: the same replies
++    assert run(off, a, 10).out == first.out and not any(len(k[0]) == cp for k in off.kept)
++    b_off = run(off, b, 10)
++    assert b_off.cached < cp and b_off.out == second.out
+diff --git a/tests/test_cuda_sys_checkpoint.py b/tests/test_cuda_sys_checkpoint.py
+new file mode 100644
+index 000000000..e7a8a88b1
+--- /dev/null
++++ b/tests/test_cuda_sys_checkpoint.py
+@@ -0,0 +1,84 @@
++"""System-block checkpoints (TF_SYS_CHECKPOINT): a kept state at the last prompt-pass boundary before a system
++block's end, so a block that differs only near its end (a date line, a memory section) resumes there."""
++
++import pytest
++
++from tensorfold.cuda import markers
++from tensorfold.cuda.markers import MIN_GAP, snapshot_points
++from tensorfold.families.qwen4_exp.cuda import prefixes
++
++OPEN, ASSISTANT = 900, 901
++
++
++def _prompt(system: int, user: int, tail: int = 0, tail_token: int = 9) -> list[int]:
++    return [OPEN] + [5] * system + [tail_token] * tail + [OPEN] + [6] * user + [OPEN, ASSISTANT, 8]
++
++
++def test_the_checkpoint_is_the_last_granule_at_least_min_gap_before_the_block_end():
++    points = snapshot_points((OPEN,), (OPEN, ASSISTANT), checkpoint=2048)
++    ids = _prompt(13123, 600)                        # the second message starts at 13124
++    assert points.checkpoint(ids) == 12288
++    assert points(ids) == [12288, 13124, len(ids) - 3]
++    near = _prompt(12288 + MIN_GAP - 2, 600)         # block end 12288 + 255: too close, the granule before it
++    assert points.checkpoint(near) == 10240
++    assert points.checkpoint(_prompt(2000, 600)) is None         # shorter than a granule + MIN_GAP: none
++    assert points.checkpoint([5] * 30000) is None                # no second message
++    assert snapshot_points((OPEN,), (OPEN, ASSISTANT), checkpoint=4096).checkpoint(ids) == 12288
++
++
++def test_without_a_granule_the_points_are_unchanged():
++    points = snapshot_points((OPEN,), (OPEN, ASSISTANT))
++    ids = _prompt(13123, 600)
++    assert points.checkpoint(ids) is None and points(ids) == [13124, len(ids) - 3]
++
++
++def test_the_granule_comes_from_tf_sys_checkpoint(monkeypatch):
++    monkeypatch.delenv("TF_SYS_CHECKPOINT", raising=False)
++    assert markers.checkpoint_rows() == 2048
++    monkeypatch.setenv("TF_SYS_CHECKPOINT", "0")
++    assert markers.checkpoint_rows() == 0
++    monkeypatch.setenv("TF_SYS_CHECKPOINT", "4096")
++    assert markers.checkpoint_rows() == 4096
++    for bad in ("100", "-1", "lots"):
++        monkeypatch.setenv("TF_SYS_CHECKPOINT", bad)
++        with pytest.raises(ValueError):
++            markers.checkpoint_rows()
++
++
++class Slot:
++    def __init__(self, name):
++        self.name, self.copied = name, None
++
++    def copy_prefix(self, source, pos, mtp_len):
++        self.copied = (source, pos, mtp_len)
++
++
++class Owner:
++    def __init__(self, keep, free=()):
++        self.kept, self.free, self.keep, self.depth = [], list(free), keep, 3
++
++    def _busy(self):
++        return set()
++
++    def _drop_kept(self, st):
++        self.kept = [k for k in self.kept if k[1] is not st]
++
++    def _grow(self, st, rows, **kwargs):
++        return True
++
++    def _shrink(self, st, **kwargs):
++        pass
++
++
++def test_a_block_with_a_new_tail_resumes_from_the_checkpoint_on_a_copy():
++    points = snapshot_points((OPEN,), (OPEN, ASSISTANT), checkpoint=2048)
++    a, b = _prompt(12600, 300, tail=500), _prompt(12600, 300, tail=500, tail_token=7)
++    cp = points.checkpoint(a)
++    assert cp == points.checkpoint(b) == 12288 and a[:cp] == b[:cp] and a[:points(a)[1]] != b[:points(b)[1]]
++    owner, slot, spare = Owner(keep=8), Slot("a"), Slot("spare")
++    for p in points(a):                                  # the kept states a's prefill leaves, as the engine keeps them
++        prefixes.remember(owner, a[:p], slot, {"pos": p, "mtp_len": p - 1}, p)
++    owner.free = [spare]
++    st, resume, cached = prefixes.slot_for(owner, b, True)
++    assert cached == cp and resume["tail"] == cp and st is spare and spare.copied == (slot, cp, cp - 1)
++    assert [len(k[0]) for k in owner.kept] == points(a)  # a's own states stay for a's next turn

@@ -3,11 +3,11 @@
 [![license: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![TensorFold](https://img.shields.io/badge/TensorFold-0.6.5-orange)](https://github.com/ashhart/TensorFold)
 [![GPU](https://img.shields.io/badge/NVIDIA-DGX%20Spark%20(GB10)-76B900)](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
-[![patches](https://img.shields.io/badge/patches-13-informational)](patches)
+[![patches](https://img.shields.io/badge/patches-14-informational)](patches)
 
 An **unofficial fork/branch of [TensorFold](https://github.com/ashhart/TensorFold) `v0.6.5`**:
 an EXL3 3.05 bpw stack plus a **prompt-lookup (suffix) draft arm** for
-**Qwen3.8-Flash-Next** on the CUDA path — 13 patches, the benchmark fixtures, and
+**Qwen3.8-Flash-Next** on the CUDA path — 14 patches, the benchmark fixtures, and
 byte-exact `token_sha` receipts covering the **EXL3 prompt-GEMM prefill work**, the
 **prompt-lookup drafter**, and the **vision / video / image-history prefix-cache**
 additions.
@@ -16,7 +16,7 @@ It began as the reference material for [TensorFold issue #444](https://github.co
 (now closed; that thread links back here) and is kept as an independent, runnable
 branch of the Python/EXL3 line.
 
-- **Engine:** TensorFold `0.6.5` (`v0.6.5` tag) + 13 patches below
+- **Engine:** TensorFold `0.6.5` (`v0.6.5` tag) + 14 patches below
 - **Model:** `Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5` (EXL3 3.05 bpw, group-32, `h5_ng5` pack — the current weights)
 - **Weight packs:** tuned on the 3.05 bpw pack above; the `0013` (F6b) decode receipt was captured while a `Lygodactylus` 4.05 bpw uncensored pack was served (2026-10-08 → 2026-10-10). §5.6 reports both packs side by side.
 - **Hardware:** NVIDIA DGX Spark (GB10), CPU/GPU unified 128 GB
@@ -50,7 +50,8 @@ broadly useful part of this stack and is orthogonal to the drafter — full numb
 [§5](#5-results). Patches `0008`–`0012` add native **vision**, **video + multi-image**,
 and the **image-history prefix cache** for multi-turn image chats — see §5.4–§5.5.
 `0013` — our own fix, not a port — removes the cold-decode graph-recapture penalty on a
-lone stream (§5.6).
+lone stream (§5.6), and `0014` keeps a system-block checkpoint so long shared prefixes
+stop re-prefilling (§5.7).
 
 ### 🤖 Deploy it with one link (for AI agents)
 
@@ -67,7 +68,7 @@ apply, the CUDA build, the weight fetch, the serve command, and the acceptance c
 
 ## 1. Patches
 
-Applied in order on top of `v0.6.5` (tag `p7.1-batch-lookup-v1` = `0001`–`0006`; tag `p8-ring-v1` = `0001`–`0007`; tags `p9-vision-v1` / `p10-vision-v1` = through `0011`; tag `p11-image-prefix-v1` = `0001`–`0012`; `0013` sits on top of that (no tag)):
+Applied in order on top of `v0.6.5` (tag `p7.1-batch-lookup-v1` = `0001`–`0006`; tag `p8-ring-v1` = `0001`–`0007`; tags `p9-vision-v1` / `p10-vision-v1` = through `0011`; tag `p11-image-prefix-v1` = `0001`–`0012`; `0013` and `0014` sit on top of that (no tag)):
 
 | # | Patch | Area |
 |---|-------|------|
@@ -84,13 +85,14 @@ Applied in order on top of `v0.6.5` (tag `p7.1-batch-lookup-v1` = `0001`–`0006
 | 0011 | `run_serve.sh: TENSORFOLD_VISION_MAX_IMAGES / TENSORFOLD_VISION_IMAGE_TOKENS knobs` | vision knobs |
 | 0012 | `fix(flash next cuda): image prompts resume and keep prompt states, matched on the images' pixels` (cherry-pick of #263) | image prefix cache |
 | 0013 | `fix(flash next cuda): keep the solo graph slot hot on a cold prefix miss (F6b)` (ours) | decode / solo graph slot |
+| 0014 | `feat(flash next cuda): keep a state at the last 2048-row boundary before a system block's end` (port of `grearjake-star`'s `sys-checkpoint` @ `b4a9993`) | long-context prefix reuse |
 
 ```sh
 git checkout v0.6.5
 git am patches/*.patch        # or: git apply patches/*.patch
 ```
 
-Combined diffstat (`v0.6.5..p11-image-prefix`): **53 files, +2625 / −104**. `0013` adds one file, +8 / −6 (`multi_solo.py`).
+Combined diffstat (`v0.6.5..p11-image-prefix`): **53 files, +2625 / −104**. `0013` adds one file, +8 / −6 (`multi_solo.py`); `0014` touches 4 files, +190 / −6 (`markers.py`, `engine.py`, two tests).
 (`0001`–`0007` alone are 34 files, +2019 / −40.) A squashed view of the first seven is in
 `receipts/all-changes.diff`.
 
@@ -414,6 +416,26 @@ unchanged (the fix only touches decode rounds); warm-state decode also improves 
 94.8 → 103.0, `edit` 103.9 → 121.5, `continue` 107.6 → 126.1). Full receipt:
 `receipt_f6b_lookup-l7-2.json` (both packs).
 
+### 5.7 System-block checkpoint — long shared prefixes stop re-prefilling (`0014`)
+
+A system block that only changes near its end (a date line, a memory section) used to be
+prefilled whole again, because the shared block's state was kept only at the second
+message's start. `0014` (a port of `grearjake-star`'s `sys-checkpoint` branch, upstream
+commit `b4a9993`) keeps **one more state** at the last multiple of `TF_SYS_CHECKPOINT`
+rows (default `2048`, a prompt pass; `0` off) at least `MIN_GAP` before that start, so a
+13.1K block resumes at `12288`. It is one more stop of `snapshot_points`, kept/forked/
+evicted within the same kept-state count. Pure Python — no CUDA recompile.
+
+Micro A/B (single session, shared prefix): `cached_tokens` **0 → 8192**, prefill
+**4.57 s → 0.38 s** (~12×). Six-session shared prefix: round-1 / total **41.56 s r1,
+41.61 s r2 → 10.18 s (4.1×) / 3.22 s (12.9×)**. `token_sha` and `token_ids` are
+**identical** off vs on — the reply is a fresh prefill's, token for token.
+
+Known limitation: the checkpoint shares the same kept-state count, so under bounded
+eviction it can be evicted before use — an intermittent cold miss (~1/6 serial, ~2–3/6
+concurrent). Enlarging the keep (`TENSORFOLD_KEEP` 8/16/64) measured **no** change; a
+GLM-style disk spill is the proposed next step.
+
 ---
 
 ## 6. Reproducing
@@ -448,6 +470,8 @@ Each command writes `receipt_<cmd>_<label>.json` next to itself.
   open issue [#414](https://github.com/ashhart/TensorFold/issues/414).
 - `0013` (F6b, the solo-graph-slot cold-miss fix) is this project's own work — not a port
   or cherry-pick.
+- The system-block checkpoint (`0014`) ports `grearjake-star`'s TensorFold branch
+  `sys-checkpoint` (commit `b4a9993450f636b314485a07969600cc2be831a4`).
 - Built on **TensorFold** by ashhart and contributors; EXL3 kernel work follows
   the existing Flash-Next CUDA/EXL3 path.
 - Hardware/quant recipe: Qwen3.8-Flash-Next EXL3 3.05 bpw `h5_ng5` on a single
