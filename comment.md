@@ -46,7 +46,7 @@ output stays byte-exact. Numbers: `README.md` §5.6; patch `0013`; receipt
 
 ### 6. Off-theme additions (`0016`–`0017`)
 
-Two further patches ship in this repo, unrelated to the Qwen3.8-Flash-Next EXL3 stack above: `0016` (ours) adds a **compressed-tensors NVFP4** read path for `Qwen3.6-35B-A3B` routed experts (MoE) on the CUDA backend, and `0017` (ours) adds a generic **GGUF reader** with on-the-fly CUDA dequant — a dense `qwen3_5` path plus grouped `qwen3_5_moe` expert kernels. Both are additive; neither changes the EXL3 path or any number in this post.
+Two further patches ship in this repo, unrelated to the Qwen3.8-Flash-Next EXL3 stack above: `0016` (ours) adds a **compressed-tensors NVFP4** read path for `Qwen3.6-35B-A3B` routed experts (MoE) on the CUDA backend, and `0017` (ours) adds a generic **GGUF reader** with on-the-fly CUDA dequant — a dense `qwen3_5` path plus grouped `qwen3_5_moe` expert kernels. Both are additive; neither changes the EXL3 path or any number in this post. Both are **experimental — read + run only, no performance work, not benchmarked.**
 
 ### Still to polish
 

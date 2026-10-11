@@ -68,7 +68,9 @@ long shared prefixes stop re-prefilling; `0015` (ours) spills a kept prefix to d
 survives a server restart (`--parallel`; off by default, see §5). `0016` (ours) adds a
 **Qwen3.6-35B-A3B NVFP4 (compressed-tensors)** MoE read path and `0017` (ours) adds a
 generic **GGUF reader with CUDA on-the-fly dequant** (dense `qwen3_5` + grouped MoE
-experts `qwen3_5_moe`) — both are off-theme additions to this EXL3 fork. `0018` (ours)
+experts `qwen3_5_moe`) — both are off-theme additions to this EXL3 fork, and both are
+**experimental: read + run only (no perf work, not benchmarked)**; skip them unless you
+want those two model families on the CUDA path. `0018` (ours)
 then stages the disk spill's eviction copies through pinned host buffers and re-pools on
 restore, bounding the eviction cost. No conflicts expected.
 

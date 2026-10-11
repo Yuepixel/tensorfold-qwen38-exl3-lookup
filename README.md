@@ -23,9 +23,9 @@ Cold `temperature 0`, one GB10, oldest/worst first:
 | + `0012` | image-history prefix cache (#263) | turn-2 `cached_tokens` **0 → 2514**; 1.53 s → 0.24 s |
 | + `0013` | cold solo graph slot (ours) | recapture rounds **191/888 → 0**; cold decode **21 → 123 t/s** |
 | + `0014` | system-block checkpoint (sys-checkpoint) | shared-prefix prefill **4.57 s → 0.38 s**; 6-session **41.6 s → 3.22 s (12.9×)** |
-| + `0015` | disk prefix spill (ours) | kept prefixes survive a restart: cold-resume `cached_tokens` **0 → 4096**; **4/10** resume after a cold restart |
-| + `0016` (off-theme) | Qwen3.6-35B-A3B NVFP4 routed experts (compressed-tensors) | MoE NVFP4 read path; 35B-A3B served on CUDA |
-| + `0017` (off-theme) | GGUF reader + CUDA on-the-fly dequant (dense + grouped MoE experts) | Qwen3.5 dense + Qwen3.6-35B-A3B GGUF served on CUDA |
+| + `0015` | disk prefix spill (ours) | kept prefixes survive a restart: cold-resume `cached_tokens` **0 → 4096**; **4/10** resume after a cold restart — *opt-in (`TF_SPILL_GIB`, default off); a cold-restart feature, not a hot-path speedup* |
+| + `0016` (off-theme, experimental) | Qwen3.6-35B-A3B NVFP4 routed experts (compressed-tensors) | MoE NVFP4 read path; 35B-A3B served on CUDA — **read+run only, no perf work** |
+| + `0017` (off-theme, experimental) | GGUF reader + CUDA on-the-fly dequant (dense + grouped MoE experts) | Qwen3.5 dense + Qwen3.6-35B-A3B GGUF served on CUDA — **read+run only, no perf work** |
 | + `0018` | disk-spill eviction fix (ours) | per-eviction `gap` **7–16 s → ≤1 s**; payload **−2.5 %** |
 
 `token_sha` identical at every stage — serial = MTP-only = lookup = auto, single & parallel. Full numbers: [§5](#5-results).
@@ -42,6 +42,11 @@ additions.
 > reader** (dense `qwen3_5` + grouped experts `qwen3_5_moe` on the CUDA path). These are
 > unrelated to the Qwen3.8-Flash-Next EXL3 stack above and are published here because
 > this is the fork's upstream-facing branch.
+>
+> **Both are experimental: they only *read and run* Qwen3.6-35B-A3B NVFP4 / GGUF
+> checkpoints — no perf work, no speed claims, not benchmarked.** Skip `0016`/`0017`
+> if you only want the Qwen3.8-Flash-Next EXL3 stack. (And `0015` is opt-in and
+> off by default: it is a *cold-restart* feature, not a general speedup.)
 
 It began as the reference material for [TensorFold issue #444](https://github.com/ashhart/TensorFold/issues/444)
 (now closed; that thread links back here) and is kept as an independent, runnable
@@ -120,8 +125,8 @@ Applied in order on top of `v0.6.5` (tag `p7.1-batch-lookup-v1` = `0001`–`0006
 | 0013 | `fix(flash next cuda): keep the solo graph slot hot on a cold prefix miss (F6b)` (ours) | decode / solo graph slot |
 | 0014 | `feat(flash next cuda): keep a state at the last 2048-row boundary before a system block's end` (port of `grearjake-star`'s `sys-checkpoint` @ `b4a9993`) | long-context prefix reuse |
 | 0015 | `feat(flash next cuda): spill a kept prefix end to disk and resume from it` (ours) | disk prefix spill |
-| 0016 | `qwen3_5_moe: read compressed-tensors NVFP4 routed experts + MTP` | MoE NVFP4 |
-| 0017 | `GGUF reader and CUDA on-the-fly dequant (dense + grouped MoE experts)` | GGUF |
+| 0016 | `qwen3_5_moe: read compressed-tensors NVFP4 routed experts + MTP` | MoE NVFP4 — off-theme, **experimental: read+run only, no perf work** |
+| 0017 | `GGUF reader and CUDA on-the-fly dequant (dense + grouped MoE experts)` | GGUF — off-theme, **experimental: read+run only, no perf work** |
 | 0018 | `fix(flash next cuda): stage spill copies through pooled pinned host buffers` + `store only raw indexer keys on disk spill, re-pool on restore` (ours) | disk prefix spill fix |
 
 ```sh

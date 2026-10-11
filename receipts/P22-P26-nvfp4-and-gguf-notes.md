@@ -2,7 +2,9 @@
 
 These two patches are additive and unrelated to the Qwen3.8-Flash-Next EXL3 stack
 documented in `README.md`. They ship in this repo because it is the fork's
-upstream-facing branch. No performance claims are made for them.
+upstream-facing branch. Both are **experimental — read + run only**: they can load and
+serve the two model families below, but **no performance work was done and nothing is
+benchmarked**; no speed or quality claims are made for them.
 
 ## `0016` — `qwen3_5_moe: read compressed-tensors NVFP4 routed experts + MTP`
 
