@@ -141,6 +141,10 @@ Notes:
   `TF_SPILL_GIB=8 TF_SPILL_MIN_TOKENS=2048` (dir: `TF_SPILL_DIR`, default
   `~/.cache/tensorfold/prefix-spill`). It only affects a *cold restart* (the hot path is
   unchanged); see README §5.8 and `receipts/P21-prefix-spill-notes.md`.
+  **On** = you bounce the server and re-send the same long prefixes — a cold resume then
+  skips ~the whole prefill. **Off** (default) = long-lived server or fresh prefixes every
+  request — nothing to gain, only disk cost. **Always take `0018`**: without it the
+  eviction copy spikes TTFT **7–16 s**. Text only; `--parallel` only.
 - **Memory & the PLE n-gram table.** The engine memory-maps `ngram_embedding.safetensors`
   (~31 GiB) and touches its pages **lazily**; right after startup the box can read as
   using only **~50 GiB**, which is **normal** — the n-gram pages warm in as requests run

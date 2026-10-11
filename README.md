@@ -23,7 +23,7 @@ Cold `temperature 0`, one GB10, oldest/worst first:
 | + `0012` | image-history prefix cache (#263) | turn-2 `cached_tokens` **0 → 2514**; 1.53 s → 0.24 s |
 | + `0013` | cold solo graph slot (ours) | recapture rounds **191/888 → 0**; cold decode **21 → 123 t/s** |
 | + `0014` | system-block checkpoint (sys-checkpoint) | shared-prefix prefill **4.57 s → 0.38 s**; 6-session **41.6 s → 3.22 s (12.9×)** |
-| + `0015` | disk prefix spill (ours) | kept prefixes survive a restart: cold-resume `cached_tokens` **0 → 4096**; **4/10** resume after a cold restart — *opt-in (`TF_SPILL_GIB`, default off); a cold-restart feature, not a hot-path speedup* |
+| + `0015` | disk prefix spill (ours) | kept prefixes survive a restart: cold-resume `cached_tokens` **0 → 4096**; **4/10** resume after a cold restart — *opt-in, default off: pays off only across a restart (not a hot-path speedup); needs `0018`* |
 | + `0016` (off-theme, experimental) | Qwen3.6-35B-A3B NVFP4 routed experts (compressed-tensors) | MoE NVFP4 read path; 35B-A3B served on CUDA — **read+run only, no perf work** |
 | + `0017` (off-theme, experimental) | GGUF reader + CUDA on-the-fly dequant (dense + grouped MoE experts) | Qwen3.5 dense + Qwen3.6-35B-A3B GGUF served on CUDA — **read+run only, no perf work** |
 | + `0018` | disk-spill eviction fix (ours) | per-eviction `gap` **7–16 s → ≤1 s**; payload **−2.5 %** |
@@ -513,6 +513,17 @@ token. Text only; the CUDA/`--parallel` path.
 Honest scope: on the **hot path it changes nothing** — the kept prefix is already in
 VRAM, so an in-process hit is identical to `0014`. Its value is a **cold restart**: after
 the server is restarted (RAM cache gone), a repeated prefix resumes from disk.
+
+**Turn it on / leave it off.**
+- **Turn it on** (`TF_SPILL_GIB=8`, optionally `TF_SPILL_MIN_TOKENS=2048`) when the *same*
+  long prefixes come back **after a restart** — a session/agent reboot, a container
+  redeploy, a nightly bounce. Then the restart no longer re-prefills them.
+- **Leave it off** (the default, `TF_SPILL_GIB=0`) when the server is long-lived, or each
+  request carries a new prefix: there is nothing to gain — the hot path is unchanged, so
+  you would only pay the disk cost.
+- **Cost of on:** bounded extra disk (the cap; oldest files trimmed), one background write
+  per evicted prefix, and the eviction copy — which **must have `0018`**, or per-eviction
+  TTFT spikes 7–16 s (see below). Text only; `--parallel` only.
 
 A/B (one GB10, `temperature 0`, `TF_SPILL_GIB=8`, `TF_SPILL_MIN_TOKENS=2048`):
 
